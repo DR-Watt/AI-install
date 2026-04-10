@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# 02_local_ai_stack.sh — Lokális AI Stack v6.4
+# 02_local_ai_stack.sh — Lokális AI Stack v6.5
 #                        Ollama + vLLM + TurboQuant llama.cpp fork
 #
 # Szerepe az INFRA rendszerben
@@ -39,6 +39,21 @@
 #   [NEW] Log chmod: sudo alatt root:root log → chmod 644 + chown user
 #         TQ build log is: touch + chmod ELŐRE + utólagos jogosultság rendezés
 #   [NEW] fix mód: install-szerű, infra_require bypass a libben; 02-ban nincs reboot
+#
+# ÚJDONSÁGOK v6.5 (COMP STATE implementáció)
+# ───────────────────────────────────────────
+#   Sablon: compstate_implementációs_sablon_az_egyes_szálaknak
+#   Minta:  06_editors.sh referencia implementáció
+#   [NEW] COMP_USE_CACHED blokk a komponens felmérés körül:
+#         ha COMP_USE_CACHED=true (master exportálja) ÉS létezik mentett check
+#         → comp_load_state() betölti a korábbi eredményt (friss check elmarad)
+#         → gyorsabb ismételt futás: check mód ~2mp (vs. ~20mp)
+#   [NEW] comp_save_state() hívás check módban: a friss check VÉGÉN mentünk
+#         (check módban pre-check = post-check → a felmérés = az eredmény)
+#   [NEW] Post-install re-check + comp_save_state() install/update/fix/reinstall után:
+#         a script VÉGÉN fut teljes re-check (show_result előtt),
+#         hogy a state mindig a TELEPÍTÉS UTÁNI valódi állapotot tükrözze
+#         (nem a pre-install állapotot, ami "missing"-nek mutatná az épp telepítettet)
 #
 # ELŐFELTÉTELEK
 # ─────────────
@@ -259,88 +274,99 @@ COMP_CHECK=(
 )
 
 # ── Komponensek ellenőrzése ───────────────────────────────────────────────────
-# uv: Astral uv package manager (03 telepítette) — comp_check_uv() a lib-ben
-comp_check_uv   "${MIN_VER[uv]}"   "$UV"
-
-# Python AI venv: a 03-as modul hozta létre ~/AI-VIBE/venvs/ai/
-# Nincs dedikált comp_check_ — könyvtár + bináris létezés ellenőrzés
-if [ -d "$VENV" ] && [ -x "$VENV_PY" ]; then
-  COMP_STATUS[venv]="ok"; COMP_VER[venv]="$("$VENV_PY" --version 2>/dev/null | grep -oP '[\d.]+')"
+# COMP STATE: mentett check eredmény betöltése VAGY friss ellenőrzés.
+# COMP_USE_CACHED=true: a 00_master.sh exportálja, ha a user kérte.
+# comp_state_exists / comp_load_state / comp_save_state: 00_lib_comp.sh
+if [ "${COMP_USE_CACHED:-false}" = "true" ] && comp_state_exists "$INFRA_NUM"; then
+  # ── Mentett eredmény betöltése ──────────────────────────────────────────────
+  # comp_load_state: COMP_STATUS[] és COMP_VER[] tömbök feltöltése state fájlból.
+  # NEM fut check-et — csak a korábban mentett értékeket tölti be.
+  # Gyorsabb ismételt futás: ~2mp (vs. ~20mp friss check).
+  comp_load_state "$INFRA_NUM"
+  _state_age=$(comp_state_age_hours "$INFRA_NUM")
+  log "COMP" "Mentett check eredmény betöltve — INFRA ${INFRA_NUM} (${_state_age} óra)"
 else
-  COMP_STATUS[venv]="missing"; COMP_VER[venv]=""
-fi
+  # ── Friss komponens ellenőrzés ──────────────────────────────────────────────
 
-# PyTorch: comp_check_torch() a lib-ben (00_lib_comp.sh)
-# [FIX v6.4] 'local torch_ver' top szinten → bash error; comp_check_torch() használata
-if [ "${COMP_STATUS[venv]}" = "ok" ]; then
-  comp_check_torch "" "$VENV_PY"
-else
-  COMP_STATUS[torch]="missing"; COMP_VER[torch]=""
-fi
+  # uv: Astral uv package manager (03 telepítette) — comp_check_uv() a lib-ben
+  comp_check_uv   "${MIN_VER[uv]}"   "$UV"
 
-# Ollama: dedikált comp_check_ollama() a lib-ben
-# Forrás: https://ollama.readthedocs.io/en/ — 'ollama version' az official CLI
-#
-# [FIX v6.4.2] sudo alatt /usr/local/bin nem mindig szerepel a PATH-ban,
-# ahol az Ollama telepítője elhelyezi a binárist (/usr/local/bin/ollama).
-# Megoldás: explicit PATH kiegészítés + közvetlen path fallback ha comp "missing".
-export PATH="/usr/local/bin:/usr/local/sbin:$PATH"
-comp_check_ollama "${MIN_VER[ollama]}"
-
-# Fallback: ha comp_check_ollama "missing"-et adott, de a bináris tényleg megvan
-if [ "${COMP_STATUS[ollama]:-missing}" = "missing" ] && [ -x "/usr/local/bin/ollama" ]; then
-  _ov=$(/usr/local/bin/ollama version 2>/dev/null | grep -oP '\d+\.\d+\.\d+' | head -1)
-  [ -z "$_ov" ] && \
-    _ov=$(/usr/local/bin/ollama --version 2>/dev/null | grep -oP '\d+\.\d+\.\d+' | head -1)
-  if [ -n "$_ov" ]; then
-    COMP_STATUS[ollama]="ok"; COMP_VER[ollama]="$_ov"
-    log "COMP" "Ollama fallback detektált: v${_ov} (/usr/local/bin/ollama)"
+  # Python AI venv: a 03-as modul hozta létre ~/AI-VIBE/venvs/ai/
+  if [ -d "$VENV" ] && [ -x "$VENV_PY" ]; then
+    COMP_STATUS[venv]="ok"; COMP_VER[venv]="$("$VENV_PY" --version 2>/dev/null | grep -oP '[\d.]+')"
+  else
+    COMP_STATUS[venv]="missing"; COMP_VER[venv]=""
   fi
-fi
 
-# vLLM: dedikált comp_check_vllm() a lib-ben (v6.2 újdonság)
-# Paraméter: min verzió + a venv Python bináris (nem a rendszer python!)
-[ "${COMP_STATUS[venv]}" = "ok" ] \
-  && comp_check_vllm "${MIN_VER[vllm]}" "$VENV_PY" \
-  || { COMP_STATUS[vllm]="missing"; COMP_VER[vllm]=""; }
+  # PyTorch: comp_check_torch() a lib-ben (00_lib_comp.sh)
+  if [ "${COMP_STATUS[venv]}" = "ok" ]; then
+    comp_check_torch "" "$VENV_PY"
+  else
+    COMP_STATUS[torch]="missing"; COMP_VER[torch]=""
+  fi
 
-# TurboQuant bináris: ~/bin/llama-turboquant symlink vagy bármely llama-turboquant-*
-# A llama-turboquant symlink a build után kerül ide (→ llama-turboquant-gpu89 stb.)
-if [ -f "$_REAL_HOME/bin/llama-turboquant" ] || \
-   ls "$_REAL_HOME/bin/llama-turboquant-"* &>/dev/null 2>&1; then
-  COMP_STATUS[turboquant]="ok"
-  COMP_VER[turboquant]="$(infra_state_get "TURBOQUANT_BUILD_MODE" "ismeretlen")"
-else
-  COMP_STATUS[turboquant]="missing"; COMP_VER[turboquant]=""
-fi
+  # Ollama: PATH kiegészítés + fallback (/usr/local/bin/ollama)
+  export PATH="/usr/local/bin:/usr/local/sbin:$PATH"
+  comp_check_ollama "${MIN_VER[ollama]}"
+  if [ "${COMP_STATUS[ollama]:-missing}" = "missing" ] && [ -x "/usr/local/bin/ollama" ]; then
+    _ov=$(/usr/local/bin/ollama version 2>/dev/null | grep -oP '\d+\.\d+\.\d+' | head -1)
+    [ -z "$_ov" ] && \
+      _ov=$(/usr/local/bin/ollama --version 2>/dev/null | grep -oP '\d+\.\d+\.\d+' | head -1)
+    if [ -n "$_ov" ]; then
+      COMP_STATUS[ollama]="ok"; COMP_VER[ollama]="$_ov"
+      log "COMP" "Ollama fallback detektált: v${_ov} (/usr/local/bin/ollama)"
+    fi
+  fi
 
-# AI SDK-k: Python import ellenőrzés a venv-ben
-# LangChain
-if [ "${COMP_STATUS[venv]}" = "ok" ] && \
-   "$VENV_PY" -c "import langchain" 2>/dev/null; then
-  COMP_STATUS[langchain]="ok"
-  COMP_VER[langchain]=$("$VENV_PY" -c "import langchain; print(langchain.__version__)" 2>/dev/null || echo "ok")
-else
-  COMP_STATUS[langchain]="missing"; COMP_VER[langchain]=""
-fi
+  # vLLM: comp_check_vllm() — Python import alapján (nincs saját CLI)
+  [ "${COMP_STATUS[venv]}" = "ok" ] \
+    && comp_check_vllm "${MIN_VER[vllm]}" "$VENV_PY" \
+    || { COMP_STATUS[vllm]="missing"; COMP_VER[vllm]=""; }
 
-# Anthropic SDK
-if [ "${COMP_STATUS[venv]}" = "ok" ] && \
-   "$VENV_PY" -c "import anthropic" 2>/dev/null; then
-  COMP_STATUS[anthropic]="ok"
-  COMP_VER[anthropic]=$("$VENV_PY" -c "import anthropic; print(anthropic.__version__)" 2>/dev/null || echo "ok")
-else
-  COMP_STATUS[anthropic]="missing"; COMP_VER[anthropic]=""
-fi
+  # TurboQuant bináris: ~/bin/llama-turboquant symlink vagy llama-turboquant-*
+  if [ -f "$_REAL_HOME/bin/llama-turboquant" ] || \
+     ls "$_REAL_HOME/bin/llama-turboquant-"* &>/dev/null 2>&1; then
+    COMP_STATUS[turboquant]="ok"
+    COMP_VER[turboquant]="$(infra_state_get "TURBOQUANT_BUILD_MODE" "ismeretlen")"
+  else
+    COMP_STATUS[turboquant]="missing"; COMP_VER[turboquant]=""
+  fi
 
-# HuggingFace Transformers
-if [ "${COMP_STATUS[venv]}" = "ok" ] && \
-   "$VENV_PY" -c "import transformers" 2>/dev/null; then
-  COMP_STATUS[hf]="ok"
-  COMP_VER[hf]=$("$VENV_PY" -c "import transformers; print(transformers.__version__)" 2>/dev/null || echo "ok")
-else
-  COMP_STATUS[hf]="missing"; COMP_VER[hf]=""
-fi
+  # AI SDK-k: Python import ellenőrzés a venv-ben
+  if [ "${COMP_STATUS[venv]}" = "ok" ] && \
+     "$VENV_PY" -c "import langchain" 2>/dev/null; then
+    COMP_STATUS[langchain]="ok"
+    COMP_VER[langchain]=$("$VENV_PY" -c "import langchain; print(langchain.__version__)" 2>/dev/null || echo "ok")
+  else
+    COMP_STATUS[langchain]="missing"; COMP_VER[langchain]=""
+  fi
+
+  if [ "${COMP_STATUS[venv]}" = "ok" ] && \
+     "$VENV_PY" -c "import anthropic" 2>/dev/null; then
+    COMP_STATUS[anthropic]="ok"
+    COMP_VER[anthropic]=$("$VENV_PY" -c "import anthropic; print(anthropic.__version__)" 2>/dev/null || echo "ok")
+  else
+    COMP_STATUS[anthropic]="missing"; COMP_VER[anthropic]=""
+  fi
+
+  if [ "${COMP_STATUS[venv]}" = "ok" ] && \
+     "$VENV_PY" -c "import transformers" 2>/dev/null; then
+    COMP_STATUS[hf]="ok"
+    COMP_VER[hf]=$("$VENV_PY" -c "import transformers; print(transformers.__version__)" 2>/dev/null || echo "ok")
+  else
+    COMP_STATUS[hf]="missing"; COMP_VER[hf]=""
+  fi
+
+  # ── COMP STATE mentés CHECK módban ──────────────────────────────────────────
+  # Check módban pre-check = post-check (semmi sem változik) → azonnal mentünk.
+  # Install/update/fix/reinstall módban NEM mentünk itt — a script VÉGÉN fut
+  # egy teljes re-check a telepítések UTÁN, azt mentjük.
+  if [ "$RUN_MODE" = "check" ]; then
+    comp_save_state "$INFRA_NUM"
+    log "COMP" "Check mód: COMP state mentve (INFRA ${INFRA_NUM})"
+  fi
+
+fi  # COMP_USE_CACHED / friss check
 
 # ── Komponens státusz összesítése ─────────────────────────────────────────────
 log_comp_status "${COMP_CHECK[@]}"
@@ -1210,6 +1236,80 @@ fi
 
 # State konzisztencia validáció
 infra_state_validate
+
+# ── Post-install COMP STATE: teljes re-check + mentés ────────────────────────
+# LOGIKA (sablon: compstate_implementációs_sablon_az_egyes_szálaknak):
+#   check mód     → comp_save_state a FELMÉRÉS VÉGÉN fut (pre-check = post-check)
+#   install/update/fix/reinstall → re-check ITT, a telepítések UTÁN
+#     Így a state mindig a TELEPÍTÉS UTÁNI valódi állapotot tükrözi,
+#     nem a pre-install állapotot (ahol az épp telepített komponens "missing" lenne).
+#
+# Az összes check ismétlődik — nincs rövidebb megbízható módja annak,
+# hogy az összes telepítés eredményét ellenőrizzük.
+if [[ "$RUN_MODE" =~ ^(install|update|fix|reinstall)$ ]]; then
+  log "COMP" "Post-install re-check futtatása (mód: $RUN_MODE)..."
+
+  comp_check_uv "${MIN_VER[uv]}" "$UV"
+
+  if [ -d "$VENV" ] && [ -x "$VENV_PY" ]; then
+    COMP_STATUS[venv]="ok"; COMP_VER[venv]="$("$VENV_PY" --version 2>/dev/null | grep -oP '[\d.]+')"
+  else
+    COMP_STATUS[venv]="missing"; COMP_VER[venv]=""
+  fi
+
+  [ "${COMP_STATUS[venv]}" = "ok" ] \
+    && comp_check_torch "" "$VENV_PY" \
+    || { COMP_STATUS[torch]="missing"; COMP_VER[torch]=""; }
+
+  # Ollama PATH fix + fallback (post-install is kell)
+  export PATH="/usr/local/bin:/usr/local/sbin:$PATH"
+  comp_check_ollama "${MIN_VER[ollama]}"
+  if [ "${COMP_STATUS[ollama]:-missing}" = "missing" ] && [ -x "/usr/local/bin/ollama" ]; then
+    _ov=$(/usr/local/bin/ollama version 2>/dev/null | grep -oP '\d+\.\d+\.\d+' | head -1)
+    [ -z "$_ov" ] && \
+      _ov=$(/usr/local/bin/ollama --version 2>/dev/null | grep -oP '\d+\.\d+\.\d+' | head -1)
+    [ -n "$_ov" ] && {
+      COMP_STATUS[ollama]="ok"; COMP_VER[ollama]="$_ov"
+      log "COMP" "Ollama post-install fallback: v${_ov}"
+    }
+  fi
+
+  [ "${COMP_STATUS[venv]}" = "ok" ] \
+    && comp_check_vllm "${MIN_VER[vllm]}" "$VENV_PY" \
+    || { COMP_STATUS[vllm]="missing"; COMP_VER[vllm]=""; }
+
+  if [ -f "$_REAL_HOME/bin/llama-turboquant" ] || \
+     ls "$_REAL_HOME/bin/llama-turboquant-"* &>/dev/null 2>&1; then
+    COMP_STATUS[turboquant]="ok"
+    COMP_VER[turboquant]="$(infra_state_get "TURBOQUANT_BUILD_MODE" "ismeretlen")"
+  else
+    COMP_STATUS[turboquant]="missing"; COMP_VER[turboquant]=""
+  fi
+
+  if [ "${COMP_STATUS[venv]}" = "ok" ] && "$VENV_PY" -c "import langchain" 2>/dev/null; then
+    COMP_STATUS[langchain]="ok"
+    COMP_VER[langchain]=$("$VENV_PY" -c "import langchain; print(langchain.__version__)" 2>/dev/null || echo "ok")
+  else
+    COMP_STATUS[langchain]="missing"; COMP_VER[langchain]=""
+  fi
+
+  if [ "${COMP_STATUS[venv]}" = "ok" ] && "$VENV_PY" -c "import anthropic" 2>/dev/null; then
+    COMP_STATUS[anthropic]="ok"
+    COMP_VER[anthropic]=$("$VENV_PY" -c "import anthropic; print(anthropic.__version__)" 2>/dev/null || echo "ok")
+  else
+    COMP_STATUS[anthropic]="missing"; COMP_VER[anthropic]=""
+  fi
+
+  if [ "${COMP_STATUS[venv]}" = "ok" ] && "$VENV_PY" -c "import transformers" 2>/dev/null; then
+    COMP_STATUS[hf]="ok"
+    COMP_VER[hf]=$("$VENV_PY" -c "import transformers; print(transformers.__version__)" 2>/dev/null || echo "ok")
+  else
+    COMP_STATUS[hf]="missing"; COMP_VER[hf]=""
+  fi
+
+  comp_save_state "$INFRA_NUM"
+  log "COMP" "Post-install COMP state mentve: COMP_02_* (telepítés utáni valós állapot)"
+fi
 
 # ── Log chmod — utolsó beállítás (futás közben root is írt bele) ───────────────
 chmod 644 "${LOGFILE_AI}" "${LOGFILE_HUMAN}" 2>/dev/null || true
