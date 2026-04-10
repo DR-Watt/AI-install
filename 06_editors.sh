@@ -428,21 +428,24 @@ if cmd_exists code; then
 
   # Extension telepítés: nincs külön ask_proceed — ha a user elindította a
   # 06-os szálat és a VS Code elérhető, az extension-ök automatikusan települnek.
-  # Extension telepítés CSAK módosító módokban — check és skip ki van zárva!
-  # Korábban "!= skip" volt: check mód is belefutott → check módban is telepített.
-  # Javítás: explicit whitelist — csak install/update/reinstall/fix futtatja.
-  if [[ "$RUN_MODE" =~ ^(install|update|reinstall|fix)$ ]]; then
+  # Extension telepítés install/update/reinstall módban.
+  # FIX MÓD KIVÉTEL: fix módban az extension-ök már fent vannak (check megmutatta),
+  #   csak a hiányzó komponenseket pótoljuk → extension loop nem fut fix-ben.
+  # REINSTALL: teljes újratelepítés esetén igen.
+  if [[ "$RUN_MODE" =~ ^(install|update|reinstall)$ ]]; then
     progress_open "VS Code Extensions" "Extension-ök telepítése..."
     ext_i=0
 
     # Segéd: extension telepítése a valódi user HOME-jában
-    # HOME="$_REAL_HOME": code felismeri a user profil könyvtárát
+    # --user-data-dir: explicit megadás → kiküszöböli a "mkdir: cannot create ''" warningot
     # sudo -u "$_REAL_USER": nem root profiljára telepít
     _install_ext() {
       local ext="$1"
       [ -z "$ext" ] && return
       HOME="$_REAL_HOME" sudo -u "$_REAL_USER" \
-        code --install-extension "$ext" --force \
+        code \
+          --user-data-dir "$_REAL_HOME/.config/Code" \
+          --install-extension "$ext" --force \
         >> "$LOGFILE_AI" 2>&1 || true
     }
 
@@ -778,11 +781,38 @@ done
 # =============================================================================
 # INFRA STATE LEZÁRÁS
 # =============================================================================
-# MOD_06_DONE: jelzi a többi szálnak (ha lenne függőség) hogy a 06 kész
-# Az editors modulnak egyelőre nincs downstream függősége, de a state-be írjuk.
 
 infra_state_set "MOD_06_DONE" "true"
 log "STATE" "MOD_06_DONE=true → state fájlba írva"
+
+# ── Post-install COMP STATE frissítés ────────────────────────────────────────
+# A comp_save_state a script ELEJÉN fut (telepítés előtt), ezért a state-ben
+# a pre-install állapot van. Ha telepítettünk valamit, itt frissítjük a
+# state-t fájl alapú gyors check-ekkel — újabb code --version nélkül.
+
+log "COMP" "Post-install COMP state frissítés..."
+
+# Cursor: AppImage VAGY indítóscript jelenléte = ok
+if [ -f "$_REAL_HOME/bin/cursor" ] || \
+   [ -f "$_REAL_HOME/tools/cursor/cursor.AppImage" ]; then
+  COMP_STATUS[cursor]="ok"
+  COMP_VER[cursor]="AppImage"
+  infra_state_set "COMP_06_S_CURSOR" "ok"
+  infra_state_set "COMP_06_V_CURSOR" "AppImage"
+  log "COMP" "Post-install: cursor → ok"
+fi
+
+# Kitty: fájl alapú
+if [ -f "$_REAL_HOME/.local/kitty.app/bin/kitty" ] || \
+   [ -f "$_REAL_HOME/bin/kitty" ]; then
+  COMP_STATUS[kitty]="ok"
+  infra_state_set "COMP_06_S_KITTY" "ok"
+  log "COMP" "Post-install: kitty → ok"
+fi
+
+# Timestamp frissítése
+infra_state_set "COMP_06_TS" "$(date '+%Y-%m-%dT%H:%M:%S')"
+log "STATE" "COMP_06 post-install state mentve"
 
 # =============================================================================
 # ÖSSZESÍTŐ
