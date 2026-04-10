@@ -284,21 +284,32 @@ if [ "${COMP_USE_CACHED:-false}" = "true" ] && comp_state_exists "$INFRA_NUM"; t
   log "COMP" "Mentett check eredmény betöltve — INFRA $INFRA_NUM (${_state_age} óra)"
 else
   # ── Friss komponens ellenőrzés ───────────────────────────────────────────────
-  # comp_check_vscode: dedikált ellenőrző (00_lib_comp.sh) — PATH fix benne
-  comp_check_vscode "${VER[vscode_min]}"
+  # ALAPELV: minden "code" hívás sudo -u "$_REAL_USER" kontextusban fut!
+  # Gyökérok: "code" (VS Code, akár deb akár snap) sudo/root alatt nem elérhető.
+  #   - /snap/bin nem kerül a root PATH-ba
+  #   - code --version Electron wrappert igényel (DBUS/display session nélkül kilép)
+  #   - code --list-extensions ugyanígy
+  # Megoldás: HOME="$_REAL_HOME" sudo -u "$_REAL_USER" code ... — user kontextus
+  # Ugyanezt csinálja az _install_ext() is, ahol működött.
 
-  # Cursor, Kitty, CLINE, Continue: nincs dedikált comp_check_ → generikus
-  # check_component: eval-alapú, COMP_STATUS[] és COMP_VER[] tömböt tölti fel
+  # VS Code: fájl alapú ellenőrzés + user kontextusú verzió lekérés
+  # comp_check_vscode() bővített logikával (00_lib_comp.sh)
+  comp_check_vscode "${VER[vscode_min]}" "$_REAL_USER" "$_REAL_HOME"
+
+  # Cursor: AppImage fájl létezés ellenőrzés (sudo-safe)
   check_component "cursor" \
     "[ -f '$_REAL_HOME/bin/cursor' ] && echo 1" "1"
-  # Kitty explicit path: sudo alatt ~/.local/kitty.app/bin nincs a PATH-ban
-  # Elsőként a symlink-et próbálja (~/bin/kitty), majd a telepítési helyet
+
+  # Kitty: explicit PATH — sudo alatt ~/.local/kitty.app/bin nem elérhető
   check_component "kitty" \
     "PATH='$_REAL_HOME/bin:$_REAL_HOME/.local/kitty.app/bin:/usr/bin:$PATH' kitty --version 2>/dev/null | grep -oP '[\d.]+' | head -1" "${VER[kitty_min]}"
+
+  # CLINE + Continue: code --list-extensions user kontextusban
+  # (sudo alatt code nem fut → extension lista nem kérhető le root-ként)
   check_component "cline" \
-    "PATH='/usr/bin:/usr/local/bin:$PATH' code --list-extensions 2>/dev/null | grep -q saoudrizwan.claude-dev && echo 1" "1"
+    "HOME='$_REAL_HOME' sudo -u '$_REAL_USER' code --list-extensions 2>/dev/null | grep -q saoudrizwan.claude-dev && echo 1" "1"
   check_component "continue_dev" \
-    "PATH='/usr/bin:/usr/local/bin:$PATH' code --list-extensions 2>/dev/null | grep -q continue.continue && echo 1" "1"
+    "HOME='$_REAL_HOME' sudo -u '$_REAL_USER' code --list-extensions 2>/dev/null | grep -q continue.continue && echo 1" "1"
 
   # comp_save_state: ellenőrzés eredményét elmenti ~/.infra-state-be
   # Kulcsok: COMP_06_S_<NÉV>=ok|old|missing, COMP_06_V_<NÉV>=verzió, COMP_06_TS=timestamp

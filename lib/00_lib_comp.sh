@@ -372,31 +372,49 @@ comp_check_torch() {
   fi
 }
 
-# comp_check_vscode: code --version (Microsoft VS Code) + dpkg fallback.
-# Forrás: code --version (VS Code CLI) | dpkg -l code
-# PROBLÉMA: sudo alatt a code --version nem működik még explicit PATH-szal sem.
-#   A VS Code Electron wrapper más env változókat vár (DBUS, display session).
-#   Sudo alatt ezek hiányoznak → a CLI indul, de rögtön kilép 0 nélküli kóddal.
-# MEGOLDÁS: kétlépéses ellenőrzés:
-#   1. dpkg -l code → csomag telepítve van-e? (sudo alatt biztosan működik)
-#   2. dpkg verzióból kinyerjük a verziószámot
-#   3. Fallback: PATH fix-es code --version (ha dpkg nem ad verziót)
+# comp_check_vscode: VS Code telepítettség + verzió ellenőrzés.
+# Forrás: dpkg -l code | snap list code | fájl alapú detektálás
+#
+# PROBLÉMA: sudo/root kontextusban "code" nem futtatható megbízhatóan:
+#   - deb: /usr/bin/code → Electron wrapper, DBUS/display session nélkül kilép
+#   - snap: /snap/bin/code → root PATH-ban nincs /snap/bin
+#   - dpkg -l code: csak deb csomagot talál, snap-et NEM
+#
+# MEGOLDÁS: háromszintű ellenőrzés:
+#   1. Fájl alapú detektálás (/usr/bin/code, /snap/bin/code) — sudo-safe
+#   2. Verzió lekérés user kontextusban (sudo -u real_user) — deb + snap esetén is
+#   3. dpkg / snap verzió fallback
+#
+# Paraméterek: $1=min_ver, $2=real_user (opcionális), $3=real_home (opcionális)
 comp_check_vscode() {
   local min="${1:-1.85}"
-  local ver
+  local real_user="${2:-${_REAL_USER:-$USER}}"
+  local real_home="${3:-${_REAL_HOME:-$HOME}}"
+  local ver="" code_bin=""
 
-  # 1. Próba: dpkg alapú ellenőrzés — sudo alatt biztosan elérhető
-  # A dpkg -l code visszaadja: ii  code  1.96.0-...  amd64  Code editor
-  if dpkg -l code 2>/dev/null | grep -q "^ii"; then
-    ver=$(dpkg -l code 2>/dev/null           | awk '/^ii/{print $3}'           | grep -oP '\d+\.\d+\.\d+' | head -1)
-    # Ha a dpkg nem ad verziószámot (formátum változott), jelezzük telepítve van
-    [ -z "$ver" ] && ver="1.0"
-  fi
+  # 1. Fájl alapú detektálás — melyik útvonalon van a code bináris?
+  for _cb in "/usr/bin/code" "/snap/bin/code" "/usr/local/bin/code"; do
+    [ -x "$_cb" ] && { code_bin="$_cb"; break; }
+  done
 
-  # 2. Fallback: code --version explicit PATH-szal (ha dpkg nem találta)
-  if [ -z "$ver" ]; then
-    ver=$(PATH="/usr/bin:/usr/local/bin:$PATH" code --version 2>/dev/null \
-          | head -1 | grep -oP '[\d.]+')
+  if [ -n "$code_bin" ]; then
+    # 2. Verzió lekérés user kontextusban — az Electron wrapper user session-nel fut
+    ver=$(HOME="$real_home" sudo -u "$real_user"           "$code_bin" --version 2>/dev/null           | head -1 | grep -oP "[\d.]+")
+
+    # 3. dpkg fallback deb csomagnál
+    [ -z "$ver" ] && ver=$(dpkg -l code 2>/dev/null           | awk "/^ii/{print \$3}"           | grep -oP "\d+\.\d+\.\d+" | head -1)
+
+    # 4. snap fallback
+    [ -z "$ver" ] && ver=$(snap list code 2>/dev/null           | awk "NR>1 && \$1=="code"{print \$2}" | head -1)
+
+    # Telepítve van de verziót nem sikerült kinyerni
+    [ -z "$ver" ] && ver="installed"
+  else
+    # Fájl nem található → dpkg utolsó esély
+    if dpkg -l code 2>/dev/null | grep -q "^ii"; then
+      ver=$(dpkg -l code 2>/dev/null             | awk "/^ii/{print \$3}"             | grep -oP "\d+\.\d+\.\d+" | head -1)
+      [ -z "$ver" ] && ver="installed"
+    fi
   fi
 
   [ -z "$ver" ] && {
@@ -405,11 +423,12 @@ comp_check_vscode() {
     return 1
   }
   COMP_VER[vscode]="$ver"
-  version_ok "$ver" "$min" \
-    && COMP_STATUS[vscode]="ok" \
-    || COMP_STATUS[vscode]="old"
+  if [ "$ver" = "installed" ]; then
+    COMP_STATUS[vscode]="ok"
+  else
+    version_ok "$ver" "$min"       && COMP_STATUS[vscode]="ok"       || COMP_STATUS[vscode]="old"
+  fi
 }
-
 # ── Megjelenítő segédek ───────────────────────────────────────────────────────
 
 # comp_line: egy sor státusz szöveg ✓/✗/⚠ szimbólumokkal.
