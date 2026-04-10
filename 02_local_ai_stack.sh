@@ -129,14 +129,11 @@ readonly AI_PKGS=(
   openai                    # OpenAI SDK — Ollama és vLLM OpenAI API kompatibilis!
 )
 
-# ── TurboQuant cmake build paraméterek táblázata ──────────────────────────────
-# cmake flag-ek a build mód szerint (GGML_CUDA + CUDA arch beállítás)
-# Forrás: llama.cpp build dokumentáció + TurboQuant fork README
-declare -A TQ_CMAKE_FLAGS=(
-  [cpu]="   -DGGML_CUDA=OFF -DCMAKE_BUILD_TYPE=Release"
-  [gpu89]=  "-DGGML_CUDA=ON  -DCMAKE_CUDA_ARCHITECTURES=89  -DCMAKE_BUILD_TYPE=Release"
-  [gpu120]= "-DGGML_CUDA=ON  -DCMAKE_CUDA_ARCHITECTURES=120 -DCMAKE_BUILD_TYPE=Release"
-)
+# ── TurboQuant architektúra cimkék (dialógokban jelenik meg) ─────────────────
+# MEGJEGYZÉS: A cmake flag-eket NEM declare -A-ban tároljuk a v6.4 óta.
+# Gyökérok: '[key]=  "value"' extra szóköz → bash asszociatív tömb hiba.
+# Megoldás: case statement + TQ_CMAKE_ARGS=() bash array a build szekcióban.
+# TQ_ARCH_LABEL megmarad: dialóg szövegekhez szükséges (${TQ_ARCH_LBL}).
 declare -A TQ_ARCH_LABEL=(
   [cpu]="CPU-only (nincs CUDA)"
   [gpu89]="GPU SM_89 — Ada Lovelace fallback (cu126 OK)"
