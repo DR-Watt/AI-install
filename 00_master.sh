@@ -1,22 +1,45 @@
 #!/bin/bash
 # =============================================================================
-# 00_master.sh — Vibe Coding Workspace Installer v6.5
+# 00_master.sh — Vibe Coding Workspace Installer v6.4.3
 #
-# Változtatások v6.5 (COMP STATE rendszer):
-#   - COMP_USE_CACHED: mentett komponens check eredmények felhasználása
-#     A user dönthet: újra lefusson-e a comp_check_* minden modulban,
-#     vagy a legutóbb mentett eredményt használja (gyorsabb).
-#     comp_save_state() / comp_load_state() (00_lib_comp.sh v6.4.1)
-#   - Módválasztás után: ha van mentett COMP state → dialog_yesno kérdés
-#   - Check módban: COMP_USE_CACHED mindig false (ellenőrző mód célja a friss check)
-#   - COMP_USE_CACHED exportálva → child process scriptek öröklik
+# Változtatások v6.4.3 (COMP STATE integráció):
+#   - COMP_USE_CACHED export: mentett check eredmények felajánlása
+#     comp_state_master_summary() listázza a cachetelt modulokat
+#     User dönthet: mentett state betöltése vs. friss check futtatása
+#   - Child scriptek öröklik COMP_USE_CACHED=true/false
 #
 # Változtatások v6.4.2 (fix mód + reboot suppress):
 #   - Módválasztó: 4. opció "javítás" (fix) mód
+#     fix módban ask_proceed() interaktív, REBOOT_NEEDED guard aktív
+#     Cél: hiányzó komponensek pótlása reboot nélkül, majd újraellenőrzés
 #
 # Változtatások v6.4 (split lib rendszer + bug fixek):
 #   - LIB_VERSION ellenőrzés: minimum 6.4 (split lib, infra_require fix)
 #   - lib/ alkönyvtár létezés ellenőrzés indításkor
+#   - infra_require(): case-insensitive kulcs (01a → MOD_01A_DONE)
+#   - detect_run_mode(): check módban nem változtat RUN_MODE-on
+#   - YAD ablakok: 4K-ra méretezve, Pango font support
+#   - hw_detect(): tényleges telepített driver detektálás dpkg alapján
+#
+# Változtatások v6.2 (03 Python/AI-ML v6.1 + lib v6.3 integráció):
+#   - LIB_VERSION ellenőrzés: minimum 6.3 kell (comp_check_torch())
+#   - Üdvözlő dialog: 03 leírás frissítve (LangChain, HuggingFace, bővített)
+#   - INFRA_DEP map: 03 [01b→] megjegyzés pontosítva
+#   - infra_state_validate() hívás a futtatás előtt (keresztellenőrzés)
+#
+# Változtatások v6.1 (lib v6.2 + 02 AI stack integráció):
+#   - Üdvözlő dialog: 02 leírás pontosítva (Ollama+vLLM+TurboQuant)
+#   - 02 futtatási sorrendje: 03 után (infra_require ellenőrzi)
+#   - LIB_VERSION ellenőrzés: minimum 6.2 kell
+#   - Egyéb: azonos logika a v6.0-val (state-alapú REBOOT, generic modulok)
+#
+# Változtatások v6.0:
+#   - 01 → 01a (pre-reboot) + 01b (post-reboot) szétválasztás kezelése
+#   - REBOOT_NEEDED: hardcoded [ "$id" = "01" ] helyett infra state-alapú
+#     (infra_state_get "REBOOT_NEEDED") — bármely jövőbeli modul írhatja
+#   - INFRA_REBOOT és INFRA_DEP map-ek frissítve: 01a, 01b
+#   - Üdvözlő dialog sorrend aktualizálva
+#   - Megerősítő szöveg generikus (nem "01-es modul")
 #
 # Futtatás: sudo bash 00_master.sh
 # =============================================================================
@@ -46,12 +69,12 @@ source "$LIB"
 source "$REGISTRY"
 
 # ── LIB_VERSION ellenőrzés ────────────────────────────────────────────────────
-# 00_lib_comp.sh v6.4.1+ szükséges: comp_save_state, comp_load_state,
-# comp_state_exists, comp_state_age_hours (COMP STATE rendszer)
-_LIB_MIN="6.4.2"
+# 00_lib.sh v6.4+ szükséges: split lib (lib/ alkönyvtár), infra_require case fix,
+# detect_run_mode check mód javítás, YAD Pango font, hw_detect dpkg driver detektálás.
+_LIB_MIN="6.4"
 if ! printf '%s\n%s\n' "$_LIB_MIN" "$LIB_VERSION" | sort -V | head -1 | grep -qx "$_LIB_MIN"; then
   echo "HIBA: 00_lib.sh verzió $LIB_VERSION < minimum $_LIB_MIN"
-  echo "Frissítsd a lib/ fájlokat!"
+  echo "Frissítsd a 00_lib.sh fájlt!"
   exit 1
 fi
 
@@ -63,12 +86,14 @@ log_init
 hw_show
 
 # ── State inicializálás + keresztellenőrzés ───────────────────────────────────
+# infra_state_init(): hiányzó kulcsokat feltölti alapértékekkel (nem írja felül!)
+# infra_state_validate(): inkonzisztenciákat detektál és javít (pl. PYTORCH_INDEX)
 infra_state_init
 infra_state_validate
 infra_state_show
 
 # ── Üdvözlő + telepítési rend ─────────────────────────────────────────────────
-dialog_msg "Vibe Coding Workspace v6.5" "
+dialog_msg "Vibe Coding Workspace v6.4.3" "
   Ubuntu 24 LTS + RTX 5090 fejlesztői környezet
 
   GPU:     $HW_GPU_NAME
@@ -117,72 +142,65 @@ case "$RUN_MODE" in
   *)       MODE_TITLE="$RUN_MODE" ;;
 esac
 
-# =============================================================================
-# COMP STATE — MENTETT KOMPONENS CHECK EREDMÉNYEK
-# =============================================================================
-# Ha korábban már futott comp_check_* valamelyik modulban és az elmentette
-# az eredményt (comp_save_state), most felajánljuk a felhasználását.
+# ── COMP STATE: mentett check eredmény ajánlat ────────────────────────────────
+# comp_state_master_summary() (00_lib_comp.sh) végignézi az összes regisztrált
+# INFRA ID-t, és listázza amelyikhez van mentett check eredmény (COMP_XX_TS).
 #
-# LOGIKA:
-#   check mód     → COMP_USE_CACHED=false (az ellenőrző mód MINDIG frissen fut)
-#   install/update/fix → ha van mentett state → megkérdezzük
+# COMP_USE_CACHED=true → a child scriptek comp_load_state()-szel töltik a
+#   COMP_STATUS[]/COMP_VER[] tömböket a state fájlból (nem futnak friss check-et).
+# COMP_USE_CACHED=false → minden script saját comp_check_*()-eket futtat.
 #
-# EXPORTÁLÁS: COMP_USE_CACHED child process scriptek (bash "$script") öröklik.
-# A scriptben: comp_state_exists "$INFRA_NUM" + comp_load_state "$INFRA_NUM"
-# =============================================================================
+# MIKOR ajánljuk fel?
+#   - check módban: mindig felajánljuk (check éppen a frissítés lenne → cache OK)
+#   - install/update/fix módban: csak ha van cached state, user dönt
+#     (friss check eredmény jobb az install döntésnél — de a user időt takaríthat meg)
+#
+# Alapértelmezés: COMP_USE_CACHED=false (biztonságos: mindig friss check)
 
-COMP_USE_CACHED="false"
+COMP_USE_CACHED=false
 
-if [ "$RUN_MODE" != "check" ]; then
-  # Mentett state-ek összegyűjtése — végigmegyünk az összes regisztrált INFRA-n
-  _cached_list=""
-  _cached_count=0
+# comp_state_master_summary kimenetét feldolgozzuk:
+#   1. sor: darabszám (hány modul van cachelve)
+#   többi sor: lista
+_CACHED_SUMMARY="$(comp_state_master_summary "${INFRA_IDS[@]}")"
+_CACHED_COUNT="$(echo "$_CACHED_SUMMARY" | head -1)"
+_CACHED_LIST="$(echo "$_CACHED_SUMMARY" | tail -n +2)"
 
-  for _id in "${INFRA_IDS[@]}"; do
-    if comp_state_exists "$_id"; then
-      _pfx="COMP_$(printf '%s' "$_id" | tr '[:lower:]' '[:upper:]')"
-      _ts=$(infra_state_get "${_pfx}_TS" "")
-      _hours=$(comp_state_age_hours "$_id")
-      _cached_list+="    INFRA ${_id}: ${INFRA_NAME[$_id]:-?}"
-      _cached_list+="  (${_ts}, ${_hours}h ezelőtt)\n"
-      ((_cached_count++))
-    fi
-  done
+if [ "${_CACHED_COUNT:-0}" -gt 0 ]; then
+  # Van legalább egy mentett check eredmény → felajánljuk
+  if dialog_yesno "Mentett check eredmények" "
+  ${_CACHED_COUNT} INFRA modulhoz van mentett komponens állapot:
 
-  if [ "$_cached_count" -gt 0 ]; then
-    # Megkérdezzük: felhasználjuk-e a mentett eredményeket?
-    dialog_yesno "Mentett komponens check eredmények" \
-"  ${_cached_count} modul esetén van mentett check eredmény:
+${_CACHED_LIST}
+  Felhasználjuk a mentett eredményeket?
 
-$(printf '%b' "$_cached_list")
-  ── Mit tegyünk? ─────────────────────────────────
-  Igen → a kiválasztott modulok NEM futtatnak újra
-         komponens ellenőrzést (gyorsabb)
-  Nem  → minden modul frissen ellenőrzi a komponenseit
-
-  Megjegyzés: check módban mindig friss ellenőrzés fut." 24 \
-    && COMP_USE_CACHED="true"
-
-    log "MASTER" "COMP_USE_CACHED=$COMP_USE_CACHED ($_cached_count modul mentett state-tel)"
+  IGEN  → Gyorsabb: nem fut le újra a komponens ellenőrzés
+          (Mentett állapot a state fájlból töltődik)
+  NEM   → Minden modul frissen ellenőriz (lassabb, de pontosabb)" 20; then
+    COMP_USE_CACHED=true
+    log "MODE" "COMP state: mentett check eredmények betöltve (${_CACHED_COUNT} modul)"
+  else
+    COMP_USE_CACHED=false
+    log "MODE" "COMP state: friss check futtatása minden modulon"
   fi
 else
-  # Check módban: soha nem használjuk a cache-t
-  # Ellenőrző mód CÉLJA: friss, valódi állapot felmérés
-  log "MASTER" "Check mód: COMP_USE_CACHED=false (mindig friss ellenőrzés)"
+  # Nincs mentett check → automatikusan friss check
+  log "MODE" "COMP state: nincs mentett check — friss check minden modulon"
 fi
 
 export COMP_USE_CACHED
+log "MODE" "COMP_USE_CACHED=$COMP_USE_CACHED"
 
-# =============================================================================
-# INFRA CHECKLIST
-# =============================================================================
-
+# ── INFRA checklist meta-adatok ───────────────────────────────────────────────
 # INFRA_REBOOT: ezek az ID-k után REBOOT szükséges (a checklist-ben jelöljük)
+# A tényleges REBOOT_NEEDED döntés az infra state-ből jön (nem hardcode).
 declare -A INFRA_REBOOT=(
   ["01a"]=" ⚠ REBOOT"
 )
 
 # INFRA_DEP: függőségi jelzők a checklist leírásában (tájékoztató jellegű)
+# Megjegyzés: a tényleges ellenőrzés infra_require()-rel történik a scripten belül.
+#   03 az infra_require("01B") hívást használja (uppercase kulcs: MOD_01B_DONE)
 declare -A INFRA_DEP=(
   ["01b"]=" [01a+REBOOT→]"
   ["02"]=" [03→]"
@@ -203,9 +221,6 @@ for id in "${INFRA_IDS[@]}"; do
   [ -n "${INFRA_REBOOT[$id]:-}" ] && suffix+="${INFRA_REBOOT[$id]}"
   [ -n "${INFRA_DEP[$id]:-}" ]    && suffix+="${INFRA_DEP[$id]}"
 
-  # COMP state jelzés: ha van mentett állapot, jelöljük ✓cache
-  comp_state_exists "$id" && suffix+=" ✓cache"
-
   compat_label=""
   if ! infra_compatible "$local_hw"; then
     compat_label=" [NEM ELÉRHETŐ: $HW_PROFILE]"
@@ -218,17 +233,14 @@ done
 
 SELECTED=$(dialog_checklist \
   "$MODE_TITLE — INFRA kiválasztás" \
-  "\n  [$RUN_MODE mód]  Válaszd ki a modulokat:\n  (⚠ REBOOT = újraindítás szükséges | [X→] = függőség | ✓cache = mentett check)\n\n  A 01a minden más ELŐFELTÉTELE." \
+  "\n  [$RUN_MODE mód]  Válaszd ki a modulokat:\n  (⚠ REBOOT = újraindítás szükséges utána | [X→] = függőség)\n\n  A 01a minden más ELŐFELTÉTELE." \
   "30" "16" \
   "${CHECKLIST_ARGS[@]}")
 
 [ -z "$SELECTED" ] && { dialog_msg "Kilépés" "\n  Semmi nem lett kijelölve."; exit 0; }
 
 # ── Megerősítés ───────────────────────────────────────────────────────────────
-CONFIRM_MSG="\n  [$MODE_TITLE — $RUN_MODE mód]\n"
-[ "$COMP_USE_CACHED" = "true" ] && \
-  CONFIRM_MSG+="  [Komponens check: mentett eredmény]\n"
-CONFIRM_MSG+="\n  Kijelölt modulok:\n"
+CONFIRM_MSG="\n  [$MODE_TITLE — $RUN_MODE mód]\n\n  Kijelölt modulok:\n"
 HAS_REBOOT=false
 for id in $(printf '%s' "$SELECTED" | tr -d '"' | tr ' ' '\n' | sort); do
   [ -z "$id" ] || [ -z "${INFRA_NAME[$id]:-}" ] && continue
@@ -236,6 +248,7 @@ for id in $(printf '%s' "$SELECTED" | tr -d '"' | tr ' ' '\n' | sort); do
   [ -n "${INFRA_REBOOT[$id]:-}" ] && { reboot_note=" ← ⚠ REBOOT"; HAS_REBOOT=true; }
   CONFIRM_MSG+="    ✓  $id — ${INFRA_NAME[$id]}$reboot_note\n"
 done
+# Generikus reboot figyelmeztetés — nem hardcode-olt ID-ra hivatkozik
 $HAS_REBOOT && CONFIRM_MSG+="\n  ⚠  REBOOT szükséges a jelölt modul(ok) után!\n"
 CONFIRM_MSG+="\n  Folytatjuk?"
 
@@ -244,10 +257,7 @@ dialog_yesno "Megerősítés" "$(printf '%b' "$CONFIRM_MSG")" 22 || {
   exit 0
 }
 
-# =============================================================================
-# FUTTATÁS
-# =============================================================================
-
+# ── Futtatás ──────────────────────────────────────────────────────────────────
 TOTAL_OK=0; TOTAL_SKIP=0; TOTAL_FAIL=0
 REBOOT_NEEDED=false
 
@@ -256,7 +266,8 @@ for id in $(printf '%s' "$SELECTED" | tr -d '"' | tr ' ' '\n' | sort); do
 
   log "MASTER" "━━━ INFRA $id — ${INFRA_NAME[$id]} [$MODE_TITLE] ━━━"
 
-  # Futtatás előtt töröljük a REBOOT_NEEDED flag-et az előző futásból
+  # Futtatás előtt töröljük a REBOOT_NEEDED flag-et az előző futásból,
+  # hogy csak az aktuális modul által írt érték legyen érvényes.
   infra_state_set "REBOOT_NEEDED" "false"
 
   infra_run "$id" "$SCRIPT_DIR" "$RUN_MODE"
@@ -264,10 +275,16 @@ for id in $(printf '%s' "$SELECTED" | tr -d '"' | tr ' ' '\n' | sort); do
 
   case $EC in
     0)  ((TOTAL_OK++))
+        # State-alapú REBOOT_NEEDED — az infra modul írja, mi olvassuk.
+        # Check módban: REBOOT_NEEDED soha nem propagálódik a local változóba.
+        #   Indoklás: check módban ask_proceed auto-kihagyja a lépéseket,
+        #   tehát valójában semmi sem változott → nincs reboot szükség.
+        #   Ha mégis true kerül a state-be (script bug), ezt ignoráljuk.
         if [ "$(infra_state_get "REBOOT_NEEDED" "false")" = "true" ]; then
           if [ "${RUN_MODE:-install}" = "check" ]; then
+            # Check módban: csak logolunk, NEM állítjuk be a local flag-et
             log "MASTER" "INFRA $id: OK (check mód: REBOOT_NEEDED flag ignorálva)"
-            infra_state_set "REBOOT_NEEDED" "false"
+            infra_state_set "REBOOT_NEEDED" "false"  # javítjuk is a state-et
           else
             REBOOT_NEEDED=true
             log "MASTER" "INFRA $id: OK — REBOOT_NEEDED flag aktív"
@@ -285,14 +302,9 @@ for id in $(printf '%s' "$SELECTED" | tr -d '"' | tr ' ' '\n' | sort); do
   esac
 done
 
-# =============================================================================
-# ÖSSZESÍTŐ
-# =============================================================================
-
-SUMMARY="\n  Mód: $MODE_TITLE ($RUN_MODE)\n"
-[ "$COMP_USE_CACHED" = "true" ] && \
-  SUMMARY+="  Komponens check: mentett eredmény felhasználva\n"
-SUMMARY+="\n  ✓  Sikeres:   $TOTAL_OK\n"
+# ── Összesítő ─────────────────────────────────────────────────────────────────
+SUMMARY="\n  Mód: $MODE_TITLE ($RUN_MODE)\n\n"
+SUMMARY+="  ✓  Sikeres:   $TOTAL_OK\n"
 SUMMARY+="  -  Kihagyott: $TOTAL_SKIP\n"
 [ "$TOTAL_FAIL" -gt 0 ] && SUMMARY+="  ✗  Hibás:    $TOTAL_FAIL\n"
 SUMMARY+="\n  AI log:    $LOGFILE_AI\n  Human log: $LOGFILE_HUMAN"
@@ -303,6 +315,7 @@ if $REBOOT_NEEDED; then
   SUMMARY+="\n\n  ⚠  ÚJRAINDÍTÁS SZÜKSÉGES!"
   [ -n "$_REBOOT_BY" ] && SUMMARY+="\n  Modul: INFRA ${_REBOOT_BY}"
   SUMMARY+="\n  Ok: ${_REBOOT_REASON}"
+  # Flag törlése — reboot után clean állapot
   infra_state_set "REBOOT_NEEDED" "false"
   dialog_msg "[$MODE_TITLE] Kész — Újraindítás szükséges!" "$(printf '%b' "$SUMMARY")" 24
   dialog_yesno "Újraindítás" "\n  Újraindítjuk most a gépet?" 10 && reboot
