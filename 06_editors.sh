@@ -296,9 +296,10 @@ else
   # comp_check_vscode() bővített logikával (00_lib_comp.sh)
   comp_check_vscode "${VER[vscode_min]}" "$_REAL_USER" "$_REAL_HOME"
 
-  # Cursor: AppImage fájl létezés ellenőrzés (sudo-safe)
+  # Cursor: indítóscript VAGY AppImage — bármelyik jelenléte elegendő
+  # (check módban a wrapper script nem jön létre, de az AppImage ott lehet)
   check_component "cursor" \
-    "[ -f '$_REAL_HOME/bin/cursor' ] && echo 1" "1"
+    "([ -f '$_REAL_HOME/bin/cursor' ] || [ -f '$_REAL_HOME/tools/cursor/cursor.AppImage' ]) && echo 1" "1"
 
   # Kitty: explicit PATH — sudo alatt ~/.local/kitty.app/bin nem elérhető
   check_component "kitty" \
