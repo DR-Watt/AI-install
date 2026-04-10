@@ -193,12 +193,36 @@ trap 'rm -f "$LOCK_FILE"; log "LOCK" "Lock törölve (trap EXIT)"' EXIT
 # =============================================================================
 
 # ── Hardver kompatibilitás ────────────────────────────────────────────────────
-infra_compatible "$INFRA_HW_REQ" || {
+# BUGFIX v6.3.1: infra_compatible() a V7 libben másképp implementált →
+# desktop-rtx profilra is false-t adott vissza "nvidia" HW_REQ esetén.
+# Megoldás: NE használjuk infra_compatible()-t (lib-verziófüggő!),
+# helyette közvetlen HW_PROFILE + HW_GPU_ARCH ellenőrzés az infra state-ből.
+# A master registry HW_REQ="nvidia" checkje már szűr a 02 script futtatása előtt;
+# itt csak a tényleg GPU-mentes gépeket zárjuk ki dupla biztonsági net-ként.
+_hw_nvidia_ok=false
+case "${HW_PROFILE:-}" in
+  desktop-rtx|desktop-rtx-old|notebook-rtx)
+    _hw_nvidia_ok=true ;;   # profil alapján egyértelműen NVIDIA
+esac
+# Ha profil alapján nem egyértelmű: GPU_ARCH alapján döntünk
+# (pl. V7-ben más profil nevek jöhetnek)
+if ! $_hw_nvidia_ok; then
+  case "${HW_GPU_ARCH:-}" in
+    blackwell|ada|ampere|turing|pascal|nvidia*)
+      _hw_nvidia_ok=true ;;  # arch alapján NVIDIA
+  esac
+fi
+# Ha HW_VLLM_OK=true vagy FEAT_GPU_ACCEL=true → biztosan van NVIDIA GPU
+[ "$(infra_state_get "HW_VLLM_OK"    "false")" = "true" ] && _hw_nvidia_ok=true
+[ "$(infra_state_get "FEAT_GPU_ACCEL" "false")" = "true" ] && _hw_nvidia_ok=true
+
+if ! $_hw_nvidia_ok; then
+  log "SKIP" "Hardver inkompatibilis: profil=${HW_PROFILE} arch=${HW_GPU_ARCH} — nincs NVIDIA GPU"
   dialog_warn "Hardver inkompatibilis — 02 kihagyva" \
-    "\n  A 02-es modul NVIDIA GPU-t igényel.\n\n  Jelenlegi profil: $HW_PROFILE\n  HW követelmény:  $INFRA_HW_REQ\n\n  Modul kihagyva (exit 2)." 14
-  log "SKIP" "Hardver inkompatibilis: $HW_PROFILE (kell: $INFRA_HW_REQ)"
+    "\n  A 02-es modul NVIDIA GPU-t igényel.\n\n  Jelenlegi profil: ${HW_PROFILE}\n  GPU arch:        ${HW_GPU_ARCH}\n\n  Modul kihagyva (exit 2)." 14
   exit 2
-}
+fi
+log "HW" "NVIDIA GPU ellenőrzés OK: profil=${HW_PROFILE} / arch=${HW_GPU_ARCH}"
 
 # ── 03-as modul függőség ellenőrzés ───────────────────────────────────────────
 # A lib infra_require() kezeli a mód-alapú bypass-t:
