@@ -272,22 +272,40 @@ log_install_paths \
 # KOMPONENS FELMÉRÉS
 # =============================================================================
 
-# comp_check_vscode: dedikált ellenőrző a 00_lib_comp.sh-ból
-# (code --version alapján, version_ok összehasonlítással)
-comp_check_vscode "${VER[vscode_min]}"
+# COMP STATE: mentett check eredmény betöltése VAGY friss ellenőrzés
+# COMP_USE_CACHED=true: a 00_master.sh exportálja, ha a user kérte
+# comp_state_exists / comp_load_state / comp_save_state: 00_lib_comp.sh
+if [ "${COMP_USE_CACHED:-false}" = "true" ] && comp_state_exists "$INFRA_NUM"; then
+  # ── Mentett eredmény betöltése ───────────────────────────────────────────────
+  # comp_load_state: COMP_STATUS[] és COMP_VER[] tömbök feltöltése state fájlból
+  # Megjegyzés: ez NEM fut check-et, csak a korábban mentett értékeket tölti be.
+  comp_load_state "$INFRA_NUM"
+  _state_age=$(comp_state_age_hours "$INFRA_NUM")
+  log "COMP" "Mentett check eredmény betöltve — INFRA $INFRA_NUM (${_state_age} óra)"
+else
+  # ── Friss komponens ellenőrzés ───────────────────────────────────────────────
+  # comp_check_vscode: dedikált ellenőrző (00_lib_comp.sh) — PATH fix benne
+  comp_check_vscode "${VER[vscode_min]}"
 
-# Cursor, Kitty, CLINE, Continue: nincs dedikált comp_check_ → generikus
-# check_component: eval-alapú, COMP_STATUS[] és COMP_VER[] tömböt tölti fel
-check_component "cursor" \
-  "[ -f '$_REAL_HOME/bin/cursor' ] && echo 1" "1"
-check_component "kitty" \
-  "kitty --version 2>/dev/null | grep -oP '[\d.]+' | head -1" "${VER[kitty_min]}"
-check_component "cline" \
-  "code --list-extensions 2>/dev/null | grep -q saoudrizwan.claude-dev && echo 1" "1"
-check_component "continue_dev" \
-  "code --list-extensions 2>/dev/null | grep -q continue.continue && echo 1" "1"
+  # Cursor, Kitty, CLINE, Continue: nincs dedikált comp_check_ → generikus
+  # check_component: eval-alapú, COMP_STATUS[] és COMP_VER[] tömböt tölti fel
+  check_component "cursor" \
+    "[ -f '$_REAL_HOME/bin/cursor' ] && echo 1" "1"
+  check_component "kitty" \
+    "kitty --version 2>/dev/null | grep -oP '[\d.]+' | head -1" "${VER[kitty_min]}"
+  check_component "cline" \
+    "PATH='/usr/bin:/usr/local/bin:$PATH' code --list-extensions 2>/dev/null | grep -q saoudrizwan.claude-dev && echo 1" "1"
+  check_component "continue_dev" \
+    "PATH='/usr/bin:/usr/local/bin:$PATH' code --list-extensions 2>/dev/null | grep -q continue.continue && echo 1" "1"
+
+  # comp_save_state: ellenőrzés eredményét elmenti ~/.infra-state-be
+  # Kulcsok: COMP_06_S_<NÉV>=ok|old|missing, COMP_06_V_<NÉV>=verzió, COMP_06_TS=timestamp
+  # Következő master indításnál a user dönthet: felhasználja-e ezeket
+  comp_save_state "$INFRA_NUM"
+fi
 
 # log_comp_status: COMP_CHECK tömb alapján logba írja az állapotot
+# (COMP_STATUS[] tömb értékeit mutatja — akár fresh, akár cached)
 log_comp_status "${COMP_CHECK[@]}"
 
 # Összes ellenőrzött kulcs — detect_run_mode() nameref-ként kapja
@@ -394,12 +412,17 @@ if cmd_exists code; then
     "c64"      "C64 / Assembly (64tass, kick-assembler, ACME)"    "ON" \
     "sysadmin" "Sysadmin (shellcheck, ansible, PowerShell, YAML)" "ON")
 
-  if ask_proceed "Extension-ök telepítése?"; then
+  # Extension telepítés: nincs külön ask_proceed — ha a user elindította a
+  # 06-os szálat és a VS Code elérhető, az extension-ök automatikusan települnek.
+  # Check módban: ask_proceed (ami belül van a _install_ext hívásokra) nem fut,
+  # de itt a check mód-ot a RUN_MODE alapján kezeljük.
+  if [ "$RUN_MODE" != "skip" ]; then
     progress_open "VS Code Extensions" "Extension-ök telepítése..."
     ext_i=0
 
     # Segéd: extension telepítése a valódi user HOME-jában
     # HOME="$_REAL_HOME": code felismeri a user profil könyvtárát
+    # sudo -u "$_REAL_USER": nem root profiljára telepít
     _install_ext() {
       local ext="$1"
       [ -z "$ext" ] && return
@@ -408,7 +431,7 @@ if cmd_exists code; then
         >> "$LOGFILE_AI" 2>&1 || true
     }
 
-    # Alap + AI profil: mindig települ
+    # Alap + AI profil: mindig települ (nem ajánlható fel kihagyásra)
     log "INFO" "Alap + AI extension-ök telepítése"
     for ext in ${VSCODE_EXT[base]} ${VSCODE_EXT[ai]}; do
       _install_ext "$ext"
@@ -416,9 +439,9 @@ if cmd_exists code; then
       progress_set $((ext_i * 2 < 60 ? ext_i * 2 : 59)) "Alap/AI: $ext"
     done
 
-    # Kiválasztott opcionális profilok
+    # Kiválasztott opcionális profilok (checklist-ből)
     for profile in $SELECTED_PROFILES; do
-      profile="${profile//\"/}"   # idézőjel eltávolítás
+      profile="${profile//\"/}"   # idézőjel eltávolítás (YAD visszaad)
       [ -z "$profile" ] && continue
       [ -z "${VSCODE_EXT[$profile]:-}" ] && continue
       log "INFO" "Profil extension-ök: $profile"
@@ -432,10 +455,9 @@ if cmd_exists code; then
     progress_close
     ((OK++))
     log "OK" "VS Code extension-ök telepítve ($ext_i db)"
-
   else
     ((SKIP++))
-    log "SKIP" "Extension telepítés kihagyva"
+    log "SKIP" "Extension telepítés kihagyva (skip mód)"
   fi
 fi
 

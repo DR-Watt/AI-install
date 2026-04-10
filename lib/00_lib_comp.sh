@@ -5,6 +5,11 @@
 # LEÍRÁS: Komponens ellenőrzők: version_ok, comp_check_*, comp_line
 # BETÖLTÉS: source-olja a 00_lib.sh master loader
 # NE futtasd közvetlenül!
+#
+# VÁLTOZTATÁSOK v6.4.1 (comp_check_vscode PATH fix):
+#   - comp_check_vscode(): explicit PATH="/usr/bin:/usr/local/bin:$PATH"
+#     Tünet: sudo alatt root PATH nem tartalmazza /usr/bin-t → code "missing"
+#     annak ellenére, hogy a VS Code telepítve van (/usr/bin/code)
 # ============================================================================
 
 # SZEKCIÓ 7 — VERZIÓ KEZELÉS
@@ -368,10 +373,17 @@ comp_check_torch() {
 }
 
 # comp_check_vscode: code --version (Microsoft VS Code).
+# Forrás: code --version (VS Code CLI)
+# FONTOS: sudo alatt a root PATH esetleg nem tartalmazza /usr/bin-t,
+#   ahol a VS Code bináris van (Ubuntu: /usr/bin/code, deb csomag telepíti).
+#   Explicit PATH megadás szükséges — enélkül sudo futtatáskor "missing"
+#   eredményt ad annak ellenére, hogy a VS Code telepítve van.
 comp_check_vscode() {
   local min="${1:-1.85}"
   local ver
-  ver=$(code --version 2>/dev/null | head -1 | grep -oP '[\d.]+')
+  # Explicit PATH: /usr/bin elsőként — sudo PATH nem örökli a user PATH-ját
+  ver=$(PATH="/usr/bin:/usr/local/bin:$PATH" code --version 2>/dev/null \
+        | head -1 | grep -oP '[\d.]+')
   [ -z "$ver" ] && {
     COMP_STATUS[vscode]="missing"
     COMP_VER[vscode]=""
@@ -459,19 +471,15 @@ nvidia_mok_status() {
   local mok_cert="/var/lib/shim-signed/mok/MOK.der"
   [ ! -f "$mok_cert" ] && { echo "no_cert"; return; }
 
-  # A MOK.der tanúsítványból kinyerjük a CN-t (Common Name)
-  # Ez az azonosítója, amit az UEFI megjelenít enrollment/listázáskor
   local cn
   cn=$(openssl x509 -in "$mok_cert" -noout -subject 2>/dev/null \
        | grep -oP 'CN\s*=\s*\K[^,/]+' | head -1 || echo "DKMS")
 
-  # Enrolled: az UEFI firmware már ismeri és elfogadja ezt a kulcsot
   local enrolled_count
   enrolled_count=$(mokutil --list-enrolled 2>/dev/null \
                    | grep -i "CN=" | grep -ci "$cn" 2>/dev/null || echo 0)
   [ "${enrolled_count:-0}" -gt 0 ] && { echo "enrolled"; return; }
 
-  # Pending: mokutil --import már lefutott, reboot után az UEFI megkérdezi
   local pending_count
   pending_count=$(mokutil --list-new 2>/dev/null \
                   | grep -c "Subject:" 2>/dev/null || echo 0)
@@ -482,13 +490,6 @@ nvidia_mok_status() {
 
 # nvidia_mok_enroll: MOK enrollment végrehajtása ha szükséges
 # ────────────────────────────────────────────────────────────
-# Visszatér: 0=sikeres vagy már enrolled/pending, 1=hiba, 2=nincs MOK.der
-# Mellékhatás: MOK_ENROLL_PASS és MOK_ENROLL_PENDING infra state-be kerül
-# Megjegyzés:
-#   - Ha enrolled: semmi teendő, state MOK_ENROLL_PENDING=false
-#   - Ha pending: korábban már bejegyezve, jelszó state-ből olvasható
-#   - Ha not_enrolled: véletlenszerű jelszóval importál, state-be ment
-#   - Ha no_cert: DKMS nem hozta létre a kulcsot, dkms autoinstall szükséges
 nvidia_mok_enroll() {
   local mok_cert="/var/lib/shim-signed/mok/MOK.der"
   [ ! -f "$mok_cert" ] && {
@@ -498,7 +499,7 @@ nvidia_mok_enroll() {
 
   local status
   status=$(nvidia_mok_status)
-  log "INFO" "MOK állapot: $status (CN: $(openssl x509 -in "$mok_cert" -noout -subject 2>/dev/null | grep -oP 'CN\s*=\s*\K[^,/]+' | head -1 || echo '?'))"
+  log "INFO" "MOK állapot: $status"
 
   case "$status" in
     enrolled)
@@ -515,14 +516,11 @@ nvidia_mok_enroll() {
       return 0
       ;;
     not_enrolled)
-      # Véletlenszerű 6 hex karakteres jelszó
       local pass
       pass="mok-$(openssl rand -hex 3 2>/dev/null || date +%s | tail -c 6)"
-
       printf '%s\n%s\n' "$pass" "$pass" | \
         mokutil --import "$mok_cert" >> "${LOGFILE_AI:-/dev/null}" 2>&1
       local ec=$?
-
       if [ $ec -eq 0 ]; then
         infra_state_set "MOK_ENROLL_PENDING" "true"
         infra_state_set "MOK_ENROLL_PASS"    "$pass"
@@ -541,11 +539,6 @@ nvidia_mok_enroll() {
 }
 
 # cuda_best_available: legjobb elérhető CUDA toolkit verziót adja vissza
-# ─────────────────────────────────────────────────────────────────────
-# Output (echo): "13.2" | "13.1" | "13.0" | "12.8" | "12.6" | ""
-# Prioritási lánc az NVIDIA CUDA repo tartalma alapján (ubuntu2404/x86_64):
-#   13.2: 2026-03-16 | 13.1: 2026-01 | 13.0: 2025-11
-#   12.8: első SM_120 natív | 12.6: Ada/Ampere stabil LTS
 # Forrás: https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/
 cuda_best_available() {
   for _cv in "13-2" "13-1" "13-0" "12-8" "12-6"; do
@@ -556,10 +549,6 @@ cuda_best_available() {
 }
 
 # cuda_pytorch_index: CUDA verziószámból PyTorch cu-index string
-# ──────────────────────────────────────────────────────────────
-# Példa: "12.6"→"cu126", "12.8"→"cu128", "13.0"→"cu128", "13.2"→"cu128"
-# Megjegyzés: CUDA 13.x esetén cu128-at adunk vissza, mert 2026-04-ban
-# még nincs cu13x PyTorch wheel — a CUDA 13 ABI backward-kompatibilis cu128-cal.
 cuda_pytorch_index() {
   local ver="${1:-12.6}"
   local major
@@ -571,3 +560,142 @@ cuda_pytorch_index() {
   fi
 }
 # =============================================================================
+
+# =============================================================================
+# SZEKCIÓ 8c — COMP STATE: MENTETT CHECK EREDMÉNYEK KEZELÉSE
+# =============================================================================
+# CÉLJA: A komponens ellenőrzés eredményét elmenti az infra state fájlba,
+#   hogy a 00_master.sh a következő indításnál felajánlhassa a felhasználását.
+#   Így nem kell minden egyes telepítési session elején újra végigfutni az
+#   összes comp_check_* hívást — elég egyszer lefuttatni check módban.
+#
+# STATE KULCSOK (példa INFRA 06-ra):
+#   COMP_06_TS=2026-04-10T16:30:04    — mikor futott le a check
+#   COMP_06_S_VSCODE=ok               — státusz (ok|old|missing|broken)
+#   COMP_06_V_VSCODE=1.96.0           — verzió (ha van)
+#   COMP_06_S_CURSOR=missing
+#   COMP_06_S_CONTINUE_DEV=ok         — underscore megtartva
+#   COMP_06_V_CONTINUE_DEV=0.9.210
+#
+# KONVENCIÓ:
+#   - Kulcs prefix: COMP_<INFRA_NUM_UPPER>_  pl. "06" → "COMP_06_"
+#   - S_ prefix: státusz (COMP_STATUS[])
+#   - V_ prefix: verzió  (COMP_VER[])
+#   - TS: timestamp (ISO 8601)
+#   - Komponens nevek: lowercase → UPPER a mentéskor, UPPER → lowercase a betöltéskor
+# =============================================================================
+
+# comp_save_state: COMP_STATUS[] és COMP_VER[] tömbök mentése az infra state-be.
+# Paraméterek: $1=infra_num (pl. "06", "01a")
+# Megjegyzés: infra_state_set()-et használja → atomikus sor-csere/hozzáadás
+comp_save_state() {
+  local infra_num="$1"
+  # Kulcs prefix: uppercase, pl. "06" → "COMP_06", "01a" → "COMP_01A"
+  local pfx="COMP_$(printf '%s' "$infra_num" | tr '[:lower:]' '[:upper:]')"
+
+  # Timestamp: ISO 8601 másodpercig
+  infra_state_set "${pfx}_TS" "$(date '+%Y-%m-%dT%H:%M:%S')"
+
+  # Minden COMP_STATUS[] bejegyzés mentése S_ prefixszel
+  local comp_name key
+  for comp_name in "${!COMP_STATUS[@]}"; do
+    # Komponens név → uppercase kulcs: "continue_dev" → "CONTINUE_DEV"
+    key="$(printf '%s' "$comp_name" | tr '[:lower:]' '[:upper:]')"
+    infra_state_set "${pfx}_S_${key}" "${COMP_STATUS[$comp_name]:-missing}"
+    # Verzió mentése V_ prefixszel (ha van)
+    if [ -n "${COMP_VER[$comp_name]:-}" ]; then
+      infra_state_set "${pfx}_V_${key}" "${COMP_VER[$comp_name]}"
+    fi
+  done
+
+  log "STATE" "Komponens állapot mentve: ${pfx}_* (${#COMP_STATUS[@]} komponens)"
+}
+
+# comp_load_state: mentett COMP state beolvasása COMP_STATUS[] és COMP_VER[]-be.
+# Paraméterek: $1=infra_num
+# Visszatér: 0 ha sikeresen betöltött, 1 ha nincs mentett state
+comp_load_state() {
+  local infra_num="$1"
+  local pfx="COMP_$(printf '%s' "$infra_num" | tr '[:lower:]' '[:upper:]')"
+
+  [ ! -f "$INFRA_STATE_FILE" ] && return 1
+
+  # Timestamp ellenőrzés — ha nincs, nincs mentett state
+  local ts
+  ts=$(infra_state_get "${pfx}_TS" "")
+  [ -z "$ts" ] && return 1
+
+  # Beolvasás: minden sor ami a megfelelő prefix-szel kezdődik
+  local line key val comp_key comp_name
+  while IFS= read -r line; do
+    # Üres sor vagy komment kihagyása
+    [[ -z "$line" || "$line" == \#* ]] && continue
+
+    key="${line%%=*}"     # kulcs: az első = előtt
+    val="${line#*=}"      # érték: az első = után (többszörös = esetén is helyes)
+
+    if [[ "$key" == "${pfx}_S_"* ]]; then
+      # Státusz kulcs: COMP_06_S_CONTINUE_DEV → comp_name="continue_dev"
+      comp_key="${key#${pfx}_S_}"
+      comp_name="$(printf '%s' "$comp_key" | tr '[:upper:]' '[:lower:]')"
+      COMP_STATUS["$comp_name"]="$val"
+
+    elif [[ "$key" == "${pfx}_V_"* ]]; then
+      # Verzió kulcs: COMP_06_V_VSCODE → comp_name="vscode"
+      comp_key="${key#${pfx}_V_}"
+      comp_name="$(printf '%s' "$comp_key" | tr '[:upper:]' '[:lower:]')"
+      COMP_VER["$comp_name"]="$val"
+    fi
+  done < "$INFRA_STATE_FILE"
+
+  log "STATE" "Komponens állapot betöltve: ${pfx} (check: $ts)"
+  return 0
+}
+
+# comp_state_exists: van-e mentett check eredmény az adott INFRA modulhoz?
+# Paraméterek: $1=infra_num
+# Visszatér: 0 ha van, 1 ha nincs
+comp_state_exists() {
+  local infra_num="$1"
+  local pfx="COMP_$(printf '%s' "$infra_num" | tr '[:lower:]' '[:upper:]')"
+  local ts
+  ts=$(infra_state_get "${pfx}_TS" "")
+  [ -n "$ts" ]
+}
+
+# comp_state_age_hours: mennyi óra telt el a mentett check óta?
+# Paraméterek: $1=infra_num
+# Kimenet (echo): egész szám (órák), vagy "?" ha nem meghatározható
+comp_state_age_hours() {
+  local infra_num="$1"
+  local pfx="COMP_$(printf '%s' "$infra_num" | tr '[:lower:]' '[:upper:]')"
+  local ts
+  ts=$(infra_state_get "${pfx}_TS" "")
+  [ -z "$ts" ] && { echo "?"; return; }
+
+  local then now
+  # date -d: GNU coreutils (Ubuntu-n elérhető)
+  then=$(date -d "$ts" +%s 2>/dev/null || echo "0")
+  now=$(date +%s)
+  echo $(( (now - then) / 3600 ))
+}
+
+# comp_state_master_summary: összes INFRA modul cached state összefoglalója
+# Kimenet (echo): többsoros szöveg a dialog_yesno-hoz
+# Paraméterek: $@=INFRA_IDS tömb értékei
+comp_state_master_summary() {
+  local infra_ids=("$@")
+  local count=0
+  local out=""
+  local id pfx ts hours
+  for id in "${infra_ids[@]}"; do
+    pfx="COMP_$(printf '%s' "$id" | tr '[:lower:]' '[:upper:]')"
+    ts=$(infra_state_get "${pfx}_TS" "")
+    [ -z "$ts" ] && continue
+    hours=$(comp_state_age_hours "$id")
+    out+="    INFRA ${id}: ${INFRA_NAME[$id]:-?} (${ts}, ${hours}h ezelőtt)\n"
+    ((count++))
+  done
+  echo "$count"   # első sor: darabszám
+  printf '%b' "$out"  # többi sor: lista
+}
