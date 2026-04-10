@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# 01a_system_foundation.sh — System Foundation v6.4.1
+# 01a_system_foundation.sh — System Foundation v6.4.2
 #                            Ubuntu 24 LTS | NVIDIA | CUDA | Docker
 #
 # Szerepe az INFRA rendszerben
@@ -12,6 +12,10 @@
 #   CUDA:   https://docs.nvidia.com/cuda/cuda-installation-guide-linux/
 #   Docker: https://docs.docker.com/engine/install/ubuntu/
 #   CTK:    https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/
+#
+# Változtatások v6.4.2:
+#   - "Következő lépések" dialog: check módban egyszerűsített szöveg (reboot nélkül)
+#   - dialog_yesno "Újraindítás most?": csak ha RUN_MODE != check ÉS OK > 0
 #
 # Változtatások v6.4.1:
 #   - INST_* state szinkronizálás a comp_check után
@@ -1071,7 +1075,23 @@ _MOK_NOTE=""
      3. Yes → Reboot
 "
 
-dialog_msg "Következő lépések — INFRA ${INFRA_NUM}" "
+# ── "Következő lépések" dialóg — check módban NEM mutat reboot ajánlatot ────
+# Check módban semmi sem változott → reboot szükségtelen és félrevezető.
+if [ "${RUN_MODE:-install}" = "check" ]; then
+  dialog_msg "[Ellenőrző] Kész — INFRA ${INFRA_NUM}" "
+  GPU mód: $GPU_MODE
+  MOK állapot: $(nvidia_mok_status 2>/dev/null || echo '?')
+
+  Minden komponens naprakész — változtatás nem történt.
+  Ellenőrző mód: a rendszer nem módosult.
+
+  Komponens összesítő:
+${STATUS}
+  AI log: $LOGFILE_AI" 20
+
+else
+  # Normál mód (install / update / fix): teljes összefoglaló reboot ajánlattal
+  dialog_msg "Következő lépések — INFRA ${INFRA_NUM}" "
   GPU mód: $GPU_MODE
   $([ "$GPU_MODE" = "hybrid" ] \
     && echo "  Kábelezés: 1 monitor alaplapon (iGPU), 1 az RTX portján" \
@@ -1090,13 +1110,18 @@ ${_MOK_NOTE}
   ⚠  REBOOT SZÜKSÉGES!  →  sudo reboot
   Reboot után: 01b_post_reboot.sh" 30
 
-dialog_yesno "Újraindítás most?" "
+  # Reboot ajánlat: csak ha tényleg volt telepítés (OK > 0)
+  # fix módban OK lehet > 0, de a REBOOT_NEEDED guard false-ra tartja
+  if [ "${OK:-0}" -gt 0 ]; then
+    dialog_yesno "Újraindítás most?" "
   $([ "$_mok_pending" = "true" ] && [ -n "$_pass_final" ] && \
     printf '  ⚠  MOK jelszó: %s  (kék képernyőn)\n\n' "$_pass_final")
   Újraindítjuk?" 14 && {
-  log "REBOOT" "Felhasználó azonnali reboot-ot kért"
-  reboot
-}
+      log "REBOOT" "Felhasználó azonnali reboot-ot kért"
+      reboot
+    }
+  fi
+fi
 
 trap - EXIT; rm -f "$LOCK"
 log "DONE" "INFRA ${INFRA_NUM} befejezve: OK=$OK SKIP=$SKIP FAIL=$FAIL"

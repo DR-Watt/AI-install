@@ -1,6 +1,11 @@
 #!/bin/bash
 # =============================================================================
-# 00_master.sh — Vibe Coding Workspace Installer v6.4
+# 00_master.sh — Vibe Coding Workspace Installer v6.4.2
+#
+# Változtatások v6.4.2 (fix mód + reboot suppress):
+#   - Módválasztó: 4. opció "javítás" (fix) mód
+#     fix módban ask_proceed() interaktív, REBOOT_NEEDED guard aktív
+#     Cél: hiányzó komponensek pótlása reboot nélkül, majd újraellenőrzés
 #
 # Változtatások v6.4 (split lib rendszer + bug fixek):
 #   - LIB_VERSION ellenőrzés: minimum 6.4 (split lib, infra_require fix)
@@ -60,7 +65,7 @@ source "$REGISTRY"
 # ── LIB_VERSION ellenőrzés ────────────────────────────────────────────────────
 # 00_lib.sh v6.4+ szükséges: split lib (lib/ alkönyvtár), infra_require case fix,
 # detect_run_mode check mód javítás, YAD Pango font, hw_detect dpkg driver detektálás.
-_LIB_MIN="6.4"
+_LIB_MIN="6.4.2"
 if ! printf '%s\n%s\n' "$_LIB_MIN" "$LIB_VERSION" | sort -V | head -1 | grep -qx "$_LIB_MIN"; then
   echo "HIBA: 00_lib.sh verzió $LIB_VERSION < minimum $_LIB_MIN"
   echo "Frissítsd a 00_lib.sh fájlt!"
@@ -82,7 +87,7 @@ infra_state_validate
 infra_state_show
 
 # ── Üdvözlő + telepítési rend ─────────────────────────────────────────────────
-dialog_msg "Vibe Coding Workspace v6.4" "
+dialog_msg "Vibe Coding Workspace v6.4.2" "
   Ubuntu 24 LTS + RTX 5090 fejlesztői környezet
 
   GPU:     $HW_GPU_NAME
@@ -113,10 +118,11 @@ sudo_init
 # ── Működési mód választás ────────────────────────────────────────────────────
 GLOBAL_MODE=$(dialog_menu "Működési mód" "
   Mit szeretnél csinálni?" \
-  16 3 \
+  18 4 \
   "install" "Telepítő   — hiányzó komponensek felrakása" \
   "update"  "Frissítő   — meglévők frissítése újabb verzióra" \
-  "check"   "Ellenőrző  — csak állapot felmérés, semmi sem változik")
+  "check"   "Ellenőrző  — csak állapot felmérés, semmi sem változik" \
+  "fix"     "Javítás    — hiányzó komponensek pótlása (reboot nélkül)")
 
 [ -z "$GLOBAL_MODE" ] && { dialog_msg "Kilépés" "\n  Megszakítva."; exit 0; }
 export RUN_MODE="$GLOBAL_MODE"
@@ -126,6 +132,7 @@ case "$RUN_MODE" in
   install) MODE_TITLE="Telepítő" ;;
   update)  MODE_TITLE="Frissítő" ;;
   check)   MODE_TITLE="Ellenőrző" ;;
+  fix)     MODE_TITLE="Javítás" ;;
   *)       MODE_TITLE="$RUN_MODE" ;;
 esac
 

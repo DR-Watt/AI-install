@@ -30,6 +30,10 @@
 #   Minden szál olvas belőle; a 01-es szál írja az alapadatokat.
 #
 #
+# VÁLTOZTATÁSOK v6.4.2 (fix mód + reboot suppress)
+#   - ask_proceed(): "fix" módban interaktív (nem auto-skip mint check-ben)
+#   - show_result(): "fix" mód cím "Javítás"
+#
 # VÁLTOZTATÁSOK v6.4.1 (log jogosultság fix)
 #   - log_init(): chown "$_REAL_UID:$_REAL_GID" a LOG_DIR + log fájlokra
 #     sudo futtatáskor root:root lenne → automatikusan javítja a user-re
@@ -98,7 +102,7 @@
 # =============================================================================
 
 # ── Verzió ────────────────────────────────────────────────────────────────────
-LIB_VERSION="6.4.1"
+LIB_VERSION="6.4.2"
 
 # =============================================================================
 # SZEKCIÓ 1 — GLOBÁLIS VÁLTOZÓK ÉS KONSTANSOK
@@ -346,6 +350,7 @@ show_result() {
     install)   mode_label="Telepítő"     ;;
     update)    mode_label="Frissítő"     ;;
     check)     mode_label="Ellenőrző"    ;;
+    fix)       mode_label="Javítás"      ;;
     reinstall) mode_label="Újratelepítő" ;;
     *)         mode_label="$RUN_MODE"    ;;
   esac
@@ -462,6 +467,12 @@ ask_proceed() {
     log "AUTO" "[check mód] kihagyva: $prompt"
     return 1   # "nem" — a lépés nem fut le
   fi
+
+  # ── Fix (javítás) mód: interaktív — user dönt ────────────────────────────────
+  # "fix" módban a user dönthet hogy telepíti-e a hiányzó komponenst.
+  # Reboot-ot igénylő lépések a REBOOT_NEEDED guard miatt nem okoznak reboottot.
+  # A "fix" mód az install/update-hez hasonlóan interactive.
+  # (nincs külön ág — a "fix" mód az alábbi interactive blokkba esik)
 
   # ── Automatikus mód (pl. CI/CD, STEP_INTERACTIVE=false) ─────────────────────
   if [ "$STEP_INTERACTIVE" = "false" ]; then

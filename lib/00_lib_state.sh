@@ -276,8 +276,8 @@ infra_require() {
   if [ "$done_val" != "true" ]; then
     # Check módban: csak logolunk, NEM blokkoljuk a futást
     # Az ellenőrző módnak mindenképpen le kell futnia függőség nélkül is
-    if [ "${RUN_MODE:-install}" = "check" ]; then
-      log "WARN" "Check mód: $done_key != true — ellenőrzés engedélyezve (nem blokkol)"
+    if [ "${RUN_MODE:-install}" = "check" ] ||        [ "${RUN_MODE:-install}" = "fix" ]; then
+      log "WARN" "${RUN_MODE} mód: $done_key != true — bypass (nem blokkol)"
       return 0
     fi
 
@@ -332,9 +332,9 @@ detect_run_mode() {
     esac
   done
 
-  # Check módban a mód változatlan marad — csak nézünk, nem döntünk
-  if [ "${RUN_MODE:-install}" = "check" ]; then
-    export RUN_MODE="check"
+  # Check és fix módban a mód változatlan marad — csak nézünk/javítunk, nem döntünk
+  if [ "${RUN_MODE:-install}" = "check" ] ||      [ "${RUN_MODE:-install}" = "fix" ]; then
+    export RUN_MODE
     return 0
   fi
 
