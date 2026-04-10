@@ -312,10 +312,14 @@ else
   check_component "continue_dev" \
     "HOME='$_REAL_HOME' sudo -u '$_REAL_USER' code --list-extensions 2>/dev/null | grep -q continue.continue && echo 1" "1"
 
-  # comp_save_state: ellenőrzés eredményét elmenti ~/.infra-state-be
-  # Kulcsok: COMP_06_S_<NÉV>=ok|old|missing, COMP_06_V_<NÉV>=verzió, COMP_06_TS=timestamp
-  # Következő master indításnál a user dönthet: felhasználja-e ezeket
-  comp_save_state "$INFRA_NUM"
+  # comp_save_state: CHECK módban az elején mentünk — semmi sem változik,
+  # ezért az eleje = a vége (pre-check = post-check állapot).
+  # Install/update/fix/reinstall módban NEM mentünk itt — ott a script VÉGÉN
+  # fut egy teljes re-check + comp_save_state, MIUTÁN minden telepítés kész.
+  if [ "$RUN_MODE" = "check" ]; then
+    comp_save_state "$INFRA_NUM"
+    log "COMP" "Check mód: COMP state mentve"
+  fi
 fi
 
 # log_comp_status: COMP_CHECK tömb alapján logba írja az állapotot
@@ -785,34 +789,31 @@ done
 infra_state_set "MOD_06_DONE" "true"
 log "STATE" "MOD_06_DONE=true → state fájlba írva"
 
-# ── Post-install COMP STATE frissítés ────────────────────────────────────────
-# A comp_save_state a script ELEJÉN fut (telepítés előtt), ezért a state-ben
-# a pre-install állapot van. Ha telepítettünk valamit, itt frissítjük a
-# state-t fájl alapú gyors check-ekkel — újabb code --version nélkül.
+# ── Post-install COMP STATE: teljes re-check + mentés ────────────────────────
+# LOGIKA:
+#   check mód     → comp_save_state az ELEJÉN fut (semmi sem változik → eleje = vége)
+#   install/update/fix/reinstall → re-check ITT, a telepítés UTÁN fut
+#     Így a state mindig a script UTÁNI valódi állapotot tükrözi.
+#
+# A check-ek megismétlése szükséges — nincs rövidebb, megbízható módja annak,
+# hogy az összes telepítés eredményét egyetlen lépésben ellenőrizzük.
 
-log "COMP" "Post-install COMP state frissítés..."
+if [[ "$RUN_MODE" =~ ^(install|update|fix|reinstall)$ ]]; then
+  log "COMP" "Post-install re-check futtatása (mód: $RUN_MODE)..."
 
-# Cursor: AppImage VAGY indítóscript jelenléte = ok
-if [ -f "$_REAL_HOME/bin/cursor" ] || \
-   [ -f "$_REAL_HOME/tools/cursor/cursor.AppImage" ]; then
-  COMP_STATUS[cursor]="ok"
-  COMP_VER[cursor]="AppImage"
-  infra_state_set "COMP_06_S_CURSOR" "ok"
-  infra_state_set "COMP_06_V_CURSOR" "AppImage"
-  log "COMP" "Post-install: cursor → ok"
+  comp_check_vscode "${VER[vscode_min]}" "$_REAL_USER" "$_REAL_HOME"
+
+  check_component "cursor"     "([ -f '$_REAL_HOME/bin/cursor' ] || [ -f '$_REAL_HOME/tools/cursor/cursor.AppImage' ]) && echo 1" "1"
+
+  check_component "kitty"     "PATH='$_REAL_HOME/bin:$_REAL_HOME/.local/kitty.app/bin:/usr/bin:$PATH' kitty --version 2>/dev/null | grep -oP '[\d.]+' | head -1" "${VER[kitty_min]}"
+
+  check_component "cline"     "HOME='$_REAL_HOME' sudo -u '$_REAL_USER' code --list-extensions 2>/dev/null | grep -q saoudrizwan.claude-dev && echo 1" "1"
+
+  check_component "continue_dev"     "HOME='$_REAL_HOME' sudo -u '$_REAL_USER' code --list-extensions 2>/dev/null | grep -q continue.continue && echo 1" "1"
+
+  comp_save_state "$INFRA_NUM"
+  log "COMP" "Post-install COMP state mentve: COMP_06_* (telepítés utáni valós állapot)"
 fi
-
-# Kitty: fájl alapú
-if [ -f "$_REAL_HOME/.local/kitty.app/bin/kitty" ] || \
-   [ -f "$_REAL_HOME/bin/kitty" ]; then
-  COMP_STATUS[kitty]="ok"
-  infra_state_set "COMP_06_S_KITTY" "ok"
-  log "COMP" "Post-install: kitty → ok"
-fi
-
-# Timestamp frissítése
-infra_state_set "COMP_06_TS" "$(date '+%Y-%m-%dT%H:%M:%S')"
-log "STATE" "COMP_06 post-install state mentve"
 
 # =============================================================================
 # ÖSSZESÍTŐ
