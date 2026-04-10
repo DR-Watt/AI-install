@@ -30,6 +30,11 @@
 #   Minden szál olvas belőle; a 01-es szál írja az alapadatokat.
 #
 #
+# VÁLTOZTATÁSOK v6.4.1 (log jogosultság fix)
+#   - log_init(): chown "$_REAL_UID:$_REAL_GID" a LOG_DIR + log fájlokra
+#     sudo futtatáskor root:root lenne → automatikusan javítja a user-re
+#     Korábban: minden futás után 'sudo chown -R $USER ~/AI-LOG-INFRA-SETUP' kellett
+#
 # VÁLTOZTATÁSOK v6.4 (UI + Driver detektálás javítás)
 #   - hw_detect(): HW_NVIDIA_PKG most ténylegesen telepített driverre mutat
 #       dpkg -l 'nvidia-driver-*-open' → legmagasabb telepített sorozat
@@ -93,7 +98,7 @@
 # =============================================================================
 
 # ── Verzió ────────────────────────────────────────────────────────────────────
-LIB_VERSION="6.4"
+LIB_VERSION="6.4.1"
 
 # =============================================================================
 # SZEKCIÓ 1 — GLOBÁLIS VÁLTOZÓK ÉS KONSTANSOK
@@ -210,6 +215,15 @@ _tee_streams() {
 # Hívás: script elején, INFRA_NAME és RUN_MODE beállítása után.
 log_init() {
   mkdir -p "$LOG_DIR"
+  # ── Tulajdonos javítás ────────────────────────────────────────────────────
+  # sudo futtatáskor a mkdir root:root tulajdonost ad → javítjuk a user-re.
+  # Enélkül a user minden futás után manuálisan kell:
+  #   sudo chown -R $USER ~/AI-LOG-INFRA-SETUP
+  chown "$_REAL_UID:$_REAL_GID" "$LOG_DIR" 2>/dev/null || true
+  # Log fájlok előre létrehozása helyes tulajdonossal.
+  # A >> operátor root-ként hozná létre a fájlokat — ezt előzzük meg.
+  touch "$LOGFILE_AI" "$LOGFILE_HUMAN" 2>/dev/null || true
+  chown "$_REAL_UID:$_REAL_GID" "$LOGFILE_AI" "$LOGFILE_HUMAN" 2>/dev/null || true
   local header
   header="$(printf '═%.0s' {1..62})
  ${INFRA_NAME:-INFRA} — $(date '+%Y-%m-%d %H:%M:%S')

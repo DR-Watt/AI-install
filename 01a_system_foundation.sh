@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# 01a_system_foundation.sh — System Foundation v6.4
+# 01a_system_foundation.sh — System Foundation v6.4.1
 #                            Ubuntu 24 LTS | NVIDIA | CUDA | Docker
 #
 # Szerepe az INFRA rendszerben
@@ -12,6 +12,11 @@
 #   CUDA:   https://docs.nvidia.com/cuda/cuda-installation-guide-linux/
 #   Docker: https://docs.docker.com/engine/install/ubuntu/
 #   CTK:    https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/
+#
+# Változtatások v6.4.1:
+#   - INST_* state szinkronizálás a comp_check után
+#     INST_CUDA_VER, INST_CUDNN_VER, INST_DOCKER_VER, INST_DRIVER_VER
+#     check módban is feltöltve ha a komponens OK → state mindig naprakész
 #
 # Változtatások v6.4 (split lib v6.4 igazítás):
 #   - LIB betöltés: 00_lib.sh master loader (lib/ alkönyvtárból tölt)
@@ -207,6 +212,50 @@ log_comp_status \
   "cudnn|cuDNN + NCCL|${MIN_VER[cudnn]}"           \
   "docker|Docker CE|${MIN_VER[docker]}"             \
   "nvidia_ctk|NVIDIA CTK|${MIN_VER[nvidia_ctk]}"
+
+# =============================================================================
+# INST_* STATE SZINKRONIZÁLÁS — minden módban fut (check mód is)
+# =============================================================================
+# A comp_check_*() függvények meghatározták mi van telepítve.
+# Ha a state-ben az INST_ mező üres de a komponens OK → feltöltjük.
+# Enélkül a state-ben INST_CUDA_VER= üres marad check módban is.
+# State írás check módban MEGENGEDETT — csak rendszerfájlok módosítása tilos.
+
+if [ "${COMP_STATUS[nvidia_driver]:-missing}" = "ok" ]; then
+  _cur_drv="$(infra_state_get "INST_DRIVER_VER" "")"
+  [ -z "$_cur_drv" ] && {
+    infra_state_set "INST_DRIVER_VER" "${COMP_VER[nvidia_driver]}"
+    log "STATE" "INST_DRIVER_VER szinkronizálva: ${COMP_VER[nvidia_driver]}"
+  }
+fi
+
+if [ "${COMP_STATUS[cuda]:-missing}" = "ok" ]; then
+  _cur_cuda="$(infra_state_get "INST_CUDA_VER" "")"
+  [ -z "$_cur_cuda" ] && {
+    infra_state_set "INST_CUDA_VER" "${COMP_VER[cuda]}"
+    # CUDA_VER is frissítjük ha eltér (nvcc által detektált)
+    infra_state_set "CUDA_VER"      "${COMP_VER[cuda]}"
+    log "STATE" "INST_CUDA_VER szinkronizálva: ${COMP_VER[cuda]}"
+  }
+fi
+
+if [ "${COMP_STATUS[cudnn]:-missing}" = "ok" ]; then
+  _cur_cudnn="$(infra_state_get "INST_CUDNN_VER" "")"
+  [ -z "$_cur_cudnn" ] && {
+    infra_state_set "INST_CUDNN_VER" "${COMP_VER[cudnn]}"
+    log "STATE" "INST_CUDNN_VER szinkronizálva: ${COMP_VER[cudnn]}"
+  }
+fi
+
+if [ "${COMP_STATUS[docker]:-missing}" = "ok" ]; then
+  _cur_docker="$(infra_state_get "INST_DOCKER_VER" "")"
+  [ -z "$_cur_docker" ] && {
+    _docker_ver="${COMP_VER[docker]:-$(docker version --format '{{.Server.Version}}' 2>/dev/null || echo '')}"
+    infra_state_set "INST_DOCKER_VER" "$_docker_ver"
+    infra_state_set "DOCKER_VER"      "$_docker_ver"
+    log "STATE" "INST_DOCKER_VER szinkronizálva: $_docker_ver"
+  }
+fi
 
 # =============================================================================
 # STATE → ACTIONS MÁTRIX
