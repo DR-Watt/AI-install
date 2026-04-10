@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# 03_python_aiml.sh — Python 3.12 + PyTorch + AI/ML Stack v6.1
+# 03_python_aiml.sh — Python 3.12 + PyTorch + AI/ML Stack v6.2
 #
 # Szerepe a INFRA rendszerben
 # ───────────────────────────
@@ -12,7 +12,7 @@
 #       FONTOS: liblzma-dev KÖTELEZŐ fordítás előtt (PyTorch modellek!)
 #   ✓ uv — Astral ultra-gyors Python csomagkezelő (Rust alapú, ~100x gyorsabb)
 #   ✓ ~/AI-VIBE/venvs/ai/ — izolált AI/ML fejlesztői virtuális környezet
-#   ✓ PyTorch 2.x — CUDA 12.x index alapján (cu126|cu128 az infra state-ből)
+#   ✓ PyTorch 2.x — CUDA index az infra state-ből (cu126|cu128|cpu)
 #   ✓ Teljes AI/ML csomag stack (LangChain, HuggingFace, OpenAI, Anthropic...)
 #   ✓ Fejlesztői eszközök (ruff, mypy, pytest, pre-commit, jupyter)
 #   ✓ Projekt template (pyproject.toml, .cursorrules, .vscode/settings.json)
@@ -34,12 +34,26 @@
 #   sudo bash 03_python_aiml.sh           # közvetlen
 #   sudo bash 00_master.sh  (03 kijelölve) # master-en keresztül
 #
-# RUN_MODE értékek
-# ────────────────
-#   install   → csak hiányzó komponensek (alapértelmezett)
+# RUN_MODE értékek (00_master.sh v6.4.2)
+# ────────────────────────────────────────
+#   install   → csak hiányzó komponensek felrakása (alapértelmezett)
 #   update    → uv + csomagok frissítése, pyenv frissítése
 #   reinstall → teljes újratelepítés (--force flag pyenv-nek)
 #   check     → csak állapot felmérés, semmi sem változik
+#   fix       → hiányzó komponensek pótlása reboot nélkül (≈ install)
+#               infra_require NEM blokkol fix módban (lib kezeli)
+#               REBOOT_NEEDED NEM propagálódik (master kezeli)
+#
+# Változtatások v6.2 (v6.4.2 CORE rendszer integráció)
+# ─────────────────────────────────────────────────────
+#   - fix mód: kezeli a masterből kapott "fix" RUN_MODE-ot (≈ install)
+#     fix módban: infra_require("01b") nem blokkol (lib/00_lib_state.sh kezeli)
+#     fix módban: REBOOT_NEEDED nem propagálódik (00_master.sh kezeli)
+#   - infra_require "01b" → lowercase (case-insensitive lib kompatibilitás)
+#     infra_require() a lib-ben auto-uppercase-el: "01b" → MOD_01B_DONE
+#   - PYTORCH_INDEX validáció: cuda_pytorch_index() segédfüggvény meghívása
+#     ha az infra state-ből olvasott index inkonzisztens a CUDA verzióval
+#   - lib split kompatibilitás: comp_check_torch() a lib/00_lib_comp.sh-ban él
 #
 # Dokumentáció referenciák
 # ────────────────────────
@@ -56,6 +70,13 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ── Közös függvénytár betöltése ───────────────────────────────────────────────
+# v6.4: 00_lib.sh master loader — betölti a lib/ alkönyvtár komponenseit:
+#   lib/00_lib_core.sh   — log, sudo, user, utility
+#   lib/00_lib_hw.sh     — hw_detect, hw_show, hw_has_nvidia
+#   lib/00_lib_ui.sh     — dialog_*, progress_*
+#   lib/00_lib_state.sh  — infra_state_*, infra_require, detect_run_mode
+#   lib/00_lib_comp.sh   — comp_check_*, version_ok, cuda_pytorch_index
+#   lib/00_lib_apt.sh    — apt_install_*, run_with_progress
 LIB="$SCRIPT_DIR/00_lib.sh"
 [ -f "$LIB" ] && source "$LIB" \
   || { echo "HIBA: 00_lib.sh hiányzik! Elvárt helye: $LIB"; exit 1; }
@@ -83,8 +104,7 @@ PY_CONFIGURE_OPTS="--enable-optimizations"
 # ── Minimum elfogadható verziók ───────────────────────────────────────────────
 declare -A MIN_VER=(
   [python]="3.12.0"    # pyenv által fordított Python — PY_VER-rel ellenőrzött
-  [uv]="0.4.0"         # Astral uv — Rust alapú csomagkezelő gyors telepítés
-  [pip]="24.0"         # pip a venv-ben — uv kezeli, de minimum érték
+  [uv]="0.4.0"         # Astral uv — Rust alapú csomagkezelő
 )
 
 # ── APT fordítási és rendszer függőségek ──────────────────────────────────────
@@ -92,9 +112,8 @@ declare -A MIN_VER=(
 # PyTorch modellek .pt fájljai xz tömörítést használnak → KÖTELEZŐ.
 # Forrás: https://github.com/pyenv/pyenv/wiki#suggested-build-environment
 declare -A PKGS=(
-  # Python forrásból fordításhoz szükséges könyvtárak
-  # Mindegyik szükséges egy modul forfordításához:
-  #   liblzma-dev     → lzma, xz tömörítés (PyTorch checkpoint-ok!)
+  # Python forrásból fordításhoz szükséges könyvtárak:
+  #   liblzma-dev     → lzma, xz tömörítés (PyTorch checkpoint-ok! KRITIKUS!)
   #   libgdbm-dev     → dbm adatbázis modul
   #   libreadline-dev → readline (interaktív REPL élmény)
   #   libsqlite3-dev  → sqlite3 beépített DB
@@ -107,6 +126,8 @@ declare -A PKGS=(
   #   xz-utils        → xz CLI eszközök (runtime)
   #   libxml2-dev     → XML feldolgozás
   #   libxmlsec1-dev  → XML aláírás (JWT, SAML)
+  #   libssl-dev      → ssl modul (HTTPS API hívások, Anthropic SDK)
+  #   libnss3-dev     → NSS (TLS, Firefox kompatibilis cert kezelés)
   [python_build]="liblzma-dev libgdbm-dev libreadline-dev libsqlite3-dev
                   libbz2-dev zlib1g-dev libffi-dev tk-dev uuid-dev
                   libncurses-dev xz-utils libxml2-dev libxmlsec1-dev
@@ -125,22 +146,22 @@ declare -A URLS=(
 )
 
 # ── PyTorch csomagok ──────────────────────────────────────────────────────────
-# Az index URL az infra state PYTORCH_INDEX-ből jön (01a állítja CUDA verzió alapján):
+# Az index URL az infra state PYTORCH_INDEX-ből jön:
 #   cu126 → CUDA 12.6 (RTX 5090 Blackwell alapértelmezett)
-#   cu128 → CUDA 12.8 (ha 01a 12.8-t telepített)
-#   cpu   → CPU-only (notebook-igpu profilokon)
+#   cu128 → CUDA 12.8, vagy CUDA 13.x esetén (ABI kompatibilis)
+#   cpu   → CPU-only (notebook-igpu / desktop-igpu profilokon)
 # Forrás: https://download.pytorch.org/whl/ — PyTorch wheel repository
+# Megjegyzés: cuda_pytorch_index() (lib/00_lib_comp.sh) állítja elő az indexet
 TORCH_PKGS="torch torchvision torchaudio"
 
-# ── AI/ML Python csomagok — alap stack ───────────────────────────────────────
-# Ez az alap stack amire a 02 szál is épít (Ollama Python client, vLLM)
-# Felosztás: funkcionális csoportonként, könnyen bővíthető
+# ── AI/ML Python csomagok — funkcionális csoportok ───────────────────────────
+# 7 csoport a könnyű karbantartáshoz — csoportonként hozzáadható/eltávolítható
 
-# Web framework és API
+# Web framework és API réteg
 AI_PKGS_API=(
-  "fastapi"              # ASGI web framework (FastAPI)
+  "fastapi"              # ASGI web framework
   "uvicorn[standard]"    # ASGI szerver (uvloop + httptools)
-  "pydantic>=2.0"        # adatvalidáció v2 (gyorsabb Rust core)
+  "pydantic>=2.0"        # adatvalidáció v2 (Rust core, gyorsabb)
   "pydantic-settings"    # .env és settings kezelés Pydantichoz
   "sqlmodel"             # SQLAlchemy + Pydantic egységes ORM
   "httpx"                # async HTTP kliens (requests helyett, FastAPI-kompatibilis)
@@ -156,7 +177,7 @@ AI_PKGS_LLM=(
   "anthropic>=0.25"                # Anthropic Claude Python SDK
   "langchain>=0.2"                 # LangChain keretrendszer
   "langchain-core"                 # LangChain alap absztrakciók (LCEL)
-  "langchain-community"            # Közösségi integrációk (dokumentum loaderek, stb.)
+  "langchain-community"            # Közösségi integrációk (dokumentum loaderek)
   "langchain-openai"               # OpenAI LangChain integráció
   "langchain-anthropic"            # Anthropic LangChain integráció
   "langgraph"                      # LangGraph agent framework (stateful)
@@ -165,10 +186,10 @@ AI_PKGS_LLM=(
 # HuggingFace ökoszisztéma
 AI_PKGS_HF=(
   "huggingface-hub>=0.22"          # HF Hub kliens (model/dataset letöltés)
-  "transformers>=4.40"             # Transformer modellek (BERT, GPT, LLaMA, stb.)
+  "transformers>=4.40"             # Transformer modellek (BERT, GPT, LLaMA stb.)
   "datasets>=2.19"                 # HF Datasets (adatbetöltés, streaming)
   "tokenizers>=0.19"               # Gyors (Rust) tokenizálás
-  "accelerate>=0.29"               # Multi-GPU + mixed precision training segédek
+  "accelerate>=0.29"               # Multi-GPU + mixed precision training
   "safetensors>=0.4"               # Biztonságos model serialization (pickle helyett!)
   "peft>=0.10"                     # Parameter-Efficient Fine-Tuning (LoRA, QLoRA)
   "sentence-transformers"          # Szöveg embeddings (RAG pipeline-hoz)
@@ -221,14 +242,14 @@ AI_PKGS_UTIL=(
   "typer>=0.12"            # CLI builder (Click wrapper, FastAPI stílus)
   "loguru>=0.7"            # Modern Python logging (log rotation, színezés)
   "tenacity>=8.2"          # Retry dekorátor (API hívásokhoz)
-  "psutil>=5.9"            # Rendszer erőforrás monitoring (GPU memória, CPU)
+  "psutil>=5.9"            # Rendszer erőforrás monitoring
   "beautifulsoup4>=4.12"   # HTML parse (web scraping, RAG pipeline)
-  "packaging"              # Verzió összehasonlítás (pip belső)
+  "packaging"              # Verzió összehasonlítás
 )
 
 # ── Komponens ellenőrző specifikációk ─────────────────────────────────────────
 # Formátum: "megjelenített_név|comp_check_kulcs|min_verzió"
-# comp_check kulcsok: a COMP_STATUS[] tömbben tárolódnak (00_lib.sh szekció 8)
+# comp_check kulcsok: a COMP_STATUS[] tömbben tárolódnak (lib/00_lib_comp.sh)
 COMP_SPECS=(
   "Python build deps|build_deps|"
   "pyenv|pyenv|"
@@ -245,14 +266,13 @@ COMP_SPECS=(
 )
 
 # ── Könyvtár útvonalak ────────────────────────────────────────────────────────
-# Ezek a változók a script egészében következetesen használva
-PYENV_ROOT="$_REAL_HOME/.pyenv"        # pyenv telepítési könyvtár
-VENV_DIR="$_REAL_HOME/AI-VIBE/venvs/ai"    # Python AI/ML venv helye
+PYENV_ROOT="$_REAL_HOME/.pyenv"              # pyenv telepítési könyvtár
+VENV_DIR="$_REAL_HOME/AI-VIBE/venvs/ai"     # Python AI/ML venv helye
 VENV_PY="$VENV_DIR/bin/python"              # venv Python bináris
-VENV_UV="$_REAL_HOME/.local/bin/uv"         # uv bináris helye
-PY_BIN="$PYENV_ROOT/versions/$PY_VER/bin/python3" # pyenv Python bináris
-TEMPLATE_DIR="$_REAL_HOME/templates/python-ai"    # Projekt template könyvtár
-LOCK_FILE="/tmp/infra_03_python.lock"              # Párhuzamos futás blokkolása
+VENV_UV="$_REAL_HOME/.local/bin/uv"          # uv bináris helye
+PY_BIN="$PYENV_ROOT/versions/$PY_VER/bin/python3"  # pyenv Python bináris
+TEMPLATE_DIR="$_REAL_HOME/templates/python-ai"      # Projekt template könyvtár
+LOCK_FILE="/tmp/infra_03_python.lock"               # Párhuzamos futás blokkolása
 
 # =============================================================================
 # ██  INICIALIZÁLÁS  ██
@@ -264,35 +284,43 @@ LOGFILE_AI="$_REAL_HOME/AI-LOG-INFRA-SETUP/install_03_$(date '+%Y%m%d_%H%M%S').l
 LOGFILE_HUMAN="$_REAL_HOME/AI-LOG-INFRA-SETUP/install_03_$(date '+%Y%m%d_%H%M%S').ansi"
 LOGFILE="$LOGFILE_AI"   # backward compat
 
-# log_init() megnyitja/létrehozza a log fájlokat és írja a fejlécet
 log_init
 
 # ── Párhuzamos futás megakadályozása ─────────────────────────────────────────
-# check_lock() ha futó instance van, dialógban kérdez — régi (2h+) lock auto-törlés
 check_lock "$LOCK_FILE"
 
 # ── INFRA state betöltés ──────────────────────────────────────────────────────
-# Az 01a modul mentette ezeket: CUDA_VER, PYTORCH_INDEX, HW_GPU_ARCH
-# infra_state_get KEY DEFAULT — ha nincs benne, az alapérték érvényes
+# Az 01a modul mentette: INST_CUDA_VER, PYTORCH_INDEX, HW_GPU_ARCH
 CUDA_VER=$(infra_state_get "INST_CUDA_VER" "12.6")
 PYTORCH_INDEX=$(infra_state_get "PYTORCH_INDEX" "cu126")
 HW_GPU_ARCH_ST=$(infra_state_get "HW_GPU_ARCH" "igpu")
 FEAT_GPU_ACCEL=$(infra_state_get "FEAT_GPU_ACCEL" "false")
 
 # CPU-only profil esetén cpu index (notebook-igpu, desktop-igpu)
+# Egyébként cuda_pytorch_index() segédfüggvénnyel ellenőrzük az index helyességét
+# Forrás: cuda_pytorch_index() a lib/00_lib_comp.sh-ban (v6.4)
 if [ "$FEAT_GPU_ACCEL" = "false" ]; then
   PYTORCH_INDEX="cpu"
   log "STATE" "CPU-only profil: PYTORCH_INDEX=cpu (GPU gyorsítás nem érhető el)"
+else
+  # Validáció: cuda_pytorch_index() kiszámítja az elvárt indexet a CUDA verzióból
+  # Ez kezeli a CUDA 13.x → cu128 fallback esetet is
+  _expected_idx="$(cuda_pytorch_index "$CUDA_VER" 2>/dev/null || echo "")"
+  if [ -n "$_expected_idx" ] && [ "$PYTORCH_INDEX" != "$_expected_idx" ]; then
+    log "WARN" "PYTORCH_INDEX mismatch: state=$PYTORCH_INDEX, várható=$_expected_idx (CUDA $CUDA_VER)"
+    log "WARN" "Automatikus korrekció: PYTORCH_INDEX=$_expected_idx"
+    PYTORCH_INDEX="$_expected_idx"
+    infra_state_set "PYTORCH_INDEX" "$_expected_idx"
+  fi
 fi
 
 log "STATE" "Betöltve: CUDA=$CUDA_VER | PyTorch index=$PYTORCH_INDEX | GPU arch=$HW_GPU_ARCH_ST"
 
 # ── INFRA state inicializálás ─────────────────────────────────────────────────
-# Csak akkor ír új kulcsokat ha még nem léteznek — nem írja felül a meglévőket
 infra_state_init
 
 # ── Hardver kompatibilitás ────────────────────────────────────────────────────
-# INFRA_HW_REQ="" → minden hardveren fut (beleértve notebook-igpu-t)
+# INFRA_HW_REQ="" → minden hardveren fut
 infra_compatible "$INFRA_HW_REQ" || {
   dialog_warn "Hardver inkompatibilis" \
     "\n  HW_REQ: $INFRA_HW_REQ | Profil: $HW_PROFILE\n  Modul kihagyva." 10
@@ -301,11 +329,13 @@ infra_compatible "$INFRA_HW_REQ" || {
 }
 
 # ── Függőség ellenőrzés ───────────────────────────────────────────────────────
-# 01b-nek (Oh My Zsh, shell konfig) kell készen lennie → zshrc-ben van pyenv init
-# Kivétel: reinstall módban vagy ha a user tudatosan hagyja ki a 01b-t (MOD_01B bypass)
-if [ "${RUN_MODE:-install}" != "reinstall" ]; then
-  infra_require "01B" "User Environment (01b_post_reboot.sh)" || {
-    # Figyelmeztető dialóg után lehetőség van manuális folytatásra
+# 01b (Oh My Zsh, shell konfig) előfeltétele — zshrc-ben van pyenv init
+# v6.2: "01b" lowercase — infra_require() auto-uppercase-el: MOD_01B_DONE
+# check és fix módban: infra_require() NEM blokkol (lib/00_lib_state.sh kezeli)
+# reinstall módban: bypass — a user tudatos döntése az újratelepítés
+if [[ "${RUN_MODE:-install}" != "reinstall" ]]; then
+  infra_require "01b" "User Environment (01b_post_reboot.sh)" || {
+    # install módban: bypass lehetősége (manuális override)
     dialog_yesno "Függőség figyelmeztető" \
       "\n  MOD_01B_DONE nincs beállítva.\n\n  A 01b (Zsh, shell setup) fut le ELŐTTE.\n\n  Ennek ellenére folytatjuk?" 14 || {
       rm -f "$LOCK_FILE"
@@ -319,21 +349,15 @@ fi
 # pyenv és uv binárisok nem biztos hogy PATH-ban vannak sudo kontextusban
 export PYENV_ROOT
 export PATH="$PYENV_ROOT/bin:$_REAL_HOME/.local/bin:$PATH"
-# pyenv init — csak ha már telepítve van (nem hibás ha még nincs)
 [ -d "$PYENV_ROOT/bin" ] && eval "$(pyenv init -)" 2>/dev/null || true
 
 # =============================================================================
 # ██  ÁLLAPOT FELMÉRÉS  ██
 # =============================================================================
 
-# ── Komponens ellenőrzés ──────────────────────────────────────────────────────
-# Minden komponenst ellenőrzünk és COMP_STATUS[] tömbben tároljuk az eredményt.
-# Formátum: ok | old | missing
-
 log "COMP" "━━━ Komponens állapot felmérés ━━━"
 
-# 1. Fordítási függőségek — az összes szükséges lib egyszerre
-# dpkg -l | grep -c ellenőrzi hogy legalább a kulcs package-ek telepítve vannak
+# 1. Fordítási függőségek
 _build_deps_ok=true
 for pkg in liblzma-dev libgdbm-dev libreadline-dev libsqlite3-dev \
            libbz2-dev libffi-dev libssl-dev; do
@@ -344,7 +368,7 @@ $_build_deps_ok \
   || COMP_STATUS[build_deps]="missing"
 log "COMP" "  build_deps: ${COMP_STATUS[build_deps]}"
 
-# 2. pyenv — Python verziókezelő
+# 2. pyenv
 if command -v pyenv &>/dev/null || [ -x "$PYENV_ROOT/bin/pyenv" ]; then
   COMP_STATUS[pyenv]="ok"
   COMP_VER[pyenv]="$(pyenv --version 2>/dev/null | grep -oP '[\d.]+' | head -1)"
@@ -354,10 +378,11 @@ fi
 log "COMP" "  pyenv: ${COMP_STATUS[pyenv]} ${COMP_VER[pyenv]:-}"
 
 # 3. Python 3.12.x — pyenv által fordított bináris
+# comp_check_python: lib/00_lib_comp.sh
 comp_check_python "$PY_VER" "$PYENV_ROOT"
 log "COMP" "  python: ${COMP_STATUS[python]:-missing} ${COMP_VER[python]:-}"
 
-# 4. lzma modul — kritikus ellenőrzés (PyTorch .pt fájlok!)
+# 4. lzma modul — KRITIKUS! (PyTorch .pt fájlok xz tömörítése)
 if [ -x "$PY_BIN" ] && "$PY_BIN" -c "import lzma, bz2, readline" 2>/dev/null; then
   COMP_STATUS[lzma_ok]="ok"
 else
@@ -366,10 +391,11 @@ fi
 log "COMP" "  lzma_ok: ${COMP_STATUS[lzma_ok]}"
 
 # 5. uv — Astral csomagkezelő
+# comp_check_uv: lib/00_lib_comp.sh
 comp_check_uv "${MIN_VER[uv]}" "$VENV_UV"
 log "COMP" "  uv: ${COMP_STATUS[uv]:-missing} ${COMP_VER[uv]:-}"
 
-# 6. AI/ML venv — könyvtár létezés
+# 6. AI/ML venv
 if [ -d "$VENV_DIR" ] && [ -x "$VENV_PY" ]; then
   COMP_STATUS[venv]="ok"
 else
@@ -377,11 +403,13 @@ else
 fi
 log "COMP" "  venv: ${COMP_STATUS[venv]}"
 
-# 7. PyTorch — import + CUDA ellenőrzés (csak ha van GPU)
+# 7. PyTorch — import + CUDA elérhetőség
+# comp_check_torch: lib/00_lib_comp.sh (v6.4 — logol: cuda.is_available())
+# FONTOS: REBOOT előtt cuda=False normális (NVIDIA kernel modul nem aktív)
 comp_check_torch "" "$VENV_PY"
 log "COMP" "  torch: ${COMP_STATUS[torch]:-missing} ${COMP_VER[torch]:-}"
 
-# 8. FastAPI — API framework ellenőrzés import alapján
+# 8. FastAPI
 if [ -x "$VENV_PY" ] && "$VENV_PY" -c "import fastapi" 2>/dev/null; then
   COMP_STATUS[fastapi]="ok"
 else
@@ -389,7 +417,7 @@ else
 fi
 log "COMP" "  fastapi: ${COMP_STATUS[fastapi]}"
 
-# 9. JupyterLab — notebook IDE
+# 9. JupyterLab
 if [ -x "$VENV_DIR/bin/jupyter" ]; then
   COMP_STATUS[jupyter]="ok"
   COMP_VER[jupyter]="$("$VENV_DIR/bin/jupyter" --version 2>/dev/null | head -1)"
@@ -398,7 +426,7 @@ else
 fi
 log "COMP" "  jupyter: ${COMP_STATUS[jupyter]}"
 
-# 10. LangChain — AI keretrendszer
+# 10. LangChain
 if [ -x "$VENV_PY" ] && "$VENV_PY" -c "import langchain" 2>/dev/null; then
   COMP_STATUS[langchain]="ok"
 else
@@ -449,10 +477,10 @@ log "COMP" "━━━ Összesítés: ${MISSING} hiányzó/elavult ━━━"
 # ██  RUN MODE KEZELÉS  ██
 # =============================================================================
 
-# ── check mód: csak megmutatjuk az állapotot, nem változtatunk semmit ─────────
+# ── check mód: csak megmutatjuk az állapotot ─────────────────────────────────
 if [ "${RUN_MODE:-install}" = "check" ]; then
   dialog_msg "[Ellenőrző] $INFRA_NAME" \
-    "\n  Komponens állapot:\n\n$(printf '%b' "$STATUS_LINES")\n
+    "\n  Komponens állapot:\n\n$(printf '%b' "$STATUS_LINES")
   PyTorch index: $PYTORCH_INDEX
   CUDA verzió:   $CUDA_VER
   Python venv:   $VENV_DIR
@@ -461,10 +489,8 @@ if [ "${RUN_MODE:-install}" = "check" ]; then
   exit 0
 fi
 
-# ── install/update/reinstall mód: szükséges-e bármit csinálni? ───────────────
-# Ha reinstall mód: kényszer újratelepítés (MISSING = összes komponens)
+# ── reinstall mód: minden komponens kényszer-újratelepítése ──────────────────
 if [ "${RUN_MODE:-install}" = "reinstall" ]; then
-  # Reinstall módban minden "hiányzónak" számít → minden lépés lefut
   for spec in "${COMP_SPECS[@]}"; do
     IFS='|' read -r label key _ <<< "$spec"
     COMP_STATUS["$key"]="missing"
@@ -473,22 +499,24 @@ if [ "${RUN_MODE:-install}" = "reinstall" ]; then
   log "MODE" "Reinstall mód: minden komponens újratelepítve ($MISSING db)"
 fi
 
-# Ha minden OK és nem update/reinstall mód: semmit sem kell csinálni
-if [ "$MISSING" -eq 0 ] && [ "${RUN_MODE:-install}" = "install" ]; then
+# ── install / fix mód: minden megvan → nincs tennivaló ───────────────────────
+# fix mód = install, de infra_require nem blokkol és REBOOT_NEEDED nem propagál
+if [ "$MISSING" -eq 0 ] && [[ "${RUN_MODE:-install}" =~ ^(install|fix)$ ]]; then
   dialog_msg "✓ Minden megvan — $INFRA_NAME" \
     "\n$(printf '%b' "$STATUS_LINES")\n  Nincs tennivaló." 28
   rm -f "$LOCK_FILE"
   exit 0
 fi
 
-# ── Telepítési szándék megerősítése ───────────────────────────────────────────
-# UPDATE mód esetén is megerősítünk — a user tudja mi fog történni
+# ── Mód felirat meghatározása ─────────────────────────────────────────────────
 case "${RUN_MODE:-install}" in
   update)    _mode_label="Frissítés" ;;
   reinstall) _mode_label="Újratelepítés" ;;
+  fix)       _mode_label="Javítás" ;;
   *)         _mode_label="Telepítés" ;;
 esac
 
+# ── Telepítési szándék megerősítése ───────────────────────────────────────────
 dialog_yesno "[$_mode_label] — $INFRA_NAME" \
   "\n  Komponensek:\n$(printf '%b' "$STATUS_LINES")
   PyTorch index: $PYTORCH_INDEX (CUDA $CUDA_VER)
@@ -500,10 +528,9 @@ dialog_yesno "[$_mode_label] — $INFRA_NAME" \
   exit 0
 }
 
-# ── Installálás eredmény számlálók ────────────────────────────────────────────
 OK=0; SKIP=0; FAIL=0
 
-# ── Üdvözlő + telepítési terv megjelenítése ───────────────────────────────────
+# ── Telepítési fejléc logba ───────────────────────────────────────────────────
 log_infra_header "   • pyenv — Python verziókezelő
    • Python ${PY_VER} — forrásból (PGO optimalizálás, ~8-12 perc)
    • uv — Rust-alapú csomagkezelő (~100x gyorsabb mint pip)
@@ -519,15 +546,13 @@ log_install_paths "   $PYENV_ROOT            — pyenv + Python ${PY_VER}
 # =============================================================================
 # ██  1. FORDÍTÁSI FÜGGŐSÉGEK  ██
 # =============================================================================
-# liblzma-dev KÖTELEZŐ! Nélküle a Python lzma modulja nem fordul →
-# PyTorch .pt checkpointok nem olvashatók → silent failures!
 
 if [ "${COMP_STATUS[build_deps]}" != "ok" ] || \
    [ "${RUN_MODE:-install}" = "reinstall" ]; then
 
   dialog_yesno "1/7 — Fordítási függőségek" "
   A pyenv Python-t FORRÁSBÓL FORDÍTJA.
-  Ezek a csomagok szükségesek a helyes fordításhoz:
+  Szükséges csomagok:
 
     liblzma-dev     — ⚠ KRITIKUS: xz/lzma (PyTorch modellek!)
     libgdbm-dev     — dbm adatbázis modul
@@ -542,8 +567,7 @@ if [ "${COMP_STATUS[build_deps]}" != "ok" ] || \
 
   Ha ezek HIÁNYOZNAK a fordításkor:
     • lzma modul NEM LESZ ELÉRHETŐ
-    • PyTorch checkpointok NEM OLVASHATÓK
-    • Csöndes hibák keletkezhetnek!
+    • PyTorch checkpointok NEM OLVASHATÓK!
 
   sudo szükséges ehhez a lépéshez.
   Folytatjuk?" 28 || { ((SKIP++)); goto_step_2=false; }
@@ -570,7 +594,6 @@ _pyenv_needs_install=false
 if $_pyenv_needs_install || [ "${RUN_MODE:-install}" = "update" ]; then
 
   if [ "${RUN_MODE:-install}" = "update" ] && [ "${COMP_STATUS[pyenv]}" = "ok" ]; then
-    # UPDATE mód: pyenv önmaga frissítése
     log "STEP" "2/7 pyenv frissítése..."
     if dialog_yesno "2/7 — pyenv frissítés" \
       "\n  pyenv frissítése a legújabb verzióra.\n  Jelenlegi: ${COMP_VER[pyenv]:-ismeretlen}\n\n  Folytatjuk?" 12; then
@@ -595,7 +618,6 @@ if $_pyenv_needs_install || [ "${RUN_MODE:-install}" = "update" ]; then
     if [ "${goto_step_3:-true}" = "true" ]; then
       log "STEP" "2/7 pyenv telepítése..."
       if [ ! -d "$PYENV_ROOT" ]; then
-        # pyenv.run shell scriptje letölti és telepíti a pyenv-t + pyenv-virtualenv plugint
         run_with_progress "pyenv telepítés" "curl pyenv.run | bash..." \
           su - "$_REAL_USER" -c "curl -fsSL ${URLS[pyenv_install]} | bash" \
           && ((OK++)) || ((FAIL++))
@@ -607,7 +629,7 @@ if $_pyenv_needs_install || [ "${RUN_MODE:-install}" = "update" ]; then
       fi
 
       # Shell inicializáció — .zshrc, .bashrc, .profile mindháromba
-      # Fontos: a heredoc PYENVRC idézőjeles → nem expandál → $HOME kell bele
+      # Fontos: heredoc PYENVRC idézőjeles → nem expandál → $HOME kell bele
       for RC in "$_REAL_HOME/.zshrc" "$_REAL_HOME/.bashrc" "$_REAL_HOME/.profile"; do
         grep -q "PYENV_ROOT" "$RC" 2>/dev/null && continue
         cat >> "$RC" << 'PYENVRC'
@@ -622,7 +644,6 @@ PYENVRC
         log "INFO" "pyenv init hozzáadva: $RC"
       done
 
-      # Frissítjük a PATH-t a jelenlegi (sudo) session-ben is
       export PATH="$PYENV_ROOT/bin:$PATH"
       eval "$(pyenv init -)" 2>/dev/null || true
     fi
@@ -632,9 +653,8 @@ fi
 # =============================================================================
 # ██  3. PYTHON 3.12.X FORDÍTÁSA  ██
 # =============================================================================
-# PGO (Profile-Guided Optimization) + LTO: ~10-15% gyorsabb interpreter
-# Fordítási idő: ~8-12 perc (i7-12700K-n ~5 perc, szerver CPU-n lehet több)
-# Megjegyzés: lzma hiba esetén is újrafordítjuk! (NEED_PY=true ha lzma_ok=missing)
+# PGO + LTO: ~10-15% gyorsabb interpreter
+# lzma hiba esetén is újrafordítjuk (NEED_PY=true ha lzma_ok=missing)!
 
 NEED_PY=false
 [ "${COMP_STATUS[python]}" != "ok" ] && NEED_PY=true
@@ -642,7 +662,6 @@ NEED_PY=false
 [ "${RUN_MODE:-install}" = "reinstall" ] && NEED_PY=true
 
 if $NEED_PY; then
-  # --force flag kell ha már létezik a verzió (újrafordítás)
   FORCE_FLAG=""
   [ "${COMP_STATUS[python]}" = "ok" ] && FORCE_FLAG="--force"
 
@@ -657,7 +676,7 @@ if $NEED_PY; then
   Eredmény: ~10-15% gyorsabb Python interpreter
 
   Fordítási idő: ~8-12 perc (processzor-függő)
-  A terminal kimenete logba kerül (nincs kijelzés fordítás közben):
+  A terminal kimenete logba kerül:
     $LOGFILE_AI
 
   FONTOS: liblzma-dev az 1. lépésben települt — ez KÖTELEZŐ!
@@ -667,7 +686,6 @@ if $NEED_PY; then
   if [ "${goto_step_4:-true}" = "true" ]; then
     log "STEP" "3/7 Python ${PY_VER} fordítása (PYTHON_CONFIGURE_OPTS='$PY_CONFIGURE_OPTS')..."
 
-    # pyenv install háttérben fut → progress bar animáció
     PYTHON_CONFIGURE_OPTS="$PY_CONFIGURE_OPTS" \
       su - "$_REAL_USER" -c "$PYENV_ROOT/bin/pyenv install $FORCE_FLAG $PY_VER" \
       >> "$LOGFILE_AI" 2>&1 &
@@ -679,7 +697,6 @@ if $NEED_PY; then
     while kill -0 $PY_PID 2>/dev/null; do
       progress_set "$i" "Python ${PY_VER} fordítása... (PGO+LTO, ~8-12 perc)"
       sleep 5
-      # Lassú inkrementálás — a fordítás unpredictable hosszúságú
       [ $i -lt 88 ] && ((i++))
     done
     progress_close
@@ -690,16 +707,14 @@ if $NEED_PY; then
       dialog_warn "Python ${PY_VER} fordítás — HIBA" \
         "\n  A Python fordítás sikertelen (exit $PY_EC).\n  Részletek: $LOGFILE_AI\n\n  Lehetséges ok: hiányzó fordítási függőség (1. lépés!)" 14
     else
-      # Globális Python verzió beállítása
       su - "$_REAL_USER" -c "$PYENV_ROOT/bin/pyenv global $PY_VER" >> "$LOGFILE_AI" 2>&1
 
-      # Kritikus ellenőrzés: lzma modul fordult-e be?
+      # Kritikus ellenőrzés: lzma, bz2, readline, ssl modulok fordultak-e be?
       if "$PY_BIN" -c "import lzma; import bz2; import readline; import ssl" 2>/dev/null; then
         ((OK++))
         PY_INSTALLED_VER=$("$PY_BIN" --version 2>/dev/null)
         log "OK" "Python ${PY_VER} lefordítva: $PY_INSTALLED_VER"
         log "OK" "lzma, bz2, readline, ssl modulok: OK"
-        # State mentés
         infra_state_set "INST_PYTHON_VER" "$PY_VER"
         dialog_msg "✓ Python ${PY_VER} — Sikeres" "
   ✓  $PY_INSTALLED_VER lefordítva
@@ -709,7 +724,6 @@ if $NEED_PY; then
 
   Telepítési hely: $PYENV_ROOT/versions/$PY_VER/" 16
       else
-        # lzma nem fordult be → valami hiányzott a fordítási függőségekből
         ((FAIL++))
         dialog_warn "Python ${PY_VER} — LZMA HIBA" \
           "\n  Python fordítva, DE az lzma modul HIÁNYZIK!\n\n  Ok: liblzma-dev nem volt telepítve fordítás előtt.\n  Megoldás: Telepítsd a fordítási függőségeket (1. lépés)\n  és futtasd újra reinstall módban.\n\n  Részletek: $LOGFILE_AI" 18
@@ -721,8 +735,6 @@ fi
 # =============================================================================
 # ██  4. UV — ASTRAL CSOMAGKEZELŐ  ██
 # =============================================================================
-# uv: Rust alapú pip/venv/pip-tools/virtualenv csere (~100x gyorsabb)
-# Forrás: https://docs.astral.sh/uv/getting-started/installation/
 
 _uv_needs_install=false
 [ "${COMP_STATUS[uv]}" != "ok" ] && _uv_needs_install=true
@@ -731,18 +743,15 @@ _uv_needs_install=false
 if $_uv_needs_install || [ "${RUN_MODE:-install}" = "update" ]; then
 
   if [ "${RUN_MODE:-install}" = "update" ] && [ "${COMP_STATUS[uv]}" = "ok" ]; then
-    # UPDATE mód: uv self update (ha van internet)
     log "STEP" "4/7 uv frissítése..."
     dialog_yesno "4/7 — uv frissítés" \
       "\n  uv frissítése a legújabb verzióra.\n  Jelenlegi: ${COMP_VER[uv]:-ismeretlen}\n\n  Folytatjuk?" 12 || { ((SKIP++)); goto_step_5=false; }
 
     if [ "${goto_step_5:-true}" = "true" ]; then
-      # uv self update az ajánlott frissítési módszer
       run_with_progress "uv self update" "uv self update..." \
         su - "$_REAL_USER" -c "$VENV_UV self update" \
         && ((OK++)) || ((FAIL++))
     fi
-
   elif $_uv_needs_install; then
     dialog_yesno "4/7 — uv telepítése" "
   uv: Astral ultra-gyors Python csomagkezelő (Rust)
@@ -753,7 +762,6 @@ if $_uv_needs_install || [ "${RUN_MODE:-install}" = "update" ]; then
     • Parallel download + cache
 
   Telepítési hely: ~/.local/bin/uv
-
   Forrás: https://docs.astral.sh/uv/
   Folytatjuk?" 18 || { ((SKIP++)); goto_step_5=false; }
 
@@ -762,13 +770,10 @@ if $_uv_needs_install || [ "${RUN_MODE:-install}" = "update" ]; then
       run_with_progress "uv telepítés" "curl astral.sh/uv | sh..." \
         su - "$_REAL_USER" -c "curl -LsSf ${URLS[uv_install]} | sh" \
         && ((OK++)) || ((FAIL++))
-
-      # PATH frissítés a jelenlegi sessionben
       export PATH="$_REAL_HOME/.local/bin:$PATH"
     fi
   fi
 
-  # uv verzió logolás
   if command -v "$VENV_UV" &>/dev/null || command -v uv &>/dev/null; then
     UV_INSTALLED_VER=$("$VENV_UV" --version 2>/dev/null || uv --version 2>/dev/null)
     log "OK" "uv elérhető: $UV_INSTALLED_VER"
@@ -779,22 +784,18 @@ fi
 # =============================================================================
 # ██  5. VIRTUÁLIS KÖRNYEZET + AI/ML CSOMAG STACK  ██
 # =============================================================================
-# A venv Python 3.12.x alapú, uv kezeli a csomagokat.
-# A csomagok CSOPORTONKÉNT vannak felosztva (API, LLM, HF, Data, Dev, Jupyter)
-# A PyTorch külön lépésben települ (6. lépés) — 3 GB letöltés!
 
 _venv_needs_work=false
-[ "${COMP_STATUS[venv]}" != "ok" ] && _venv_needs_work=true
-[ "${COMP_STATUS[fastapi]}" != "ok" ] && _venv_needs_work=true
-[ "${COMP_STATUS[jupyter]}" != "ok" ] && _venv_needs_work=true
-[ "${COMP_STATUS[langchain]}" != "ok" ] && _venv_needs_work=true
+[ "${COMP_STATUS[venv]}" != "ok" ]           && _venv_needs_work=true
+[ "${COMP_STATUS[fastapi]}" != "ok" ]        && _venv_needs_work=true
+[ "${COMP_STATUS[jupyter]}" != "ok" ]        && _venv_needs_work=true
+[ "${COMP_STATUS[langchain]}" != "ok" ]      && _venv_needs_work=true
 [ "${COMP_STATUS[huggingface_hub]}" != "ok" ] && _venv_needs_work=true
-[ "${RUN_MODE:-install}" = "reinstall" ] && _venv_needs_work=true
-[ "${RUN_MODE:-install}" = "update" ] && _venv_needs_work=true
+[ "${RUN_MODE:-install}" = "reinstall" ]     && _venv_needs_work=true
+[ "${RUN_MODE:-install}" = "update" ]        && _venv_needs_work=true
 
 if $_venv_needs_work; then
 
-  _MODE_DESC=""
   case "${RUN_MODE:-install}" in
     update)    _MODE_DESC="Csomagok frissítése" ;;
     reinstall) _MODE_DESC="Venv újratelepítése" ;;
@@ -822,7 +823,7 @@ if $_venv_needs_work; then
   if [ "${goto_step_6:-true}" = "true" ]; then
     log "STEP" "5/7 AI/ML venv + csomagok..."
 
-    # ── 5.1. Venv létrehozása ha nincs (reinstall esetén töröljük és újra) ────
+    # Reinstall esetén töröljük a régi venvet
     if [ "${RUN_MODE:-install}" = "reinstall" ] && [ -d "$VENV_DIR" ]; then
       log "INFO" "Reinstall: régi venv törlése: $VENV_DIR"
       rm -rf "$VENV_DIR"
@@ -836,7 +837,7 @@ if $_venv_needs_work; then
         >> "$LOGFILE_AI" 2>&1
     fi
 
-    # ── 5.2. Csomagok összegyűjtése egyetlen listába ──────────────────────────
+    # Összes csomag összegyűjtése
     ALL_PKGS=(
       "${AI_PKGS_API[@]}"
       "${AI_PKGS_LLM[@]}"
@@ -848,8 +849,7 @@ if $_venv_needs_work; then
     )
     log "INFO" "Összes telepítendő csomag: ${#ALL_PKGS[@]} db"
 
-    # ── 5.3. uv pip install — összes csomag egyszerre ────────────────────────
-    # --upgrade flag update módban — frissíti a meglévőket is
+    # --upgrade flag update módban
     UV_FLAGS=""
     [ "${RUN_MODE:-install}" = "update" ] && UV_FLAGS="--upgrade"
 
@@ -877,12 +877,10 @@ if $_venv_needs_work; then
       log "OK" "AI/ML csomag stack telepítve (${#ALL_PKGS[@]} csomag)"
     fi
 
-    # ── 5.4. JupyterLab kernel regisztráció ──────────────────────────────────
+    # JupyterLab kernel regisztráció
     # JUPYTER_DATA_DIR kényszere: sudo kontextusban --user /root-ba írna!
-    # A venv Python-ja regisztrálja magát "Python 3.12 (AI/ML)" névvel.
     # Forrás: https://ipython.readthedocs.io/en/stable/install/kernel_install.html
     log "INFO" "JupyterLab AI kernel regisztráció..."
-    JUPYTER_DATA_DIR="$_REAL_HOME/.local/share/jupyter" \
     su - "$_REAL_USER" -c \
       "JUPYTER_DATA_DIR='$_REAL_HOME/.local/share/jupyter'
        '$VENV_PY' -m ipykernel install \
@@ -891,13 +889,11 @@ if $_venv_needs_work; then
          --display-name 'Python 3.12 (AI/ML)'" \
       >> "$LOGFILE_AI" 2>&1
 
-    # Kernel fájlok tulajdonosának korrekciója (sudo futtatás esetén root-ra kerülhet)
     chown -R "$_REAL_USER:$_REAL_USER" \
       "$_REAL_HOME/.local/share/jupyter" 2>/dev/null || true
     log "OK" "JupyterLab kernel 'Python 3.12 (AI/ML)' regisztrálva"
 
-    # ── 5.5. Venv tulajdonos korrekció ───────────────────────────────────────
-    # sudo alatt létrehozott fájlok root tulajdonosúak lehetnek → javítás
+    # Venv tulajdonos korrekció (sudo futtatás esetén root-ra kerülhet)
     chown -R "$_REAL_USER:$_REAL_USER" "$VENV_DIR" 2>/dev/null || true
     chown -R "$_REAL_USER:$_REAL_USER" "$_REAL_HOME/AI-VIBE" 2>/dev/null || true
   fi
@@ -906,14 +902,11 @@ fi
 # =============================================================================
 # ██  6. PYTORCH — CUDA VERZIÓS TELEPÍTÉS  ██
 # =============================================================================
-# PyTorch CUDA index az infra state-ből (01a állítja CUDA telepítés alapján):
-#   cu126 → CUDA 12.6 (RTX 5090 Blackwell + minden újabb kártya)
-#   cu128 → CUDA 12.8 (ha 01a CUDA 12.8-t telepített)
-#   cpu   → CPU-only (iGPU profilok: notebook-igpu, desktop-igpu)
+# PYTORCH_INDEX az infra state-ből (01a + cuda_pytorch_index() állítja):
+#   cu126 → CUDA 12.6 | cu128 → CUDA 12.8 / 13.x | cpu → iGPU
 #
-# FIGYELMEZTETÉS: cuda.is_available() REBOOT ELŐTT False értéket ad!
-# Ennek oka: az NVIDIA kernel modul csak driver betöltés után aktív.
-# Ez NORMÁLIS — nem telepítési hiba.
+# FIGYELMEZTETÉS: cuda.is_available() REBOOT ELŐTT False értéket adhat!
+# Az NVIDIA kernel modul csak driver betöltés után aktív — ez NORMÁLIS.
 
 _torch_needs_install=false
 [ "${COMP_STATUS[torch]}" != "ok" ] && _torch_needs_install=true
@@ -922,7 +915,6 @@ _torch_needs_install=false
 
 if $_torch_needs_install; then
 
-  # PyTorch index URL meghatározása
   TORCH_INDEX_URL="https://download.pytorch.org/whl/${PYTORCH_INDEX}"
   TORCH_SIZE_EST="~2.5-3 GB"
   [ "$PYTORCH_INDEX" = "cpu" ] && TORCH_SIZE_EST="~180 MB"
@@ -930,27 +922,23 @@ if $_torch_needs_install; then
   dialog_yesno "6/7 — PyTorch telepítése" "
   PyTorch 2.x — ${PYTORCH_INDEX} index
 
-  Csomagok:
-    torch + torchvision + torchaudio
+  Csomagok: torch + torchvision + torchaudio
   Index URL: $TORCH_INDEX_URL
 
   Letöltési méret: $TORCH_SIZE_EST
   Ez a leghosszabb lépés (~5-20 perc internet sebességtől függően).
 
-  $([ "$PYTORCH_INDEX" != "cpu" ] && echo "CUDA elérhetőség ellenőrzése:
+  $([ "$PYTORCH_INDEX" != "cpu" ] && echo "CUDA ellenőrzés REBOOT UTÁN:
+    source $VENV_DIR/bin/activate
     python -c 'import torch; print(torch.cuda.is_available())'
-  Várható: True (REBOOT UTÁN!)
-  Most False lehet — ez NORMÁLIS (NVIDIA driver még nem aktív)." \
-  || echo "CPU-only telepítés (iGPU profil)
-  CUDA nem elérhető ezen a gépen.")
+  Várható: True (most False lehet — NORMÁLIS!)" \
+  || echo "CPU-only telepítés (iGPU profil).")
 
   Folytatjuk?" 26 || { ((SKIP++)); goto_step_7=false; }
 
   if [ "${goto_step_7:-true}" = "true" ]; then
     log "STEP" "6/7 PyTorch telepítése: ${PYTORCH_INDEX} ($TORCH_INDEX_URL)"
 
-    # --index-url: PyTorch saját wheel repository (CUDA verzió specifikus)
-    # --upgrade update módban (meglévő csomag frissítése)
     UV_FLAGS=""
     [ "${RUN_MODE:-install}" = "update" ] && UV_FLAGS="--upgrade"
 
@@ -978,7 +966,6 @@ if $_torch_needs_install; then
       dialog_warn "PyTorch — Telepítési hiba" \
         "\n  PyTorch telepítés sikertelen (exit $TORCH_EC).\n\n  Részletek: $LOGFILE_AI\n\n  Lehetséges ok:\n  • Internet kapcsolat hiba\n  • Inkompatibilis PYTORCH_INDEX: $PYTORCH_INDEX" 16
     else
-      # PyTorch verzió lekérés és logolás
       TORCH_VER=$("$VENV_PY" -c \
         "import torch; print(torch.__version__)" 2>/dev/null || echo "ismeretlen")
       ((OK++))
@@ -994,7 +981,7 @@ if $_torch_needs_install; then
     python -c 'import torch; print(torch.cuda.get_device_name(0))'
 
   $([ "$PYTORCH_INDEX" != "cpu" ] && \
-    echo "Várható eredmény: True (most False lehet — normális!)" || \
+    echo "Várható: True (most False lehet — normális!)" || \
     echo "CPU-only mód: cuda.is_available() = False (normális!)")" 18
     fi
   fi
@@ -1003,9 +990,6 @@ fi
 # =============================================================================
 # ██  7. PROJEKT TEMPLATE  ██
 # =============================================================================
-# A template minden új Python AI projekthez kiindulópontot ad.
-# A .cursorrules az AI pair programming asszisztensnek ad kontextust.
-# A pyproject.toml tartalmaz minden szükséges tool konfigurációt.
 
 _tmpl_needs_install=false
 [ "${COMP_STATUS[template]}" != "ok" ] && _tmpl_needs_install=true
@@ -1018,10 +1002,10 @@ if $_tmpl_needs_install; then
     $TEMPLATE_DIR/
 
   Tartalom:
-    pyproject.toml      — ruff, black, mypy, pytest, isort konfig
-    .env.example        — API kulcsok mintája
-    .cursorrules        — Cursor/Claude AI coding instrukciók
-    .vscode/settings.json — VS Code Python konfiguráció
+    pyproject.toml         — ruff, black, mypy, pytest, isort konfig
+    .env.example           — API kulcsok mintája
+    .cursorrules           — Cursor/Claude AI coding instrukciók
+    .vscode/settings.json  — VS Code Python konfiguráció
     .pre-commit-config.yaml — pre-commit hook konfiguráció
 
   Folytatjuk?" 18 || { ((SKIP++)); goto_end=false; }
@@ -1032,12 +1016,10 @@ if $_tmpl_needs_install; then
     chown -R "$_REAL_USER:$_REAL_USER" "$_REAL_HOME/templates" 2>/dev/null || true
 
     # ── pyproject.toml ────────────────────────────────────────────────────────
-    # Minden tool konfigurációja egy fájlban — PEP 517/518 szabvány
-    # Forrás: https://packaging.python.org/en/latest/guides/writing-pyproject-toml/
     cat > "$TEMPLATE_DIR/pyproject.toml" << 'TOML_EOF'
 # =============================================================================
 # pyproject.toml — Python AI/ML projekt konfiguráció
-# Generálta: vibe-coding-infra 03_python_aiml.sh
+# Generálta: vibe-coding-infra 03_python_aiml.sh v6.2
 # Python: 3.12+ | Stack: PyTorch, FastAPI, LangChain, HuggingFace
 # =============================================================================
 
@@ -1048,102 +1030,72 @@ description = "AI/ML projekt leírása"
 requires-python = ">=3.12"
 dependencies = []
 
-# ── Black — kód formázó ───────────────────────────────────────────────────────
-# Forrás: https://black.readthedocs.io/en/stable/
 [tool.black]
 line-length = 100
 target-version = ["py312"]
-# preview = true  # új formázás funkciók (opcionális)
 
-# ── Ruff — linter + formázó (Black + isort + flake8 kombináció) ─────────────
-# Forrás: https://docs.astral.sh/ruff/
 [tool.ruff]
 line-length = 100
 target-version = "py312"
 
 [tool.ruff.lint]
-# Aktív szabálycsoportok:
-#   E/W: pycodestyle, F: pyflakes, I: isort, N: pep8-naming
-#   UP: pyupgrade (modernizálás), B: flake8-bugbear, ANN: annotáció
-#   S: bandit (biztonsági), ASYNC: aszinkron kód minőség
 select = ["E", "F", "I", "N", "UP", "B", "ANN", "ASYNC"]
 ignore = [
   "ANN101",  # self annotáció nem szükséges
   "ANN102",  # cls annotáció nem szükséges
-  "B008",    # FastAPI Depends() függőség injekció OK
+  "B008",    # FastAPI Depends() OK
 ]
 
 [tool.ruff.lint.isort]
-# isort kompatibilis szekciók: stdlib, third-party, first-party
 known-first-party = ["src"]
 
-# ── isort — import rendezés ───────────────────────────────────────────────────
 [tool.isort]
 profile = "black"
 line_length = 100
 
-# ── mypy — statikus típusellenőrzés ──────────────────────────────────────────
-# Forrás: https://mypy.readthedocs.io/en/stable/
 [tool.mypy]
 python_version = "3.12"
 strict = true
 ignore_missing_imports = true
-# Plugin-ok (opcionális):
-# plugins = ["pydantic.mypy"]  # Pydantic v2 mypy plugin
 
-# ── pytest — teszt keretrendszer ──────────────────────────────────────────────
-# Forrás: https://docs.pytest.org/en/stable/
 [tool.pytest.ini_options]
-asyncio_mode = "auto"         # pytest-asyncio: auto mód (nem kell @pytest.mark.asyncio)
+asyncio_mode = "auto"
 testpaths = ["tests"]
-addopts = [
-  "-v",                        # részletes kimenet
-  "--tb=short",                # rövid traceback
-  "--cov=src",                 # coverage riport a src/ könyvtárra
-  "--cov-report=term-missing", # hiányzó sorok megjelenítése
-]
+addopts = ["-v", "--tb=short", "--cov=src", "--cov-report=term-missing"]
 
-# ── coverage.py ───────────────────────────────────────────────────────────────
 [tool.coverage.run]
 source = ["src"]
 omit = ["tests/*", "**/__init__.py"]
 TOML_EOF
 
     # ── .env.example ──────────────────────────────────────────────────────────
-    # API kulcsok mintája — a .env nincs verziókezelve (gitignore!)
     cat > "$TEMPLATE_DIR/.env.example" << 'ENV_EOF'
 # =============================================================================
 # .env.example — API kulcsok és konfiguráció minta
 # Másold .env-be és töltsd ki! (.env SOHA nem kerül git-be!)
 # =============================================================================
 
-# ── LLM API kulcsok ───────────────────────────────────────────────────────────
 ANTHROPIC_API_KEY=sk-ant-api03-...
 OPENAI_API_KEY=sk-proj-...
 HUGGINGFACE_TOKEN=hf_...
 
-# ── Lokális AI stack (02_local_ai_stack.sh telepíti) ──────────────────────────
 OLLAMA_HOST=http://localhost:11434
 VLLM_HOST=http://localhost:8000
-VLLM_API_KEY=token-vllm          # vLLM API kulcs (szabadon beállítható)
+VLLM_API_KEY=token-vllm
 
-# ── CUDA konfiguráció ─────────────────────────────────────────────────────────
 CUDA_HOME=/usr/local/cuda
-CUDA_VISIBLE_DEVICES=0            # melyik GPU-t használja (0 = első)
-PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512  # CUDA OOM hiba csökkentése
+CUDA_VISIBLE_DEVICES=0
+PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512
 
-# ── Fejlesztői konfiguráció ───────────────────────────────────────────────────
 LOG_LEVEL=INFO
 DEBUG=false
 ENV_EOF
 
     # ── .cursorrules ──────────────────────────────────────────────────────────
-    # Cursor IDE és Claude AI pair programming instrukciók
-    # Forrás: https://www.cursor.com/blog/cursorrules
     cat > "$TEMPLATE_DIR/.cursorrules" << CURSOR_EOF
 # =============================================================================
 # .cursorrules — AI pair programming irányelvek
-# Generálta: vibe-coding-infra 03_python_aiml.sh
+# Generálta: vibe-coding-infra 03_python_aiml.sh v6.2
 # Stack: Python 3.12 + PyTorch ${PYTORCH_INDEX} + LangChain + HuggingFace + FastAPI
 # =============================================================================
 
@@ -1160,26 +1112,23 @@ Always write production-quality, type-annotated Python 3.12+ code.
 
 ## Code Quality Rules
 - Type hints EVERYWHERE — use \`from __future__ import annotations\` at top
-- Pydantic v2 BaseModel for all data structures (not TypedDict for complex data)
+- Pydantic v2 BaseModel for all data structures
 - Google-style docstrings for all public functions and classes
 - 100 character line length (black + ruff configured)
-- pathlib.Path (not os.path), logging (not print), loguru preferred
+- pathlib.Path (not os.path), loguru (not print)
 - No bare except — always catch specific exceptions
-- f-strings for formatting (not .format() or % style)
 
 ## PyTorch Conventions
 - torch.no_grad() + torch.autocast() for all inference paths
 - bfloat16 on Blackwell (RTX 5090) and Ampere+, float16 on older Turing
 - safetensors for model serialization (NEVER pickle for models!)
-- Device-agnostic code: device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-- Explicit batch dimension handling, comment tensor shapes
+- Device-agnostic: device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 ## LLM / AI Conventions
 - Use langchain LCEL (pipe syntax: chain = prompt | llm | parser)
 - Anthropic Claude: use streaming for long outputs
 - OpenAI: use structured outputs (response_format=)
 - Rate limiting + tenacity retry for all API calls
-- Log token usage for cost monitoring
 
 ## Security
 - API keys from python-dotenv / pydantic-settings ONLY
@@ -1191,50 +1140,33 @@ CURSOR_EOF
     # ── .vscode/settings.json ─────────────────────────────────────────────────
     cat > "$TEMPLATE_DIR/.vscode/settings.json" << VSCODE_EOF
 {
-  "// comment": "VS Code Python konfiguráció — vibe-coding-infra generálta",
   "python.defaultInterpreterPath": "${_REAL_HOME}/AI-VIBE/venvs/ai/bin/python",
   "python.terminal.activateEnvironment": true,
   "editor.formatOnSave": true,
   "editor.rulers": [100],
   "[python]": {
     "editor.defaultFormatter": "ms-python.black-formatter",
-    "editor.codeActionsOnSave": {
-      "source.organizeImports": "explicit"
-    }
+    "editor.codeActionsOnSave": { "source.organizeImports": "explicit" }
   },
   "ruff.lint.args": ["--line-length=100"],
   "black-formatter.args": ["--line-length", "100"],
   "mypy-type-checker.args": ["--strict", "--ignore-missing-imports"],
   "python.testing.pytestEnabled": true,
-  "python.testing.pytestArgs": ["tests"],
-  "jupyter.kernels.filter": [
-    {
-      "path": "${_REAL_HOME}/AI-VIBE/venvs/ai/bin/python",
-      "type": "pythonEnvironment"
-    }
-  ]
+  "python.testing.pytestArgs": ["tests"]
 }
 VSCODE_EOF
 
     # ── .pre-commit-config.yaml ───────────────────────────────────────────────
-    # Git commit előtti automatikus ellenőrzések
-    # Forrás: https://pre-commit.com/
     cat > "$TEMPLATE_DIR/.pre-commit-config.yaml" << 'PRECOMMIT_EOF'
-# =============================================================================
-# .pre-commit-config.yaml — Git commit hook konfiguráció
+# pre-commit hook konfiguráció
 # Telepítés: pre-commit install (venv aktiválás után)
-# Futtatás: pre-commit run --all-files
-# =============================================================================
 repos:
-  # Ruff linter + formázó (Black + isort + flake8 kombináció)
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.4.10
     hooks:
       - id: ruff
-        args: ["--fix"]          # automatikus javítás ahol lehetséges
-      - id: ruff-format          # Black-kompatibilis formázás
-
-  # Trailing whitespace, EOF newline, YAML/JSON validáció
+        args: ["--fix"]
+      - id: ruff-format
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v4.6.0
     hooks:
@@ -1243,11 +1175,9 @@ repos:
       - id: check-yaml
       - id: check-json
       - id: check-toml
-      - id: check-added-large-files  # megakadályozza nagy fájlok véletlen commit-ját
-        args: ["--maxkb=10240"]      # 10 MB limit (modell fájlok!)
-      - id: debug-statements         # print(), pdb.set_trace() blokkolása
-
-  # Mypy statikus típusellenőrzés
+      - id: check-added-large-files
+        args: ["--maxkb=10240"]
+      - id: debug-statements
   - repo: https://github.com/pre-commit/mirrors-mypy
     rev: v1.9.0
     hooks:
@@ -1266,23 +1196,23 @@ fi
 # =============================================================================
 
 # ── INFRA state frissítés ─────────────────────────────────────────────────────
-# MOD_03_DONE=true → a 02_local_ai_stack.sh infra_require("03")-mal ellenőrzi
-# Csak sikeres befejezés esetén írjuk true-ra!
+# MOD_03_DONE=true → 02_local_ai_stack.sh infra_require("03") ellenőrzi
+# Legalább egy sikeres lépés VAGY nulla hiba esetén true-ra állítjuk.
+# fix módban is beállítjuk — a javítás sikeres komponensek esetén érvényes.
 if [ "$FAIL" -eq 0 ] || [ "$OK" -gt 0 ]; then
   infra_state_set "MOD_03_DONE" "true"
   log "STATE" "MOD_03_DONE=true — 02_local_ai_stack.sh futtatható"
 else
-  log "WARN" "Hibák miatt MOD_03_DONE nem lett true-ra állítva"
+  log "WARN" "Hibák miatt MOD_03_DONE nem lett true-ra állítva (OK=$OK FAIL=$FAIL)"
 fi
 
-# Lock fájl törlése — más scriptek futhatnak
+# Lock fájl törlése
 rm -f "$LOCK_FILE"
 
-# ── Végeredmény összesítő ──────────────────────────────────────────────────────
-# show_result() dialóg + log (00_lib.sh)
+# ── Végeredmény összesítő ─────────────────────────────────────────────────────
 show_result "$OK" "$SKIP" "$FAIL"
 
-# ── Összefoglalás dialóg — aktiválási útmutató ───────────────────────────────
+# ── Összefoglalás dialóg ──────────────────────────────────────────────────────
 dialog_msg "[$INFRA_NAME] — Következő lépések" "
   ── Venv aktiválás ────────────────────────────────────────
   source $VENV_DIR/bin/activate
@@ -1299,11 +1229,7 @@ dialog_msg "[$INFRA_NAME] — Következő lépések" "
 
   ── Projekt template ──────────────────────────────────────
   cp -r $TEMPLATE_DIR/ ~/projektek/uj-ai-projekt/
-  cd ~/projektek/uj-ai-projekt/
-  cp .env.example .env && nano .env  # API kulcsok beállítása
 
-  ── PyTorch CUDA index ────────────────────────────────────
-  $PYTORCH_INDEX (CUDA $CUDA_VER)
-
+  ── PyTorch index: $PYTORCH_INDEX (CUDA $CUDA_VER)
   ── AI kernel neve: Python 3.12 (AI/ML)
   ── Log: $LOGFILE_AI" 30
