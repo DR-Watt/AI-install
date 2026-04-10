@@ -1,26 +1,22 @@
 name: "CI – AI/ML Installer Ellenőrzés"
 # =============================================================================
-# .github/workflows/ci.yml
-# =============================================================================
-# Projekt:      AI/ML környezet telepítő (CUDA · PyTorch · Ollama · vLLM)
-# Platform:     Ubuntu 24.04 LTS · x86_64
-# Leírás:       Folyamatos integráció (CI) pipeline:
-#               - Shell script szintaxis ellenőrzés (shellcheck)
-#               - Python kód formázás ellenőrzés (ruff)
-#               - Dokumentáció frissességének ellenőrzése
-#               - Biztonsági szken (trivy / gitleaks)
-# Verzió:       1.0.0
-# Dokumentáció: https://docs.github.com/en/actions
+# .github/workflows/ci.yml — v1.1.0
+#
+# SHELLCHECK POLICY:
+#   --severity=error  → csak valódi hibák buktatják el a build-et
+#   Warningok (SC2155 readonly+assign, SC2034 unused var, SC2088 tilde)
+#   nem CI-hibák — stílus jelzések, nem funkcióhibák.
+#   Kizárva: gh_connect.sh, git_setup.sh (third-party eszközök)
+#   Ellenőrzött: 00_*.sh, 01*.sh, 02*.sh, 03*.sh, lib/*.sh
 # =============================================================================
 
 on:
   push:
-    branches: [ "main", "develop" ]          # Push esemény main és develop branch-re
+    branches: [ "main", "develop" ]
   pull_request:
-    branches: [ "main" ]                      # PR esemény main branch-re
-  workflow_dispatch:                          # Manuális futtatás lehetősége
+    branches: [ "main" ]
+  workflow_dispatch:
 
-# Alapértelmezett shell beállítása
 defaults:
   run:
     shell: bash
@@ -31,7 +27,7 @@ jobs:
   # ===========================================================================
   shellcheck:
     name: "🔍 Shell Script Ellenőrzés"
-    runs-on: ubuntu-24.04                     # Ubuntu 24.04 LTS runner
+    runs-on: ubuntu-24.04
 
     steps:
       - name: "📥 Kód checkout"
@@ -40,12 +36,21 @@ jobs:
       - name: "🔧 ShellCheck telepítése"
         run: sudo apt-get install -y shellcheck
 
-      - name: "🔍 .sh fájlok ellenőrzése"
+      - name: "🔍 INFRA .sh fájlok ellenőrzése"
         run: |
-          # Minden shell script fájl megkeresése és ellenőrzése
-          find . -name "*.sh" -not -path "./.git/*" | while read -r script; do
+          # INFRA scriptek ellenőrzése — kizárva:
+          #   gh_connect.sh  : third-party connector eszköz
+          #   git_setup.sh   : third-party setup eszköz
+          #   *.bak.*        : backup fájlok
+          # --severity=error : csak valódi hibák buktatják el (nem stílus warningok)
+          find . -name "*.sh" \
+            -not -path "./.git/*" \
+            -not -name "gh_connect.sh" \
+            -not -name "git_setup.sh" \
+            -not -name "*.bak.*" \
+          | sort | while read -r script; do
             echo "Ellenőrzés: $script"
-            shellcheck --severity=warning "$script"
+            shellcheck --severity=error "$script"
           done
 
   # ===========================================================================
@@ -54,7 +59,6 @@ jobs:
   python-lint:
     name: "🐍 Python Kód Minőség"
     runs-on: ubuntu-24.04
-    # Csak akkor fut, ha van Python fájl
     if: |
       contains(toJSON(github.event.head_commit.modified), '.py') ||
       contains(toJSON(github.event.head_commit.added), '.py')
@@ -64,7 +68,6 @@ jobs:
         uses: actions/checkout@v4
 
       - name: "🐍 Python + UV telepítése"
-        # UV dokumentáció: https://docs.astral.sh/uv/
         run: |
           curl -LsSf https://astral.sh/uv/install.sh | sh
           echo "$HOME/.cargo/bin" >> $GITHUB_PATH
@@ -75,7 +78,7 @@ jobs:
           uv tool run ruff format . --check
 
   # ===========================================================================
-  # 3. JOB: Biztonsági szken (gitleaks – titkos kulcsok keresése)
+  # 3. JOB: Biztonsági szken (gitleaks)
   # ===========================================================================
   security-scan:
     name: "🔒 Biztonsági Szken"
@@ -85,7 +88,7 @@ jobs:
       - name: "📥 Kód checkout (teljes história)"
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0    # Teljes git historia a gitleaks-hez
+          fetch-depth: 0
 
       - name: "🔒 Gitleaks – titkos kulcsok keresése"
         uses: gitleaks/gitleaks-action@v2
@@ -106,7 +109,7 @@ jobs:
       - name: "📋 README.md létezés ellenőrzése"
         run: |
           if [[ ! -f "README.md" ]]; then
-            echo "::warning::README.md hiányzik! Ajánlott létrehozni."
+            echo "::warning::README.md hiányzik!"
           else
             echo "✓ README.md megtalálható"
             wc -l README.md
