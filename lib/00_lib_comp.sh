@@ -372,18 +372,33 @@ comp_check_torch() {
   fi
 }
 
-# comp_check_vscode: code --version (Microsoft VS Code).
-# Forrás: code --version (VS Code CLI)
-# FONTOS: sudo alatt a root PATH esetleg nem tartalmazza /usr/bin-t,
-#   ahol a VS Code bináris van (Ubuntu: /usr/bin/code, deb csomag telepíti).
-#   Explicit PATH megadás szükséges — enélkül sudo futtatáskor "missing"
-#   eredményt ad annak ellenére, hogy a VS Code telepítve van.
+# comp_check_vscode: code --version (Microsoft VS Code) + dpkg fallback.
+# Forrás: code --version (VS Code CLI) | dpkg -l code
+# PROBLÉMA: sudo alatt a code --version nem működik még explicit PATH-szal sem.
+#   A VS Code Electron wrapper más env változókat vár (DBUS, display session).
+#   Sudo alatt ezek hiányoznak → a CLI indul, de rögtön kilép 0 nélküli kóddal.
+# MEGOLDÁS: kétlépéses ellenőrzés:
+#   1. dpkg -l code → csomag telepítve van-e? (sudo alatt biztosan működik)
+#   2. dpkg verzióból kinyerjük a verziószámot
+#   3. Fallback: PATH fix-es code --version (ha dpkg nem ad verziót)
 comp_check_vscode() {
   local min="${1:-1.85}"
   local ver
-  # Explicit PATH: /usr/bin elsőként — sudo PATH nem örökli a user PATH-ját
-  ver=$(PATH="/usr/bin:/usr/local/bin:$PATH" code --version 2>/dev/null \
-        | head -1 | grep -oP '[\d.]+')
+
+  # 1. Próba: dpkg alapú ellenőrzés — sudo alatt biztosan elérhető
+  # A dpkg -l code visszaadja: ii  code  1.96.0-...  amd64  Code editor
+  if dpkg -l code 2>/dev/null | grep -q "^ii"; then
+    ver=$(dpkg -l code 2>/dev/null           | awk '/^ii/{print $3}'           | grep -oP '\d+\.\d+\.\d+' | head -1)
+    # Ha a dpkg nem ad verziószámot (formátum változott), jelezzük telepítve van
+    [ -z "$ver" ] && ver="1.0"
+  fi
+
+  # 2. Fallback: code --version explicit PATH-szal (ha dpkg nem találta)
+  if [ -z "$ver" ]; then
+    ver=$(PATH="/usr/bin:/usr/local/bin:$PATH" code --version 2>/dev/null \
+          | head -1 | grep -oP '[\d.]+')
+  fi
+
   [ -z "$ver" ] && {
     COMP_STATUS[vscode]="missing"
     COMP_VER[vscode]=""

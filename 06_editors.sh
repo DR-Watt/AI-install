@@ -291,8 +291,10 @@ else
   # check_component: eval-alapú, COMP_STATUS[] és COMP_VER[] tömböt tölti fel
   check_component "cursor" \
     "[ -f '$_REAL_HOME/bin/cursor' ] && echo 1" "1"
+  # Kitty explicit path: sudo alatt ~/.local/kitty.app/bin nincs a PATH-ban
+  # Elsőként a symlink-et próbálja (~/bin/kitty), majd a telepítési helyet
   check_component "kitty" \
-    "kitty --version 2>/dev/null | grep -oP '[\d.]+' | head -1" "${VER[kitty_min]}"
+    "PATH='$_REAL_HOME/bin:$_REAL_HOME/.local/kitty.app/bin:/usr/bin:$PATH' kitty --version 2>/dev/null | grep -oP '[\d.]+' | head -1" "${VER[kitty_min]}"
   check_component "cline" \
     "PATH='/usr/bin:/usr/local/bin:$PATH' code --list-extensions 2>/dev/null | grep -q saoudrizwan.claude-dev && echo 1" "1"
   check_component "continue_dev" \
@@ -414,9 +416,10 @@ if cmd_exists code; then
 
   # Extension telepítés: nincs külön ask_proceed — ha a user elindította a
   # 06-os szálat és a VS Code elérhető, az extension-ök automatikusan települnek.
-  # Check módban: ask_proceed (ami belül van a _install_ext hívásokra) nem fut,
-  # de itt a check mód-ot a RUN_MODE alapján kezeljük.
-  if [ "$RUN_MODE" != "skip" ]; then
+  # Extension telepítés CSAK módosító módokban — check és skip ki van zárva!
+  # Korábban "!= skip" volt: check mód is belefutott → check módban is telepített.
+  # Javítás: explicit whitelist — csak install/update/reinstall/fix futtatja.
+  if [[ "$RUN_MODE" =~ ^(install|update|reinstall|fix)$ ]]; then
     progress_open "VS Code Extensions" "Extension-ök telepítése..."
     ext_i=0
 
