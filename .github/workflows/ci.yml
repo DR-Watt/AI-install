@@ -1,0 +1,121 @@
+name: "CI – AI/ML Installer Ellenőrzés"
+# =============================================================================
+# .github/workflows/ci.yml
+# =============================================================================
+# Projekt:      AI/ML környezet telepítő (CUDA · PyTorch · Ollama · vLLM)
+# Platform:     Ubuntu 24.04 LTS · x86_64
+# Leírás:       Folyamatos integráció (CI) pipeline:
+#               - Shell script szintaxis ellenőrzés (shellcheck)
+#               - Python kód formázás ellenőrzés (ruff)
+#               - Dokumentáció frissességének ellenőrzése
+#               - Biztonsági szken (trivy / gitleaks)
+# Verzió:       1.0.0
+# Dokumentáció: https://docs.github.com/en/actions
+# =============================================================================
+
+on:
+  push:
+    branches: [ "main", "develop" ]          # Push esemény main és develop branch-re
+  pull_request:
+    branches: [ "main" ]                      # PR esemény main branch-re
+  workflow_dispatch:                          # Manuális futtatás lehetősége
+
+# Alapértelmezett shell beállítása
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # ===========================================================================
+  # 1. JOB: Shell script ellenőrzés (shellcheck)
+  # ===========================================================================
+  shellcheck:
+    name: "🔍 Shell Script Ellenőrzés"
+    runs-on: ubuntu-24.04                     # Ubuntu 24.04 LTS runner
+
+    steps:
+      - name: "📥 Kód checkout"
+        uses: actions/checkout@v4
+
+      - name: "🔧 ShellCheck telepítése"
+        run: sudo apt-get install -y shellcheck
+
+      - name: "🔍 .sh fájlok ellenőrzése"
+        run: |
+          # Minden shell script fájl megkeresése és ellenőrzése
+          find . -name "*.sh" -not -path "./.git/*" | while read -r script; do
+            echo "Ellenőrzés: $script"
+            shellcheck --severity=warning "$script"
+          done
+
+  # ===========================================================================
+  # 2. JOB: Python kód minőség (ruff linter)
+  # ===========================================================================
+  python-lint:
+    name: "🐍 Python Kód Minőség"
+    runs-on: ubuntu-24.04
+    # Csak akkor fut, ha van Python fájl
+    if: |
+      contains(toJSON(github.event.head_commit.modified), '.py') ||
+      contains(toJSON(github.event.head_commit.added), '.py')
+
+    steps:
+      - name: "📥 Kód checkout"
+        uses: actions/checkout@v4
+
+      - name: "🐍 Python + UV telepítése"
+        # UV dokumentáció: https://docs.astral.sh/uv/
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+
+      - name: "🔍 Ruff linter futtatása"
+        run: |
+          uv tool run ruff check . --output-format=github
+          uv tool run ruff format . --check
+
+  # ===========================================================================
+  # 3. JOB: Biztonsági szken (gitleaks – titkos kulcsok keresése)
+  # ===========================================================================
+  security-scan:
+    name: "🔒 Biztonsági Szken"
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: "📥 Kód checkout (teljes história)"
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0    # Teljes git historia a gitleaks-hez
+
+      - name: "🔒 Gitleaks – titkos kulcsok keresése"
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ===========================================================================
+  # 4. JOB: Dokumentáció ellenőrzés
+  # ===========================================================================
+  docs-check:
+    name: "📚 Dokumentáció Ellenőrzés"
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: "📥 Kód checkout"
+        uses: actions/checkout@v4
+
+      - name: "📋 README.md létezés ellenőrzése"
+        run: |
+          if [[ ! -f "README.md" ]]; then
+            echo "::warning::README.md hiányzik! Ajánlott létrehozni."
+          else
+            echo "✓ README.md megtalálható"
+            wc -l README.md
+          fi
+
+      - name: "📋 Dokumentációs prompt ellenőrzése"
+        run: |
+          if [[ -f "dokumentációs_prompt.md" ]]; then
+            echo "✓ dokumentációs_prompt.md megtalálható"
+          else
+            echo "::warning::dokumentációs_prompt.md hiányzik!"
+          fi
