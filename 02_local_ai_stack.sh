@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# 02_local_ai_stack.sh — Lokális AI Stack v6.2
+# 02_local_ai_stack.sh — Lokális AI Stack v6.2.1
 #                        Ollama + vLLM + TurboQuant llama.cpp fork
 #
 # Szerepe az INFRA rendszerben
@@ -237,7 +237,6 @@ fi
 # PyTorch: a venv-ben kell jelen lennie — Python import ellenőrzés
 # Ha nincs torch a venv-ben, a 03-as modul nem futott le teljesen.
 if [ "${COMP_STATUS[venv]}" = "ok" ]; then
-  local torch_ver
   torch_ver=$("$VENV_PY" -c "import torch; print(torch.__version__)" 2>/dev/null)
   if [ -n "$torch_ver" ]; then
     COMP_STATUS[torch]="ok"; COMP_VER[torch]="$torch_ver"
@@ -430,7 +429,7 @@ if [ "${COMP_STATUS[ollama]}" != "ok" ] || [ "$RUN_MODE" = "reinstall" ]; then
     OLLAMA_PID=$!
 
     progress_open "Ollama telepítése" "Ollama letöltése és telepítése..."
-    local _pct=5
+    _pct=5
     while kill -0 $OLLAMA_PID 2>/dev/null; do
       progress_set "$_pct" "Ollama telepítése..."
       sleep 1
@@ -495,7 +494,7 @@ if ${HW_VLLM_OK}; then
       VLLM_PID=$!
 
       progress_open "vLLM telepítése" "uv pip install vllm (${PYTORCH_INDEX})..."
-      local _vpct=5
+      _vpct=5
       while kill -0 $VLLM_PID 2>/dev/null; do
         progress_set "$_vpct" "vLLM telepítése (~500 MB)..."
         sleep 3
@@ -607,7 +606,6 @@ dialog_yesno "TurboQuant llama.cpp fork fordítása" \
 
     # ── cu128 figyelmeztetés ha SM_120 választva de CUDA < 12.8 ───────────────
     if [ "$TQ_BUILD_MODE" = "gpu120" ]; then
-      local _cuda_major _cuda_minor
       _cuda_major=$(echo "${TQ_CUDA_VER:-0.0}" | cut -d. -f1)
       _cuda_minor=$(echo "${TQ_CUDA_VER:-0.0}" | cut -d. -f2)
 
@@ -918,7 +916,7 @@ if $OLLAMA_AVAIL; then
       PULL_PID=$!
 
       progress_open "Ollama — modell letöltés" "${MODEL}"
-      local _mpct=3
+      _mpct=3
       while kill -0 $PULL_PID 2>/dev/null; do
         progress_set "$_mpct" "${MODEL} letöltése..."
         sleep 3
