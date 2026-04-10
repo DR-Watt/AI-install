@@ -279,7 +279,24 @@ else
 fi
 
 # Ollama: dedikált comp_check_ollama() a lib-ben
+# Forrás: https://ollama.readthedocs.io/en/ — 'ollama version' az official CLI
+#
+# [FIX v6.4.2] sudo alatt /usr/local/bin nem mindig szerepel a PATH-ban,
+# ahol az Ollama telepítője elhelyezi a binárist (/usr/local/bin/ollama).
+# Megoldás: explicit PATH kiegészítés + közvetlen path fallback ha comp "missing".
+export PATH="/usr/local/bin:/usr/local/sbin:$PATH"
 comp_check_ollama "${MIN_VER[ollama]}"
+
+# Fallback: ha comp_check_ollama "missing"-et adott, de a bináris tényleg megvan
+if [ "${COMP_STATUS[ollama]:-missing}" = "missing" ] && [ -x "/usr/local/bin/ollama" ]; then
+  _ov=$(/usr/local/bin/ollama version 2>/dev/null | grep -oP '\d+\.\d+\.\d+' | head -1)
+  [ -z "$_ov" ] && \
+    _ov=$(/usr/local/bin/ollama --version 2>/dev/null | grep -oP '\d+\.\d+\.\d+' | head -1)
+  if [ -n "$_ov" ]; then
+    COMP_STATUS[ollama]="ok"; COMP_VER[ollama]="$_ov"
+    log "COMP" "Ollama fallback detektált: v${_ov} (/usr/local/bin/ollama)"
+  fi
+fi
 
 # vLLM: dedikált comp_check_vllm() a lib-ben (v6.2 újdonság)
 # Paraméter: min verzió + a venv Python bináris (nem a rendszer python!)
@@ -500,8 +517,8 @@ if [ "${COMP_STATUS[ollama]}" != "ok" ] || [ "$RUN_MODE" = "reinstall" ]; then
     wait $OLLAMA_PID
     progress_close
 
-    if command -v ollama &>/dev/null; then
-      # Systemd service regisztrálása és indítása
+    if command -v ollama &>/dev/null || [ -x "/usr/local/bin/ollama" ]; then
+      # [FIX v6.4.2] explicit path fallback: command -v esetleg nem találja sudo PATH-ban
       # Forrás: Ollama Linux install dokumentáció
       sudo_run systemctl enable ollama 2>/dev/null || true
       sudo_run systemctl start  ollama 2>/dev/null || true
