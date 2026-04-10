@@ -245,9 +245,12 @@ hw_detect() {
                  | awk '/^ii/{print $2}' | sort -V | tail -1)
 
     # B. Ténylegesen telepített nvidia-driver-* (zárt, nem-open)
+    # FONTOS: awk-ban a && NEM mehet regex blokkon belül!
+    #   HIBÁS:  awk '/^ii && !/open/{print $2}'  → syntax error
+    #   HELYES: awk '/^ii/ && !/open/{print $2}'  → két külön feltétel
     local _inst_closed
     _inst_closed=$(dpkg -l 'nvidia-driver-[0-9]*' 2>/dev/null \
-                   | awk '/^ii && !/open/{print $2}' | sort -V | tail -1)
+                   | awk '/^ii/ && !/open/{print $2}' | sort -V | tail -1)
 
     if [ -n "$_inst_open" ]; then
       # Telepített -open csomag van — azt mutatjuk
