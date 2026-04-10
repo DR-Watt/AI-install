@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# 01b_post_reboot.sh — User Environment v6.4
+# 01b_post_reboot.sh — User Environment v6.5
 #                       Zsh · Oh My Zsh · Shell konfiguráció · PATH
 #
 # Szerepe a INFRA rendszerben
@@ -32,6 +32,16 @@
 #   • Rendszer újraindult (az NVIDIA driver betöltve: nvidia-smi válaszol)
 #   • sudo jogosultság (chsh, apt)
 #
+# Változtatások v6.5 (COMP STATE integráció):
+#   - COMP STATE bevezetése a komponens felmérés blokkban
+#       COMP_USE_CACHED=true → comp_load_state("01b") (master exportálja)
+#       COMP_USE_CACHED=false → friss comp_check_zsh + comp_check_ohmyzsh
+#   - Check módban comp_save_state("01b") a felmérés végén
+#   - Post-install re-check + comp_save_state a script végén
+#       (install/update/fix/reinstall módokban)
+#   - COMP_CHECK tömb bevezetése (log_comp_status-hoz, 06-os minta)
+#   - Telepítési lépések RUN_MODE guard: check módban nem futnak
+#
 # Változtatások v6.4 (split lib v6.4 igazítás):
 #   - REAL_USER/REAL_HOME: lib _REAL_* értékek, nem újradefiniálva
 #   - infra_require("01a"): most helyes — lib fix: tr lowercase→uppercase
@@ -58,6 +68,13 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ── Közös függvénytár betöltése ───────────────────────────────────────────────
+# 00_lib.sh master loader — betölti az összes lib/ komponenst sorban:
+#   lib/00_lib_core.sh  → log, sudo, user, utility
+#   lib/00_lib_hw.sh    → hw_detect, hw_has_nvidia
+#   lib/00_lib_ui.sh    → dialog_*, progress_*
+#   lib/00_lib_state.sh → infra_state_*, infra_require, detect_run_mode
+#   lib/00_lib_comp.sh  → comp_check_*, comp_save_state, comp_load_state, ...
+#   lib/00_lib_apt.sh   → apt_install_*, run_with_progress
 LIB="$SCRIPT_DIR/00_lib.sh"
 [ -f "$LIB" ] && source "$LIB" \
   || { echo "HIBA: 00_lib.sh hiányzik! Elvárt helye: $LIB"; exit 1; }
@@ -107,7 +124,7 @@ declare -A PKGS=(
   # ripgrep: grep helyett (gyorsabb, .gitignore-aware)
   # fd-find: find helyett (gyorsabb, user-friendly szintaxis)
   # zoxide: cd helyett (frecency alapú navigáció, z parancs)
-  # starship: opcionális prompt (p10k alternatíva, Rust-alapú)
+  # Forrás: Ubuntu 24.04 LTS universe repository
   [modern_cli]="fzf bat eza ripgrep fd-find zoxide"
 
   # tmux: terminál multiplexer — vibe coding session layout
@@ -141,9 +158,15 @@ ZSH_PLUGINS=(
   "zsh-completions"         # kibővített completion adatbázis
 )
 
-# ── Ellenőrizendő komponensek listája ─────────────────────────────────────────
-# comp_check_* függvények a 00_lib.sh-ban vannak definiálva
-COMP_NAMES=(zsh ohmyzsh)
+# ── Komponens ellenőrző specifikációk ─────────────────────────────────────────
+# Formátum: "name|version_cmd|min_ver"
+# Ezeket a log_comp_status() olvassa a státusz logba íráshoz (06-os minta).
+# A tényleges check hívások a KOMPONENS FELMÉRÉS blokkban vannak.
+# FONTOS: a "name" megegyezik a COMP_STATUS[] és COMP_VER[] kulcsával!
+COMP_CHECK=(
+  "zsh|zsh --version|${MIN_VER[zsh]}"
+  "ohmyzsh|[ -d '$_REAL_HOME/.oh-my-zsh/.git' ] && echo 1|1"
+)
 
 # =============================================================================
 # ██  INICIALIZÁLÁS  ██
@@ -178,6 +201,11 @@ trap 'rm -f "$LOCK"; log "LOCK" "Lock felszabadítva"' EXIT
 # ── Log rendszer inicializálás ─────────────────────────────────────────────────
 log_init
 
+# ── hw_detect + infra_state_init ──────────────────────────────────────────────
+# hw_detect: HW_PROFILE, hw_has_nvidia stb. — a reboot dialog ellenőrzéséhez
+hw_detect
+infra_state_init
+
 # ── INFRA state betöltése ─────────────────────────────────────────────────────
 # Ezeket a 01a_system_foundation.sh írta — mi csak olvassuk.
 _CUDA_VER="$(infra_state_get "CUDA_VER" "12.6")"
@@ -186,14 +214,15 @@ _HW_GPU_NAME="$(infra_state_get "HW_GPU_NAME" "ismeretlen GPU")"
 _PYTORCH_IDX="$(infra_state_get "PYTORCH_INDEX" "cu126")"
 
 log "STATE" "Betöltve: CUDA=$_CUDA_VER PROFILE=$_HW_PROFILE PyTorch=$_PYTORCH_IDX"
+log "INFO"  "Valódi user: $REAL_USER | Home: $REAL_HOME | GUI: $GUI_BACKEND"
 
 # =============================================================================
 # ██  ELŐFELTÉTELEK ELLENŐRZÉSE  ██
 # =============================================================================
 
 # ── 01a lefutott-e? ───────────────────────────────────────────────────────────
-# infra_require() a 00_lib.sh-ban: MOD_01A_DONE=true-t keres az infra state-ben.
-# Ha nincs benne, dialógot mutat és kilép.
+# infra_require(): MOD_01A_DONE=true-t keres az infra state-ben.
+# Check és fix módban a lib nem blokkol (bypass logika 00_lib_state.sh-ban).
 if ! infra_require "01a" "System Foundation (01a_system_foundation.sh)"; then
   log "FAIL" "Előfeltétel hiányzik: 01a — kilépés"
   exit 1
@@ -226,29 +255,62 @@ fi
 # =============================================================================
 # ██  KOMPONENS ÁLLAPOT FELMÉRÉS  ██
 # =============================================================================
-# comp_check_ohmyzsh: ~/.oh-my-zsh könyvtár + git commit hash
-# Zsh verzió: zsh --version
+# COMP STATE logika (06_editors.sh minta alapján):
+#
+#   COMP_USE_CACHED=true (00_master.sh exportálja) + létező state:
+#     → comp_load_state: COMP_STATUS[] és COMP_VER[] betöltése state fájlból
+#     → NEM fut tényleges check — a mentett értékeket használja
+#
+#   Egyébként (friss check):
+#     → comp_check_zsh + comp_check_ohmyzsh futnak
+#     → check módban: comp_save_state ide (semmi sem változik → pre=post)
+#     → install/update/fix/reinstall módban: comp_save_state a SCRIPT VÉGÉN fut
+#       (post-install re-check után — hogy a telepítések utáni valós állapotot
+#       tükrözze, ne a telepítés ELŐTTI állapotot)
+#
+# lib/00_lib_comp.sh függvények:
+#   comp_load_state()      — state → COMP_STATUS[] + COMP_VER[] (check nélkül)
+#   comp_save_state()      — COMP_STATUS[] + COMP_VER[] → state
+#   comp_state_exists()    — bool: van-e mentett check?
+#   comp_state_age_hours() — hány óra régi a mentett check?
 
 log "COMP" "━━━ Komponens felmérés ━━━"
 
-# Zsh verzió lekérdezése
-_ZSH_VER=$(zsh --version 2>/dev/null | grep -oP '[\d.]+' | head -1)
-if [ -z "$_ZSH_VER" ]; then
-  COMP_STATUS[zsh]="missing"; COMP_VER[zsh]=""
-elif version_ok "$_ZSH_VER" "${MIN_VER[zsh]}"; then
-  COMP_STATUS[zsh]="ok"; COMP_VER[zsh]="$_ZSH_VER"
+if [ "${COMP_USE_CACHED:-false}" = "true" ] && comp_state_exists "$INFRA_NUM"; then
+  # ── Mentett check eredmény betöltése ─────────────────────────────────────────
+  # comp_load_state: COMP_STATUS[] + COMP_VER[] tömbök feltöltése state fájlból.
+  # Ez NEM fut check-et — csak a korábban elmentett értékeket tölti be.
+  comp_load_state "$INFRA_NUM"
+  _state_age=$(comp_state_age_hours "$INFRA_NUM")
+  log "COMP" "Mentett check betöltve — INFRA $INFRA_NUM (${_state_age} óra)"
+
 else
-  COMP_STATUS[zsh]="old"; COMP_VER[zsh]="$_ZSH_VER"
+  # ── Friss komponens ellenőrzés ───────────────────────────────────────────────
+
+  # Zsh verzió: comp_check_zsh() a lib/00_lib_comp.sh-ban (zsh --version alapján)
+  # Forrás: https://zsh.sourceforge.io/Doc/ — zsh --version flag
+  # Ubuntu 24.04 LTS main repóban: 5.9
+  comp_check_zsh "${MIN_VER[zsh]}"
+
+  # Oh My Zsh: könyvtár + .git jelenlét ellenőrzése
+  # comp_check_ohmyzsh() a lib/00_lib_comp.sh-ban (git log alapján)
+  # REAL_HOME átadása: sudo alatt $_REAL_HOME helyes, $HOME=/root lenne
+  comp_check_ohmyzsh "$REAL_HOME/.oh-my-zsh"
+
+  # ── Check módban mentés az ELEJÉN ─────────────────────────────────────────────
+  # Check módban semmi sem változik → pre-check állapot = post-check állapot.
+  # Ezért itt mentünk, nem a végén.
+  # Install/update/fix/reinstall módban NEM mentünk itt — ott a SCRIPT VÉGÉN
+  # fut egy teljes re-check + mentés, MIUTÁN minden telepítés kész.
+  if [ "$RUN_MODE" = "check" ]; then
+    comp_save_state "$INFRA_NUM"
+    log "COMP" "Check mód: COMP state mentve"
+  fi
 fi
 
-# Oh My Zsh: a REAL_USER home könyvtárában kell lennie
-comp_check_ohmyzsh "$REAL_HOME/.oh-my-zsh"
-
-# Státusz szöveg
-STATUS=""
-for _c in "${COMP_NAMES[@]}"; do
-  STATUS+="$(comp_line "$_c" "$_c")"$'\n'
-done
+# log_comp_status: COMP_CHECK tömb alapján logba írja az állapotot
+# (00_lib_comp.sh — COMP_STATUS[] tömb értékeit mutatja, akár fresh akár cached)
+log_comp_status "${COMP_CHECK[@]}"
 
 log "COMP" "zsh: ${COMP_STATUS[zsh]:-missing} (${COMP_VER[zsh]:-—})"
 log "COMP" "ohmyzsh: ${COMP_STATUS[ohmyzsh]:-missing} (${COMP_VER[ohmyzsh]:-—})"
@@ -257,16 +319,16 @@ log "COMP" "ohmyzsh: ${COMP_STATUS[ohmyzsh]:-missing} (${COMP_VER[ohmyzsh]:-—}
 # ██  ÜDVÖZLŐ DIALÓGUS  ██
 # =============================================================================
 
-log_infra_header "
-    • Zsh shell (alapértelmezett shell: chsh)
+log_infra_header \
+"    • Zsh shell (alapértelmezett shell: chsh)
     • Oh My Zsh + plugins (autosuggestions, syntax-hl, completions)
     • Powerlevel10k téma (git, Python, CUDA prompt info)
     • .zshrc teljes konfiguráció (CUDA, pyenv, nvm, workspace aliasok)
     • Modern CLI eszközök (fzf, bat, eza, ripgrep, zoxide)
     • ~/.aliases, ~/.tmux.conf, git global konfig"
 
-log_install_paths "
-    ~/.oh-my-zsh/                    — Oh My Zsh keretrendszer
+log_install_paths \
+"    ~/.oh-my-zsh/                    — Oh My Zsh keretrendszer
     ~/.oh-my-zsh/custom/plugins/     — külső plugin-ok
     ~/.oh-my-zsh/custom/themes/      — powerlevel10k téma
     ~/.zshrc                         — fő shell konfig (backup: .zshrc.bak)
@@ -274,18 +336,22 @@ log_install_paths "
     ~/.tmux.conf                     — tmux konfig
     ~/.p10k.zsh                      — powerlevel10k prompt konfig"
 
+# Státusz szöveg dialóghoz
+STATUS=""
+STATUS+="$(comp_line "zsh"     "Zsh"      "${MIN_VER[zsh]}")"$'\n'
+STATUS+="$(comp_line "ohmyzsh" "Oh My Zsh" "")"$'\n'
+
 dialog_msg "INFRA ${INFRA_NUM} — ${INFRA_NAME}" "
-  GPU:        ${_HW_GPU_NAME}
-  CUDA:       ${_CUDA_VER} (PyTorch: ${_PYTORCH_IDX})
-  Mód:        $RUN_MODE
+  GPU:         ${_HW_GPU_NAME}
+  CUDA:        ${_CUDA_VER} (PyTorch: ${_PYTORCH_IDX})
+  Mód:         $RUN_MODE
   Felhasználó: $REAL_USER
 
   Komponens állapot:
 ${STATUS}
   Telepíti:
     • Zsh ${MIN_VER[zsh]}+ (alapértelmezett shell)
-    • Oh My Zsh + 3 plugin
-    • Powerlevel10k téma
+    • Oh My Zsh + 3 plugin + powerlevel10k téma
     • .zshrc teljes generálás (backup készül)
     • Modern CLI: fzf, bat, eza, ripgrep, zoxide
     • ~/.aliases workspace shortcutek
@@ -297,26 +363,29 @@ ${STATUS}
 # =============================================================================
 # ██  RUN_MODE MEGHATÁROZÁS  ██
 # =============================================================================
+# detect_run_mode: Ha minden OK → felajánl skip/update/reinstall opciót.
+# Ha bármi hiányzik → RUN_MODE=install marad.
+# Paraméter: nameref a komponens kulcs tömbhöz.
 
 _comp_keys=(zsh ohmyzsh)
 detect_run_mode _comp_keys
 
 [ "$RUN_MODE" = "skip" ] && {
-  dialog_msg "Minden naprakész" "\n${STATUS}\n  Minden komponens naprakész — semmi sem változik."
+  dialog_msg "Minden naprakész — INFRA ${INFRA_NUM}" \
+    "\n${STATUS}\n  Minden komponens naprakész — semmi sem változik."
   log "SKIP" "Minden komponens OK → kilépés"
   infra_state_set "MOD_01B_DONE" "true"
   exit 0
 }
 
-dialog_yesno "Komponens állapot — Megerősítés" "
+dialog_yesno "Komponens állapot — INFRA ${INFRA_NUM}" "
 ${STATUS}
   Telepítési helyek:
     ~/.oh-my-zsh/       — Oh My Zsh
     ~/.zshrc            — shell konfig (backup: .zshrc.bak)
     ~/.aliases          — workspace aliasok
 
-  Mód: $RUN_MODE
-  Folytatjuk?" 24 || { log "USER" "Megszakítva"; exit 0; }
+  Mód: $RUN_MODE — folytatjuk?" 24 || { log "USER" "Megszakítva"; exit 0; }
 
 OK=0; SKIP=0; FAIL=0
 
@@ -327,56 +396,65 @@ OK=0; SKIP=0; FAIL=0
 # chsh -s: alapértelmezett shell beállítása a valódi felhasználónak.
 # FONTOS: sudo alatt nem futunk zsh-val — csak a login shell változik.
 # Forrás: https://zsh.sourceforge.io/Doc/
+#
+# RUN_MODE guard: check módban ez a lépés nem futhat — a check nem változtat
+# rendszerállapotot. Az ask_proceed egyrészt kérdez, de a check mód
+# általában automatikus (STEP_INTERACTIVE=false), így a guard explicit.
 
 log "STEP" "━━━ 1/6: Zsh telepítés + alapértelmezett shell ━━━"
 
-if [ "${COMP_STATUS[zsh]:-missing}" != "ok" ] || \
-   [ "$RUN_MODE" = "reinstall" ]; then
+if [[ "$RUN_MODE" =~ ^(install|update|reinstall|fix)$ ]]; then
+  if [ "${COMP_STATUS[zsh]:-missing}" != "ok" ] || \
+     [ "$RUN_MODE" = "reinstall" ]; then
 
-  if ask_proceed "Zsh telepítése és alapértelmezett shellként beállítása?"; then
-    apt_install_progress \
-      "Zsh shell" \
-      "Zsh telepítése..." \
-      ${PKGS[shell]}
-    _ec=$?
+    if ask_proceed "Zsh telepítése és alapértelmezett shellként beállítása?"; then
+      apt_install_progress \
+        "Zsh shell" \
+        "Zsh telepítése..." \
+        ${PKGS[shell]}
+      _ec=$?
 
-    if [ $_ec -eq 0 ]; then
-      # Zsh elérési útja — Ubuntu 24.04-en tipikusan /usr/bin/zsh
-      _ZSH_PATH="$(which zsh 2>/dev/null || echo "/usr/bin/zsh")"
+      if [ $_ec -eq 0 ]; then
+        # Zsh elérési útja — Ubuntu 24.04-en tipikusan /usr/bin/zsh
+        _ZSH_PATH="$(which zsh 2>/dev/null || echo "/usr/bin/zsh")"
 
-      # /etc/shells ellenőrzés — chsh csak bejegyzett shell-re vált
-      if ! grep -qxF "$_ZSH_PATH" /etc/shells; then
-        echo "$_ZSH_PATH" >> /etc/shells
-        log "CFG" "Zsh hozzáadva /etc/shells-be: $_ZSH_PATH"
-      fi
+        # /etc/shells ellenőrzés — chsh csak bejegyzett shell-re vált
+        if ! grep -qxF "$_ZSH_PATH" /etc/shells; then
+          echo "$_ZSH_PATH" >> /etc/shells
+          log "CFG" "Zsh hozzáadva /etc/shells-be: $_ZSH_PATH"
+        fi
 
-      # chsh: a valódi felhasználó alapértelmezett shelljét váltja
-      # -s: az új shell; a felhasználónév az utolsó argumentum
-      if chsh -s "$_ZSH_PATH" "$REAL_USER" 2>/dev/null; then
-        log "OK" "Alapértelmezett shell beállítva: $REAL_USER → $_ZSH_PATH"
-        ((OK++))
-      else
-        log "WARN" "chsh sikertelen — manuálisan: chsh -s $_ZSH_PATH $REAL_USER"
-        dialog_warn "chsh — Figyelmeztetés" "
+        # chsh: a valódi felhasználó alapértelmezett shelljét váltja
+        # -s: az új shell; a felhasználónév az utolsó argumentum
+        if chsh -s "$_ZSH_PATH" "$REAL_USER" 2>/dev/null; then
+          log "OK" "Alapértelmezett shell beállítva: $REAL_USER → $_ZSH_PATH"
+          ((OK++))
+        else
+          log "WARN" "chsh sikertelen — manuálisan: chsh -s $_ZSH_PATH $REAL_USER"
+          dialog_warn "chsh — Figyelmeztetés" "
   Az alapértelmezett shell beállítása (chsh) sikertelen volt.
 
   Manuálisan:
     chsh -s $(which zsh) $REAL_USER
 
   A zsh ettől függetlenül fut — csak a login shell nem zsh még." 14
-        ((OK++))  # Nem kritikus — telepítés OK, csak chsh nem sikerült
-      fi
+          ((OK++))  # Nem kritikus — telepítés OK, csak chsh nem sikerült
+        fi
 
-      _ZSH_VER_NOW=$(zsh --version 2>/dev/null | grep -oP '[\d.]+' | head -1)
-      infra_state_set "INST_ZSH_VER" "${_ZSH_VER_NOW:-ismeretlen}"
+        _ZSH_VER_NOW=$(zsh --version 2>/dev/null | grep -oP '[\d.]+' | head -1)
+        infra_state_set "INST_ZSH_VER" "${_ZSH_VER_NOW:-ismeretlen}"
+      else
+        log "FAIL" "Zsh telepítés SIKERTELEN (exit $_ec)"; ((FAIL++))
+      fi
     else
-      log "FAIL" "Zsh telepítés SIKERTELEN (exit $_ec)"; ((FAIL++))
+      ((SKIP++)); log "SKIP" "Zsh telepítés kihagyva"
     fi
   else
-    ((SKIP++)); log "SKIP" "Zsh telepítés kihagyva"
+    log "SKIP" "Zsh már telepítve (${COMP_VER[zsh]:-?})"
+    ((SKIP++))
   fi
 else
-  log "SKIP" "Zsh már telepítve (${COMP_VER[zsh]:-?})"
+  log "SKIP" "Zsh telepítés kihagyva — check mód ($RUN_MODE)"
   ((SKIP++))
 fi
 
@@ -388,27 +466,33 @@ fi
 # eza:      modern ls (fa nézet, git integráció, ikonok)
 # ripgrep:  rg — grep helyett (10-100x gyorsabb, .gitignore-aware)
 # fd-find:  fd — find helyett (egyszerűbb szintaxis, gyorsabb)
-# zoxide:   z — smart cd frecency alapon (az oft-used könyvtárak rövidítése)
+# zoxide:   z — smart cd frecency alapon
+# tmux:     terminál multiplexer — vibe coding session layout
 #
 # Forrás: Ubuntu 24.04 LTS universe repository
 
 log "STEP" "━━━ 2/6: Modern CLI eszközök ━━━"
 
-if ask_proceed "Modern CLI eszközök telepítése? (fzf, bat, eza, ripgrep, zoxide)"; then
-  apt_install_progress \
-    "Modern CLI eszközök" \
-    "fzf, bat, eza, ripgrep, fd-find, zoxide telepítése..." \
-    ${PKGS[modern_cli]} ${PKGS[terminal]}
-  _ec=$?
-  if [ $_ec -eq 0 ]; then
-    log "OK" "Modern CLI eszközök telepítve"
-    ((OK++))
+if [[ "$RUN_MODE" =~ ^(install|update|reinstall|fix)$ ]]; then
+  if ask_proceed "Modern CLI eszközök telepítése? (fzf, bat, eza, ripgrep, zoxide, tmux)"; then
+    apt_install_progress \
+      "Modern CLI eszközök" \
+      "fzf, bat, eza, ripgrep, fd-find, zoxide, tmux telepítése..." \
+      ${PKGS[modern_cli]} ${PKGS[terminal]}
+    _ec=$?
+    if [ $_ec -eq 0 ]; then
+      log "OK" "Modern CLI eszközök telepítve"
+      ((OK++))
+    else
+      log "WARN" "Részleges sikertelenség (exit $_ec) — folytatás"
+      ((OK++))  # Nem kritikus, az aliasok gracefully degradálnak
+    fi
   else
-    log "WARN" "Részleges sikertelenség (exit $_ec) — folytatás"
-    ((OK++))  # Nem kritikus, az aliasok majd gracefully degradálnak
+    ((SKIP++)); log "SKIP" "Modern CLI eszközök kihagyva"
   fi
 else
-  ((SKIP++)); log "SKIP" "Modern CLI eszközök kihagyva"
+  log "SKIP" "Modern CLI eszközök kihagyva — check mód ($RUN_MODE)"
+  ((SKIP++))
 fi
 
 # =============================================================================
@@ -428,41 +512,42 @@ log "STEP" "━━━ 3/6: Oh My Zsh telepítés ━━━"
 
 _OMZ_DIR="$REAL_HOME/.oh-my-zsh"
 
-if [ "${COMP_STATUS[ohmyzsh]:-missing}" != "ok" ] || \
-   [ "$RUN_MODE" = "reinstall" ]; then
+if [[ "$RUN_MODE" =~ ^(install|update|reinstall|fix)$ ]]; then
+  if [ "${COMP_STATUS[ohmyzsh]:-missing}" != "ok" ] || \
+     [ "$RUN_MODE" = "reinstall" ]; then
 
-  if ask_proceed "Oh My Zsh telepítése?"; then
+    if ask_proceed "Oh My Zsh telepítése?"; then
 
-    # ── Reinstall esetén régi telepítés eltávolítása ──────────────────────
-    if [ "$RUN_MODE" = "reinstall" ] && [ -d "$_OMZ_DIR" ]; then
-      log "INFO" "Reinstall: régi Oh My Zsh törlése: $_OMZ_DIR"
-      rm -rf "$_OMZ_DIR"
-    fi
+      # ── Reinstall esetén régi telepítés eltávolítása ────────────────────
+      if [ "$RUN_MODE" = "reinstall" ] && [ -d "$_OMZ_DIR" ]; then
+        log "INFO" "Reinstall: régi Oh My Zsh törlése: $_OMZ_DIR"
+        rm -rf "$_OMZ_DIR"
+      fi
 
-    # ── Installer futtatása a valódi felhasználóként ──────────────────────
-    # Az install.sh: letölti a repo-t master branch-ről, beállítja a könyvtárat.
-    # A futtatás user kontextusban történik (HOME, UID, GID helyesen beállítva).
-    progress_open "Oh My Zsh telepítés" "Oh My Zsh master branch letöltése és telepítése..."
-    log_term "$ sudo -u $REAL_USER CHSH=no RUNZSH=no KEEP_ZSHRC=yes sh -c install.sh"
+      # ── Installer futtatása a valódi felhasználóként ──────────────────────
+      # Az install.sh: letölti a repo-t master branch-ről, beállítja a könyvtárat.
+      # A futtatás user kontextusban történik (HOME, UID, GID helyesen beállítva).
+      progress_open "Oh My Zsh telepítés" "Oh My Zsh master branch letöltése és telepítése..."
+      log_term "$ sudo -u $REAL_USER CHSH=no RUNZSH=no KEEP_ZSHRC=yes sh -c install.sh"
 
-    sudo -u "$REAL_USER" \
-      HOME="$REAL_HOME" \
-      CHSH=no \
-      RUNZSH=no \
-      KEEP_ZSHRC=yes \
-      sh -c "$(curl -fsSL '${OMZ_URLS[install]}')" 2>&1 | _tee_streams
-    _OMZ_EC="${PIPESTATUS[0]}"
+      sudo -u "$REAL_USER" \
+        HOME="$REAL_HOME" \
+        CHSH=no \
+        RUNZSH=no \
+        KEEP_ZSHRC=yes \
+        sh -c "$(curl -fsSL '${OMZ_URLS[install]}')" 2>&1 | _tee_streams
+      _OMZ_EC="${PIPESTATUS[0]}"
 
-    progress_close
+      progress_close
 
-    if [ -d "$_OMZ_DIR" ]; then
-      _OMZ_COMMIT=$(git -C "$_OMZ_DIR" log --oneline -1 2>/dev/null | cut -c1-7)
-      log "OK" "Oh My Zsh telepítve (commit: ${_OMZ_COMMIT:-?})"
-      infra_state_set "INST_OMZ_COMMIT" "${_OMZ_COMMIT:-ismeretlen}"
-      ((OK++))
-    else
-      log "FAIL" "Oh My Zsh telepítés SIKERTELEN (exit $_OMZ_EC)"
-      dialog_warn "Oh My Zsh — Hiba" "
+      if [ -d "$_OMZ_DIR" ]; then
+        _OMZ_COMMIT=$(git -C "$_OMZ_DIR" log --oneline -1 2>/dev/null | cut -c1-7)
+        log "OK" "Oh My Zsh telepítve (commit: ${_OMZ_COMMIT:-?})"
+        infra_state_set "INST_OMZ_COMMIT" "${_OMZ_COMMIT:-ismeretlen}"
+        ((OK++))
+      else
+        log "FAIL" "Oh My Zsh telepítés SIKERTELEN (exit $_OMZ_EC)"
+        dialog_warn "Oh My Zsh — Hiba" "
   Az Oh My Zsh telepítése sikertelen.
 
   Lehetséges okok:
@@ -471,89 +556,92 @@ if [ "${COMP_STATUS[ohmyzsh]:-missing}" != "ok" ] || \
     • REAL_HOME nem írható: ls -la $REAL_HOME
 
   Log: $LOGFILE_AI" 14
-      ((FAIL++))
+        ((FAIL++))
+      fi
+
+    else
+      ((SKIP++)); log "SKIP" "Oh My Zsh kihagyva"
+    fi
+
+    # ── Plugin-ok klónozása ────────────────────────────────────────────────
+    # Csak akkor klónozzuk, ha az OMZ könyvtár létezik
+    if [ -d "$_OMZ_DIR" ]; then
+
+      _OMZ_PLUGINS="$_OMZ_DIR/custom/plugins"
+      _OMZ_THEMES="$_OMZ_DIR/custom/themes"
+
+      # Könyvtárak létrehozása ha még nem léteznek
+      sudo -u "$REAL_USER" mkdir -p "$_OMZ_PLUGINS" "$_OMZ_THEMES"
+
+      log "STEP" "━━━ 3b: Plugin-ok klónozása ━━━"
+
+      # Segéd: klón vagy update, RUN_MODE-tudatos
+      _clone_or_update() {
+        local repo_url="$1"
+        local target_dir="$2"
+        local name="$3"
+
+        if [ -d "$target_dir/.git" ]; then
+          if [ "$RUN_MODE" = "update" ] || [ "$RUN_MODE" = "reinstall" ]; then
+            log "UPDATE" "$name frissítése: git pull"
+            sudo -u "$REAL_USER" git -C "$target_dir" pull --ff-only --quiet 2>&1 \
+              | _tee_streams || log "WARN" "$name git pull sikertelen (nem kritikus)"
+          else
+            log "SKIP" "$name már klónozva (install módban nem frissítjük)"
+          fi
+        else
+          log "INFO" "$name klónozása: $repo_url"
+          sudo -u "$REAL_USER" \
+            git clone --depth=1 "$repo_url" "$target_dir" 2>&1 | _tee_streams
+          if [ -d "$target_dir" ]; then
+            log "OK" "$name klónozva → $target_dir"
+          else
+            log "FAIL" "$name klónozás SIKERTELEN"
+          fi
+        fi
+      }
+
+      # zsh-autosuggestions — szürke előrejelzés history alapján
+      # Forrás: https://github.com/zsh-users/zsh-autosuggestions
+      _clone_or_update \
+        "${OMZ_URLS[autosuggestions]}" \
+        "$_OMZ_PLUGINS/zsh-autosuggestions" \
+        "zsh-autosuggestions"
+
+      # zsh-syntax-highlighting — gépelés közbeni szintaxis
+      # Forrás: https://github.com/zsh-users/zsh-syntax-highlighting
+      # FONTOS: A plugins listában az UTOLSÓ helyen kell szerepelnie!
+      _clone_or_update \
+        "${OMZ_URLS[syntax_hl]}" \
+        "$_OMZ_PLUGINS/zsh-syntax-highlighting" \
+        "zsh-syntax-highlighting"
+
+      # zsh-completions — kibővített completion adatbázis
+      # Forrás: https://github.com/zsh-users/zsh-completions
+      _clone_or_update \
+        "${OMZ_URLS[completions]}" \
+        "$_OMZ_PLUGINS/zsh-completions" \
+        "zsh-completions"
+
+      # powerlevel10k téma — leggazdagabb prompt
+      # Forrás: https://github.com/romkatv/powerlevel10k#oh-my-zsh
+      # --depth=1: csak a legfrissebb commit, a teljes history nem kell
+      _clone_or_update \
+        "${OMZ_URLS[p10k]}" \
+        "$_OMZ_THEMES/powerlevel10k" \
+        "powerlevel10k"
+
+      # Plugin könyvtár jogosultság javítás — sudo alatti git clone root-ként fut
+      chown -R "${REAL_UID}:${REAL_GID}" "$_OMZ_PLUGINS" "$_OMZ_THEMES" 2>/dev/null || true
+      log "CFG" "Plugin és téma könyvtár jogosultság beállítva: $REAL_USER"
     fi
 
   else
-    ((SKIP++)); log "SKIP" "Oh My Zsh kihagyva"
+    log "SKIP" "Oh My Zsh már telepítve (${COMP_VER[ohmyzsh]:-?})"
+    ((SKIP++))
   fi
-
-  # ── Plugin-ok klónozása ──────────────────────────────────────────────────
-  # Csak akkor klónozzuk, ha az OMZ könyvtár létezik
-  if [ -d "$_OMZ_DIR" ]; then
-
-    _OMZ_PLUGINS="$_OMZ_DIR/custom/plugins"
-    _OMZ_THEMES="$_OMZ_DIR/custom/themes"
-
-    # Könyvtárak létrehozása ha még nem léteznek
-    sudo -u "$REAL_USER" mkdir -p "$_OMZ_PLUGINS" "$_OMZ_THEMES"
-
-    log "STEP" "━━━ 3b: Plugin-ok klónozása ━━━"
-
-    # ── zsh-autosuggestions ───────────────────────────────────────────────
-    # Forrás: https://github.com/zsh-users/zsh-autosuggestions
-    # Gépelés közben szürke előrejelzés a history alapján; nyíl jobb = elfogad
-    _clone_or_update() {
-      local repo_url="$1"
-      local target_dir="$2"
-      local name="$3"
-
-      if [ -d "$target_dir/.git" ]; then
-        if [ "$RUN_MODE" = "update" ] || [ "$RUN_MODE" = "reinstall" ]; then
-          log "UPDATE" "$name frissítése: git pull"
-          sudo -u "$REAL_USER" git -C "$target_dir" pull --ff-only --quiet 2>&1 \
-            | _tee_streams || log "WARN" "$name git pull sikertelen (nem kritikus)"
-        else
-          log "SKIP" "$name már klónozva (install módban nem frissítjük)"
-        fi
-      else
-        log "INFO" "$name klónozása: $repo_url"
-        sudo -u "$REAL_USER" \
-          git clone --depth=1 "$repo_url" "$target_dir" 2>&1 | _tee_streams
-        if [ -d "$target_dir" ]; then
-          log "OK" "$name klónozva → $target_dir"
-        else
-          log "FAIL" "$name klónozás SIKERTELEN"
-        fi
-      fi
-    }
-
-    _clone_or_update \
-      "${OMZ_URLS[autosuggestions]}" \
-      "$_OMZ_PLUGINS/zsh-autosuggestions" \
-      "zsh-autosuggestions"
-
-    # ── zsh-syntax-highlighting ───────────────────────────────────────────
-    # Forrás: https://github.com/zsh-users/zsh-syntax-highlighting
-    # FONTOS: A plugins listában az UTOLSÓ előtt kell szerepelnie!
-    _clone_or_update \
-      "${OMZ_URLS[syntax_hl]}" \
-      "$_OMZ_PLUGINS/zsh-syntax-highlighting" \
-      "zsh-syntax-highlighting"
-
-    # ── zsh-completions ──────────────────────────────────────────────────
-    # Forrás: https://github.com/zsh-users/zsh-completions
-    # Kiegészítő completion definíciók (apt, docker, git stb.)
-    _clone_or_update \
-      "${OMZ_URLS[completions]}" \
-      "$_OMZ_PLUGINS/zsh-completions" \
-      "zsh-completions"
-
-    # ── powerlevel10k téma ────────────────────────────────────────────────
-    # Forrás: https://github.com/romkatv/powerlevel10k#oh-my-zsh
-    # --depth=1: csak a legfrissebb commit, a teljes history nem kell
-    _clone_or_update \
-      "${OMZ_URLS[p10k]}" \
-      "$_OMZ_THEMES/powerlevel10k" \
-      "powerlevel10k"
-
-    # Plugin könyvtár jogosultság javítás — sudo alatti git clone root-ként fut
-    chown -R "${REAL_UID}:${REAL_GID}" "$_OMZ_PLUGINS" "$_OMZ_THEMES" 2>/dev/null || true
-    log "CFG" "Plugin és téma könyvtár jogosultság beállítva: $REAL_USER"
-  fi
-
 else
-  log "SKIP" "Oh My Zsh már telepítve (${COMP_VER[ohmyzsh]:-?})"
+  log "SKIP" "Oh My Zsh telepítés kihagyva — check mód ($RUN_MODE)"
   ((SKIP++))
 fi
 
@@ -562,7 +650,6 @@ fi
 # =============================================================================
 # Teljes .zshrc generálás template-alapon.
 # A régi .zshrc backup-ra kerül (.zshrc.bak.<timestamp>) — nem veszítjük el.
-# Minden PATH beállítás, alias, export egyetlen helyen, jól kommentálva.
 #
 # PATH sorrend (alacsonyabb index = magasabb prioritás):
 #   1. ~/.local/bin      — pip install --user és uv tool install kimenete
@@ -572,34 +659,29 @@ fi
 #   5. system PATH       — maradék rendszer PATH
 #
 # Forrás: https://zsh.sourceforge.io/Doc/Release/Files.html
-#   → ~/.zshrc: Zsh interaktív session konfig fájlja
 
 log "STEP" "━━━ 4/6: .zshrc generálás ━━━"
 
 _ZSHRC="$REAL_HOME/.zshrc"
 
-if ask_proceed ".zshrc generálása? (backup készül a régiről)"; then
+if [[ "$RUN_MODE" =~ ^(install|update|reinstall|fix)$ ]]; then
+  if ask_proceed ".zshrc generálása? (backup készül a régiről)"; then
 
-  # ── Backup a meglévő .zshrc-ről ─────────────────────────────────────────
-  if [ -f "$_ZSHRC" ]; then
-    _BAK="${_ZSHRC}.bak.$(date '+%Y%m%d_%H%M%S')"
-    cp "$_ZSHRC" "$_BAK"
-    log "CFG" ".zshrc backup: $_BAK"
-  fi
+    # ── Backup a meglévő .zshrc-ről ───────────────────────────────────────
+    if [ -f "$_ZSHRC" ]; then
+      _BAK="${_ZSHRC}.bak.$(date '+%Y%m%d_%H%M%S')"
+      cp "$_ZSHRC" "$_BAK"
+      log "CFG" ".zshrc backup: $_BAK"
+    fi
 
-  # ── Plugin lista stringgé alakítása ───────────────────────────────────────
-  # A tömböt szóközzel elválasztott stringgé fűzzük a heredoc-ban
-  _PLUGINS_STR=$(printf '%s\n  ' "${ZSH_PLUGINS[@]}")
+    # ── Plugin lista stringgé alakítása ────────────────────────────────────
+    _PLUGINS_STR=$(printf '%s\n  ' "${ZSH_PLUGINS[@]}")
 
-  # ── .zshrc írása heredoc-kal ──────────────────────────────────────────────
-  # A heredoc 'ZSHRC_EOF' (egyszerű idézőjellel): NEM expanzálódnak a változók
-  # a heredoc tartalmában — CSAK a kijelölt helyeken (ahol "$var" szerepel).
-  # Ezért a statikus blokkokat külön adagoljuk cat >> formátumban.
-
-  cat > "$_ZSHRC" << ZSHRC_EOF
+    # ── .zshrc írása heredoc-kal ───────────────────────────────────────────
+    cat > "$_ZSHRC" << ZSHRC_EOF
 # =============================================================================
 # ~/.zshrc — Vibe Coding Workspace
-# Generálta: 01b_post_reboot.sh v6.0
+# Generálta: 01b_post_reboot.sh v6.5
 # Generálás ideje: $(date '+%Y-%m-%d %H:%M:%S')
 # GPU: ${_HW_GPU_NAME}
 # CUDA: ${_CUDA_VER} | PyTorch index: ${_PYTORCH_IDX}
@@ -608,14 +690,12 @@ if ask_proceed ".zshrc generálása? (backup készül a régiről)"; then
 
 # ── Oh My Zsh alapbeállítások ─────────────────────────────────────────────────
 
-# Oh My Zsh telepítési könyvtár
 export ZSH="\$HOME/.oh-my-zsh"
 
-# Téma: powerlevel10k — ga4dag prompt (git, python, cuda, timer)
-# Saját konfig: ~/.p10k.zsh (p10k configure futtatásával generálható)
+# Téma: powerlevel10k — gazdag prompt (git, python, cuda, timer)
 ZSH_THEME="${ZSH_THEME}"
 
-# Powerlevel10k instant prompt — gyors shell indítás, mielőtt az init lefut
+# Powerlevel10k instant prompt — gyors shell indítás
 # Forrás: https://github.com/romkatv/powerlevel10k#instant-prompt
 if [[ -r "\${XDG_CACHE_HOME:-\$HOME/.cache}/p10k-instant-prompt-\${(%):-%n}.zsh" ]]; then
   source "\${XDG_CACHE_HOME:-\$HOME/.cache}/p10k-instant-prompt-\${(%):-%n}.zsh"
@@ -628,42 +708,33 @@ plugins=(
 )
 
 # ── Zsh beállítások ───────────────────────────────────────────────────────────
-HISTSIZE=50000             # memóriában tárolt history bejegyzések száma
-SAVEHIST=50000             # lemezre mentett history bejegyzések
+HISTSIZE=50000
+SAVEHIST=50000
 HISTFILE="\$HOME/.zsh_history"
-setopt HIST_IGNORE_ALL_DUPS  # duplikált parancsok ne kerüljenek history-ba
-setopt HIST_SAVE_NO_DUPS     # mentéskor se kerüljön be duplikátum
-setopt SHARE_HISTORY         # több terminál ablak közötti history megosztás
-setopt AUTO_CD               # 'kod' egyenértékű 'cd kod'-dal ha könyvtár
-setopt CORRECT               # gépelési hibák automatikus korrekció ajánlata
-setopt COMPLETE_ALIASES      # aliasok tab-completion-jének engedélyezése
+setopt HIST_IGNORE_ALL_DUPS
+setopt HIST_SAVE_NO_DUPS
+setopt SHARE_HISTORY
+setopt AUTO_CD
+setopt CORRECT
+setopt COMPLETE_ALIASES
 
 # ── PATH konfiguráció ─────────────────────────────────────────────────────────
-# Sorrend (balról jobbra = prioritás csökken):
-#   1. ~/.local/bin      pip --user és uv tool install kimenete
-#   2. ~/bin             saját scriptek
-#   3. CUDA              nvcc, nsight, cuda-gdb stb.
-#   4. pyenv             Python verzióváltó (03_python_aiml.sh telepíti)
-#   5. nvm               Node.js verzióváltó (04_nodejs.sh telepíti)
-#   6. Rendszer PATH     maradék
+# 1. ~/.local/bin   2. ~/bin   3. CUDA   4. pyenv   5. nvm   6. system
 
-# Helyi binárisok — pip --user, uv tool install, pipx
 export PATH="\$HOME/.local/bin:\$HOME/bin:\$PATH"
 
 # ── CUDA toolkit ──────────────────────────────────────────────────────────────
-# CUDA_HOME: nvcc, libcuda, nsight elérési útja
 # Verzió: ${_CUDA_VER} (01a_system_foundation.sh telepítette)
 export CUDA_HOME=/usr/local/cuda
 export PATH="\${CUDA_HOME}/bin\${PATH:+:\${PATH}}"
 export LD_LIBRARY_PATH="\${CUDA_HOME}/lib64\${LD_LIBRARY_PATH:+:\${LD_LIBRARY_PATH}}"
 
 # ── pyenv — Python verzióváltó ────────────────────────────────────────────────
-# 03_python_aiml.sh telepíti. Ha még nincs fenn, ez a blokk gracefully kihagyódik.
+# 03_python_aiml.sh telepíti. Ha még nincs fenn, gracefully kihagyódik.
 export PYENV_ROOT="\$HOME/.pyenv"
 if [ -d "\$PYENV_ROOT" ]; then
   export PATH="\$PYENV_ROOT/bin:\$PATH"
   eval "\$(pyenv init -)"
-  # pyenv-virtualenv: ha telepítve van
   [ -f "\$PYENV_ROOT/plugins/pyenv-virtualenv/bin/pyenv-virtualenv" ] && \
     eval "\$(pyenv virtualenv-init -)"
 fi
@@ -675,16 +746,11 @@ export NVM_DIR="\$HOME/.nvm"
 [ -s "\$NVM_DIR/bash_completion" ] && source "\$NVM_DIR/bash_completion"
 
 # ── zoxide inicializálás ───────────────────────────────────────────────────────
-# z parancs: smart cd frecency alapon (oft-used könyvtárak rövid úton)
-# Forrás: https://github.com/ajeetdsouza/zoxide
 command -v zoxide &>/dev/null && eval "\$(zoxide init zsh)"
 
 # ── fzf konfiguráció ──────────────────────────────────────────────────────────
-# Ctrl+R: fuzzy history keresés | Ctrl+T: fuzzy file picker
-# Forrás: https://github.com/junegunn/fzf#key-bindings-for-command-line
 [ -f ~/.fzf.zsh ] && source ~/.fzf.zsh
 export FZF_DEFAULT_OPTS="--height 40% --border --layout=reverse --preview-window=right:50%"
-# fd-find használata a fzf-hez (gyorsabb, .gitignore-aware)
 command -v fdfind &>/dev/null && \
   export FZF_DEFAULT_COMMAND='fdfind --type f --hidden --follow --exclude .git'
 
@@ -692,7 +758,6 @@ command -v fdfind &>/dev/null && \
 source "\$ZSH/oh-my-zsh.sh"
 
 # ── zsh-completions manuális aktiválás ────────────────────────────────────────
-# A zsh-completions plugin a fpath-ba kerülést igényli OMZ betöltése után is
 if [ -d "\${ZSH_CUSTOM:-\$HOME/.oh-my-zsh/custom}/plugins/zsh-completions/src" ]; then
   fpath+="\${ZSH_CUSTOM:-\$HOME/.oh-my-zsh/custom}/plugins/zsh-completions/src"
 fi
@@ -701,47 +766,46 @@ fi
 [ -f "\$HOME/.aliases" ] && source "\$HOME/.aliases"
 
 # ── Powerlevel10k téma konfig ─────────────────────────────────────────────────
-# Ha még nincs ~/.p10k.zsh: 'p10k configure' futtatásával generálható interaktívan.
 [ -f "\$HOME/.p10k.zsh" ] && source "\$HOME/.p10k.zsh"
 
 ZSHRC_EOF
 
-  # ── Jogosultság beállítás ─────────────────────────────────────────────────
-  chown "${REAL_UID}:${REAL_GID}" "$_ZSHRC"
-  chmod 644 "$_ZSHRC"
-  log "OK" ".zshrc generálva: $_ZSHRC"
-  ((OK++))
+    chown "${REAL_UID}:${REAL_GID}" "$_ZSHRC"
+    chmod 644 "$_ZSHRC"
+    log "OK" ".zshrc generálva: $_ZSHRC"
+    ((OK++))
 
+  else
+    ((SKIP++)); log "SKIP" ".zshrc generálás kihagyva"
+  fi
 else
-  ((SKIP++)); log "SKIP" ".zshrc generálás kihagyva"
+  log "SKIP" ".zshrc generálás kihagyva — check mód ($RUN_MODE)"
+  ((SKIP++))
 fi
 
 # =============================================================================
 # ██  5. LÉPÉS — .bashrc SZINKRONIZÁLÁS  ██
 # =============================================================================
-# A .bashrc-be csak a kritikus PATH beállításokat adjuk hozzá —
-# azokat, amik nélkül az NVIDIA/CUDA CLI-k nem működnek bash sessionben sem.
+# A .bashrc-be csak a kritikus PATH beállításokat adjuk hozzá.
 # (VS Code terminál, SSH session, script futtatás esetén fontos.)
-# NEM generálunk teljes .bashrc-t — csak appendelünk egy jól elkülönített blokkot.
+# NEM generálunk teljes .bashrc-t — csak appendelünk egy elkülönített blokkot.
 
 log "STEP" "━━━ 5/6: .bashrc szinkronizálás ━━━"
 
 _BASHRC="$REAL_HOME/.bashrc"
 
-if ask_proceed ".bashrc CUDA + pyenv PATH szinkronizálása?"; then
+if [[ "$RUN_MODE" =~ ^(install|update|reinstall|fix)$ ]]; then
+  if ask_proceed ".bashrc CUDA + pyenv PATH szinkronizálása?"; then
 
-  # ── Ellenőrzés: már benne van-e a blokk? ────────────────────────────────
-  if grep -q "01b_post_reboot — PATH szinkronizálás" "$_BASHRC" 2>/dev/null; then
-    log "SKIP" ".bashrc blokk már létezik — nem írjuk felül"
-    ((SKIP++))
-  else
-    # ── Backup ──────────────────────────────────────────────────────────────
-    _BASHRC_BAK="${_BASHRC}.bak.$(date '+%Y%m%d_%H%M%S')"
-    cp "$_BASHRC" "$_BASHRC_BAK" 2>/dev/null && \
-      log "CFG" ".bashrc backup: $_BASHRC_BAK"
+    if grep -q "01b_post_reboot — PATH szinkronizálás" "$_BASHRC" 2>/dev/null; then
+      log "SKIP" ".bashrc blokk már létezik — nem írjuk felül"
+      ((SKIP++))
+    else
+      _BASHRC_BAK="${_BASHRC}.bak.$(date '+%Y%m%d_%H%M%S')"
+      cp "$_BASHRC" "$_BASHRC_BAK" 2>/dev/null && \
+        log "CFG" ".bashrc backup: $_BASHRC_BAK"
 
-    # ── PATH blokk hozzáadása ────────────────────────────────────────────
-    cat >> "$_BASHRC" << BASHRC_EOF
+      cat >> "$_BASHRC" << BASHRC_EOF
 
 # =============================================================================
 # 01b_post_reboot — PATH szinkronizálás — $(date '+%Y-%m-%d')
@@ -749,34 +813,33 @@ if ask_proceed ".bashrc CUDA + pyenv PATH szinkronizálása?"; then
 # GPU: ${_HW_GPU_NAME} | CUDA: ${_CUDA_VER}
 # =============================================================================
 
-# Helyi binárisok
 export PATH="\$HOME/.local/bin:\$HOME/bin:\${PATH}"
 
-# CUDA toolkit PATH (nvcc, nsight stb.)
 export CUDA_HOME=/usr/local/cuda
 export PATH="\${CUDA_HOME}/bin\${PATH:+:\${PATH}}"
 export LD_LIBRARY_PATH="\${CUDA_HOME}/lib64\${LD_LIBRARY_PATH:+:\${LD_LIBRARY_PATH}}"
 
-# pyenv (ha telepítve)
 export PYENV_ROOT="\$HOME/.pyenv"
 [ -d "\$PYENV_ROOT/bin" ] && export PATH="\$PYENV_ROOT/bin:\$PATH"
 command -v pyenv &>/dev/null && eval "\$(pyenv init -)"
 
-# nvm (ha telepítve)
 export NVM_DIR="\$HOME/.nvm"
 [ -s "\$NVM_DIR/nvm.sh" ] && source "\$NVM_DIR/nvm.sh"
 
-# Workspace aliasok
 [ -f "\$HOME/.aliases" ] && source "\$HOME/.aliases"
 BASHRC_EOF
 
-    chown "${REAL_UID}:${REAL_GID}" "$_BASHRC"
-    log "OK" ".bashrc PATH szinkronizálva"
-    ((OK++))
-  fi
+      chown "${REAL_UID}:${REAL_GID}" "$_BASHRC"
+      log "OK" ".bashrc PATH szinkronizálva"
+      ((OK++))
+    fi
 
+  else
+    ((SKIP++)); log "SKIP" ".bashrc szinkronizálás kihagyva"
+  fi
 else
-  ((SKIP++)); log "SKIP" ".bashrc szinkronizálás kihagyva"
+  log "SKIP" ".bashrc szinkronizálás kihagyva — check mód ($RUN_MODE)"
+  ((SKIP++))
 fi
 
 # =============================================================================
@@ -785,15 +848,14 @@ fi
 
 log "STEP" "━━━ 6/6: Workspace aliasok, tmux.conf, git global konfig ━━━"
 
-if ask_proceed "Workspace aliasok (~/.aliases), tmux konfig, git beállítások generálása?"; then
+if [[ "$RUN_MODE" =~ ^(install|update|reinstall|fix)$ ]]; then
+  if ask_proceed "Workspace aliasok (~/.aliases), tmux konfig, git beállítások generálása?"; then
 
-  # ── ~/.aliases — workspace shortcutek ─────────────────────────────────────
-  # Forrás: saját workspace igények + zsh best practices
-  # Fájl: ~/.aliases — .zshrc és .bashrc egyaránt betölti
-  cat > "$REAL_HOME/.aliases" << ALIAS_EOF
+    # ── ~/.aliases ──────────────────────────────────────────────────────────
+    cat > "$REAL_HOME/.aliases" << ALIAS_EOF
 # =============================================================================
 # ~/.aliases — Vibe Coding Workspace aliasok
-# Generálta: 01b_post_reboot.sh v6.0 — $(date '+%Y-%m-%d')
+# Generálta: 01b_post_reboot.sh v6.5 — $(date '+%Y-%m-%d')
 # Betölti: ~/.zshrc és ~/.bashrc
 # =============================================================================
 
@@ -802,8 +864,6 @@ alias ..='cd ..'
 alias ...='cd ../..'
 alias ....='cd ../../..'
 alias ~='cd ~'
-# eza: modern ls (ikonok, git státusz, human-readable méret)
-# Fallback ls-re ha eza nincs telepítve
 if command -v eza &>/dev/null; then
   alias ls='eza --icons --group-directories-first'
   alias ll='eza --icons --long --group-directories-first --git'
@@ -817,30 +877,27 @@ else
 fi
 
 # ── Szövegkezelés ────────────────────────────────────────────────────────────
-# bat: szintaxiskiemelő cat (--paging=never: ne lapozzon)
 command -v bat &>/dev/null && alias cat='bat --paging=never'
-# ripgrep: jobb grep (rg)
 command -v rg &>/dev/null && alias grep='rg'
-# fd: jobb find (fdfind Ubuntu csomagban)
 command -v fdfind &>/dev/null && alias fd='fdfind'
 
 # ── Rendszer megfigyelés ──────────────────────────────────────────────────────
 alias top='htop'
-alias gpu='watch -n 1 nvidia-smi'          # GPU állapot frissítés/sec
-alias gpuw='nvtop'                          # nvtop GPU dashboard
-alias mem='free -h'                         # RAM gyors áttekintés
-alias disk='df -h | grep -v tmpfs'          # lemez helyfoglalás
-alias ports='ss -tlnp'                      # aktív TCP portok
-alias myip='curl -s ifconfig.me'            # külső IP
+alias gpu='watch -n 1 nvidia-smi'
+alias gpuw='nvtop'
+alias mem='free -h'
+alias disk='df -h | grep -v tmpfs'
+alias ports='ss -tlnp'
+alias myip='curl -s ifconfig.me'
 
 # ── Docker ────────────────────────────────────────────────────────────────────
 alias d='docker'
 alias dc='docker compose'
 alias dps='docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"'
 alias dpsa='docker ps -a --format "table {{.Names}}\t{{.Status}}\t{{.Image}}"'
-alias dlogs='docker logs -f'               # dlogs <container>
-alias dex='docker exec -it'               # dex <container> bash
-alias dclean='docker system prune -f'      # futó containerek nélküli cleanup
+alias dlogs='docker logs -f'
+alias dex='docker exec -it'
+alias dclean='docker system prune -f'
 alias dgpus='docker run --rm --gpus all nvidia/cuda:12.6-base-ubuntu24.04 nvidia-smi'
 
 # ── Python + AI ──────────────────────────────────────────────────────────────
@@ -848,7 +905,7 @@ alias py='python3'
 alias pip='pip3'
 alias venv='python3 -m venv'
 alias activate='source .venv/bin/activate'
-alias jupy='jupyter lab --no-browser'        # JupyterLab (03_python_aiml után)
+alias jupy='jupyter lab --no-browser'
 
 # ── CUDA / GPU debug ─────────────────────────────────────────────────────────
 alias cuda-ver='nvcc --version'
@@ -861,7 +918,6 @@ alias infra-log-last='bat ~/AI-LOG-INFRA-SETUP/\$(ls -t ~/AI-LOG-INFRA-SETUP/*.l
 alias infra-state='cat ~/.infra-state'
 
 # ── Git rövidítések ───────────────────────────────────────────────────────────
-# (az OMZ git plugin is tartalmaz aliasokat — ezek kiegészítik)
 alias gs='git status'
 alias gd='git diff'
 alias gdc='git diff --cached'
@@ -872,65 +928,55 @@ alias gcb='git checkout -b'
 alias glog='git log --oneline --graph --decorate --all -20'
 
 # ── Vim / Nano ────────────────────────────────────────────────────────────────
-# Ha van neovim: vi és vim is azt nyissa
 command -v nvim &>/dev/null && alias vi='nvim' && alias vim='nvim'
 
 # ── Tmux workspace ────────────────────────────────────────────────────────────
-alias tm='tmux new-session -A -s main'      # 'main' session indítás/csatlakozás
-alias tma='tmux attach-session -t'          # tma <session>
+alias tm='tmux new-session -A -s main'
+alias tma='tmux attach-session -t'
 alias tml='tmux list-sessions'
 ALIAS_EOF
 
-  chown "${REAL_UID}:${REAL_GID}" "$REAL_HOME/.aliases"
-  log "OK" "~/.aliases generálva"
+    chown "${REAL_UID}:${REAL_GID}" "$REAL_HOME/.aliases"
+    log "OK" "~/.aliases generálva"
 
-  # ── ~/.tmux.conf — vibe coding session layout ──────────────────────────────
-  # Forrás: https://github.com/tmux/tmux/wiki/Getting-Started
-  # Layout: főablak felül (editor), log/AI pane alul, GPU pane jobb oldalt
-  cat > "$REAL_HOME/.tmux.conf" << TMUX_EOF
+    # ── ~/.tmux.conf ────────────────────────────────────────────────────────
+    # Forrás: https://github.com/tmux/tmux/wiki/Getting-Started
+    cat > "$REAL_HOME/.tmux.conf" << TMUX_EOF
 # =============================================================================
 # ~/.tmux.conf — Vibe Coding Workspace
-# Generálta: 01b_post_reboot.sh v6.0 — $(date '+%Y-%m-%d')
+# Generálta: 01b_post_reboot.sh v6.5 — $(date '+%Y-%m-%d')
 # =============================================================================
 
-# ── Alap beállítások ──────────────────────────────────────────────────────────
 set -g default-shell $(which zsh 2>/dev/null || echo /bin/zsh)
-set -g default-terminal "screen-256color"  # 256 szín + italics
-set -ga terminal-overrides ",xterm-256color:Tc"  # true color (24-bit)
-set -g history-limit 50000                 # scrollback buffer mérete
-set -g mouse on                            # egér: ablak váltás, resize, scroll
-set -g base-index 1                        # ablak számozás 1-től (nem 0-tól)
-setw -g pane-base-index 1                  # pane számozás 1-től
-set -g renumber-windows on                 # gap-mentes ablakszámok
+set -g default-terminal "screen-256color"
+set -ga terminal-overrides ",xterm-256color:Tc"
+set -g history-limit 50000
+set -g mouse on
+set -g base-index 1
+setw -g pane-base-index 1
+set -g renumber-windows on
 
-# ── Prefix billentyű ─────────────────────────────────────────────────────────
-# C-a: könnyebb mint C-b (vim-szerű, screen-kompatibilis)
 unbind C-b
 set -g prefix C-a
 bind C-a send-prefix
 
-# ── Vim-szerű navigáció ───────────────────────────────────────────────────────
-setw -g mode-keys vi             # copy mode-ban vi billentyűk
-bind h select-pane -L            # Prefix+h: bal pane
-bind j select-pane -D            # Prefix+j: alsó pane
-bind k select-pane -U            # Prefix+k: felső pane
-bind l select-pane -R            # Prefix+l: jobb pane
+setw -g mode-keys vi
+bind h select-pane -L
+bind j select-pane -D
+bind k select-pane -U
+bind l select-pane -R
 
-# Pane átméretezés (Prefix + Shift + arrow)
 bind -r H resize-pane -L 5
 bind -r J resize-pane -D 5
 bind -r K resize-pane -U 5
 bind -r L resize-pane -R 5
 
-# ── Pane felosztás (intuitív) ─────────────────────────────────────────────────
-bind | split-window -h -c "#{pane_current_path}"   # vízszintes felosztás
-bind - split-window -v -c "#{pane_current_path}"   # függőleges felosztás
+bind | split-window -h -c "#{pane_current_path}"
+bind - split-window -v -c "#{pane_current_path}"
 unbind '"'; unbind %
 
-# ── Konfig újratöltés ─────────────────────────────────────────────────────────
 bind r source-file ~/.tmux.conf \; display "~/.tmux.conf újratöltve!"
 
-# ── Státussor ─────────────────────────────────────────────────────────────────
 set -g status on
 set -g status-interval 5
 set -g status-position bottom
@@ -940,63 +986,56 @@ set -g status-left "#[fg=colour45,bold][ #S ]#[default] "
 set -g status-right "#[fg=colour220]%Y-%m-%d %H:%M #[fg=colour45]| #[fg=colour220]#H"
 setw -g window-status-current-format "#[fg=colour45,bold][#I:#W]"
 setw -g window-status-format " #I:#W "
-
-# ── Vibe coding session indítása ──────────────────────────────────────────────
-# 'tm' alias: tmux new-session -A -s main
-# Automatikus layout: főablak + log pane + GPU pane
-# (ha már létezik a session, csatlakozik — nem csinál újat)
 TMUX_EOF
 
-  chown "${REAL_UID}:${REAL_GID}" "$REAL_HOME/.tmux.conf"
-  log "OK" "~/.tmux.conf generálva"
+    chown "${REAL_UID}:${REAL_GID}" "$REAL_HOME/.tmux.conf"
+    log "OK" "~/.tmux.conf generálva"
 
-  # ── Git global konfiguráció ───────────────────────────────────────────────
-  # Forrás: https://git-scm.com/docs/git-config
-  # Csak azokat a beállításokat adjuk, amik nem definiáltak még
-  # (a git config --global nem írja felül ha már van bejegyezve)
-  _set_git_global() {
-    local key="$1" val="$2"
-    # Ellenőrzés: ha már van beállítva, csak loggoljuk
-    local existing
-    existing=$(sudo -u "$REAL_USER" HOME="$REAL_HOME" git config --global "$key" 2>/dev/null)
-    if [ -n "$existing" ]; then
-      log "SKIP" "git config $key már beállítva: $existing"
-    else
-      sudo -u "$REAL_USER" HOME="$REAL_HOME" git config --global "$key" "$val"
-      log "CFG" "git config --global $key=$val"
-    fi
-  }
+    # ── Git global konfiguráció ─────────────────────────────────────────────
+    # Forrás: https://git-scm.com/docs/git-config
+    # Csak azokat adjuk, amik még nincsenek beállítva
+    _set_git_global() {
+      local key="$1" val="$2"
+      local existing
+      existing=$(sudo -u "$REAL_USER" HOME="$REAL_HOME" git config --global "$key" 2>/dev/null)
+      if [ -n "$existing" ]; then
+        log "SKIP" "git config $key már beállítva: $existing"
+      else
+        sudo -u "$REAL_USER" HOME="$REAL_HOME" git config --global "$key" "$val"
+        log "CFG" "git config --global $key=$val"
+      fi
+    }
 
-  # Core beállítások
-  _set_git_global core.editor      "nano"        # alapértelmezett editor (biztonságos)
-  _set_git_global pull.rebase      "false"       # merge (nem rebase) pull esetén
-  _set_git_global init.defaultBranch "main"      # új repo-k main branch-sel
-  _set_git_global core.autocrlf    "input"       # Windows sorvégek konverzió ki
-  _set_git_global core.whitespace  "trailing-space,space-before-tab"
+    _set_git_global core.editor       "nano"
+    _set_git_global pull.rebase       "false"
+    _set_git_global init.defaultBranch "main"
+    _set_git_global core.autocrlf     "input"
+    _set_git_global core.whitespace   "trailing-space,space-before-tab"
+    _set_git_global alias.st          "status"
+    _set_git_global alias.co          "checkout"
+    _set_git_global alias.br          "branch"
+    _set_git_global alias.lg          "log --oneline --graph --decorate --all"
+    _set_git_global alias.lg10        "log --oneline --graph --decorate --all -10"
+    _set_git_global alias.unstage     "reset HEAD --"
+    _set_git_global alias.last        "log -1 HEAD"
+    _set_git_global alias.visual      "!gitk"
 
-  # Hasznos aliasok (git lg = szép egysorosás log)
-  _set_git_global alias.st    "status"
-  _set_git_global alias.co    "checkout"
-  _set_git_global alias.br    "branch"
-  _set_git_global alias.lg    "log --oneline --graph --decorate --all"
-  _set_git_global alias.lg10  "log --oneline --graph --decorate --all -10"
-  _set_git_global alias.unstage "reset HEAD --"
-  _set_git_global alias.last  "log -1 HEAD"
-  _set_git_global alias.visual "!gitk"
+    log "OK" "Git global konfig beállítva"
+    ((OK++))
 
-  log "OK" "Git global konfig beállítva"
-  ((OK++))
-
+  else
+    ((SKIP++)); log "SKIP" "Workspace aliasok / tmux / git konfig kihagyva"
+  fi
 else
-  ((SKIP++)); log "SKIP" "Workspace aliasok / tmux / git konfig kihagyva"
+  log "SKIP" "Workspace lépés kihagyva — check mód ($RUN_MODE)"
+  ((SKIP++))
 fi
 
 # =============================================================================
-# ██  INFRA STATE — MODOLT BEFEJEZETTNEK JELÖLJÜK  ██
+# ██  INFRA STATE — MODUL BEFEJEZETTNEK JELÖLVE  ██
 # =============================================================================
 # MOD_01B_DONE=true → 03_python_aiml.sh infra_require("01b") ezt ellenőrzi.
 # FEAT_SHELL_ZSH=true → más modulok tudhatják, hogy zsh az aktív shell.
-# Forrás: 00_lib.sh infra_state_set() — generikus key=value mentés
 
 infra_state_set "MOD_01B_DONE"    "true"
 infra_state_set "FEAT_SHELL_ZSH"  "true"
@@ -1007,6 +1046,37 @@ infra_state_set "INST_OMZ_COMMIT" "${_OMZ_COMMIT_FINAL:-ismeretlen}"
 
 log "STATE" "MOD_01B_DONE=true → 03_python_aiml.sh futtatható"
 infra_state_show
+
+# =============================================================================
+# ██  POST-INSTALL COMP STATE — RE-CHECK + MENTÉS  ██
+# =============================================================================
+# COMP STATE mentési logika (sablon alapján):
+#
+#   check mód     → comp_save_state a KOMPONENS FELMÉRÉS blokkban fut (fent)
+#                   Semmi sem változik → pre-check = post-check állapot.
+#
+#   install/update/fix/reinstall → re-check ITT, a telepítések UTÁN.
+#     Így a mentett state MINDIG a telepítések utáni valós állapotot tükrözi,
+#     nem a telepítés ELŐTTI állapotot.
+#
+# A check-ek megismétlése szükséges — a lib nem tud "lazy re-check"-et,
+# minden comp_check_* hívás friss értéket ad.
+
+if [[ "$RUN_MODE" =~ ^(install|update|fix|reinstall)$ ]]; then
+  log "COMP" "Post-install re-check futtatása (mód: $RUN_MODE)..."
+
+  # Zsh re-check: zsh --version (lib/00_lib_comp.sh comp_check_zsh)
+  comp_check_zsh "${MIN_VER[zsh]}"
+
+  # Oh My Zsh re-check: könyvtár + git log
+  comp_check_ohmyzsh "$REAL_HOME/.oh-my-zsh"
+
+  # Mentés az infra state fájlba
+  # Kulcsok: COMP_01B_TS, COMP_01B_S_ZSH, COMP_01B_V_ZSH,
+  #           COMP_01B_S_OHMYZSH, COMP_01B_V_OHMYZSH
+  comp_save_state "$INFRA_NUM"
+  log "COMP" "Post-install COMP state mentve: COMP_01B_* (telepítés utáni valós állapot)"
+fi
 
 # =============================================================================
 # ██  ÖSSZESÍTŐ  ██
@@ -1038,8 +1108,10 @@ dialog_msg "Következő lépések — INFRA ${INFRA_NUM}" "
   Következő INFRA modul:
     03_python_aiml.sh       ← Python 3.12 + PyTorch ${_PYTORCH_IDX}
 
+  COMP state mentve: ~/.infra-state (COMP_01B_*)
+
   AI log:    $LOGFILE_AI
-  Human log: $LOGFILE_HUMAN" 30
+  Human log: $LOGFILE_HUMAN" 32
 
 trap - EXIT
 rm -f "$LOCK"
