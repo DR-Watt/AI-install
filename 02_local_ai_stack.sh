@@ -71,21 +71,108 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # ── Közös függvénytár betöltése — V6 (00_lib.sh) és V7 (lib/) kompatibilis ───
-# V7 struktúra: lib/00_lib_core.sh + lib/00_lib_state.sh
-# V6 struktúra: 00_lib.sh (single file)
-if [ -f "$SCRIPT_DIR/lib/00_lib_core.sh" ]; then
-  source "$SCRIPT_DIR/lib/00_lib_core.sh" \
-    || { echo "HIBA: lib/00_lib_core.sh betöltése sikertelen!"; exit 1; }
+# V7 struktúra: lib/00_lib_state.sh + lib/00_lib_core.sh
+# FONTOS SORREND: state.sh ELŐBB kell mint core.sh, mert:
+#   - state.sh definiálja: comp_line, comp_check_*, infra_state_*, infra_require
+#   - core.sh MAGA IS HÍVJA comp_line-t (pl. log_comp_status()-ban, line 331)
+#   - ha core.sh-t töltjük be előbb → comp_line: command not found a core.sh-ban!
+# V6 struktúra: 00_lib.sh (single file, minden benne van)
+if [ -f "$SCRIPT_DIR/lib/00_lib_state.sh" ] && [ -f "$SCRIPT_DIR/lib/00_lib_core.sh" ]; then
+  # V7: state ELŐSZÖR (comp_line + comp_check_* + infra_state_* kell a core-nak)
   source "$SCRIPT_DIR/lib/00_lib_state.sh" \
     || { echo "HIBA: lib/00_lib_state.sh betöltése sikertelen!"; exit 1; }
+  source "$SCRIPT_DIR/lib/00_lib_core.sh" \
+    || { echo "HIBA: lib/00_lib_core.sh betöltése sikertelen!"; exit 1; }
 elif [ -f "$SCRIPT_DIR/00_lib.sh" ]; then
+  # V6: egyetlen fájl
   source "$SCRIPT_DIR/00_lib.sh" \
     || { echo "HIBA: 00_lib.sh betöltése sikertelen!"; exit 1; }
 else
-  echo "HIBA: Lib nem található! (keresve: lib/00_lib_core.sh, 00_lib.sh)"
+  echo "HIBA: Lib nem található! (keresve: lib/00_lib_state.sh, lib/00_lib_core.sh, 00_lib.sh)"
   echo "      Script könyvtára: $SCRIPT_DIR"
   exit 1
 fi
+
+# ── Helyi fallback függvények — lib-verzió független biztonsági net ───────────
+# comp_check_vllm: MINDIG lokális (a V6/V7 libben nincs benne — új funkció)
+# Forrás: https://docs.vllm.ai/en/latest/ — vLLM-nek nincs saját version CLI-je
+comp_check_vllm() {
+  local min="${1:-0.4}" py="${2:-python3}"
+  local ver
+  ver=$("$py" -c "import vllm; print(vllm.__version__)" 2>/dev/null \
+        | grep -oP '[\d.]+' | head -1)
+  if [ -z "$ver" ]; then
+    COMP_STATUS[vllm]="missing"; COMP_VER[vllm]=""
+    return 1
+  fi
+  COMP_VER[vllm]="$ver"
+  version_ok "$ver" "$min" \
+    && COMP_STATUS[vllm]="ok" \
+    || COMP_STATUS[vllm]="old"
+}
+
+# A következő fallback-ek csak akkor aktívak, ha a lib nem definiálta őket.
+# V6 libben ezek megvannak; V7-ben a state.sh-ban kell lenniük.
+# Ha valami miatt mégsem volnának (pl. jövőbeli refaktorálás), nem omlik össze.
+
+# comp_line: státusz sor formázás ✓/⚠/✗ szimbólumokkal
+declare -f comp_line &>/dev/null || comp_line() {
+  local name="$1" label="${2:-$1}" min="${3:-}"
+  local min_txt
+  [ -n "$min" ] && min_txt=" (min: $min)" || min_txt=""
+  case "${COMP_STATUS[$name]:-missing}" in
+    ok)      printf '  ✓  %-22s %s\n'       "$label" "${COMP_VER[$name]}" ;;
+    old)     printf '  ⚠  %-22s %s%s\n'     "$label" "${COMP_VER[$name]}" "$min_txt" ;;
+    missing) printf '  ✗  %-22s hiányzik\n' "$label" ;;
+  esac
+}
+
+# comp_check_uv: uv package manager verzió ellenőrzése
+declare -f comp_check_uv &>/dev/null || comp_check_uv() {
+  local min="${1:-0.1}" bin="${2:-uv}"
+  local ver
+  ver=$("$bin" --version 2>/dev/null | grep -oP '[\d.]+' | head -1)
+  [ -z "$ver" ] && ver=$(uv --version 2>/dev/null | grep -oP '[\d.]+' | head -1)
+  if [ -z "$ver" ]; then
+    COMP_STATUS[uv]="missing"; COMP_VER[uv]=""
+    return 1
+  fi
+  COMP_VER[uv]="$ver"; COMP_STATUS[uv]="ok"
+}
+
+# comp_check_ollama: Ollama verzió ellenőrzése
+# Forrás: https://ollama.readthedocs.io/en/ — 'ollama version' az official CLI
+declare -f comp_check_ollama &>/dev/null || comp_check_ollama() {
+  local min="${1:-0.5}"
+  local ver
+  ver=$(ollama version 2>/dev/null | grep -oP '[\d.]+' | head -1)
+  [ -z "$ver" ] && ver=$(ollama --version 2>/dev/null | grep -oP '[\d.]+' | head -1)
+  if [ -z "$ver" ]; then
+    COMP_STATUS[ollama]="missing"; COMP_VER[ollama]=""
+    return 1
+  fi
+  COMP_VER[ollama]="$ver"; COMP_STATUS[ollama]="ok"
+}
+
+# dialog_msg: grafikus üzenet dialóg (YAD / whiptail)
+# Ez a V7 lib/00_lib_core.sh-ban KELL hogy legyen; csak extreme fallback
+declare -f dialog_msg &>/dev/null || dialog_msg() {
+  local title="$1" msg="$2" height="${3:-20}"
+  if command -v whiptail &>/dev/null; then
+    whiptail --title "$title" --msgbox "$msg" "$height" 76
+  else
+    printf '\n=== %s ===\n%s\n\n' "$title" "$msg" >&2
+  fi
+}
+
+# log_comp_status: komponens státuszok logba írása
+declare -f log_comp_status &>/dev/null || log_comp_status() {
+  log "COMP" "━━━ Komponens állapot ━━━"
+  for spec in "$@"; do
+    IFS='|' read -r cname _ cmin <<< "$spec"
+    log "COMP" "$(comp_line "$cname" "$cname" "$cmin")"
+  done
+}
 
 # =============================================================================
 # ██  SZEKCIÓ 1 — KONFIGURÁCIÓ  ── minden érték itt, kódban nincs magic string  ██
