@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# 03_python_aiml.sh — Python 3.12 + PyTorch + AI/ML Stack v6.2
+# 03_python_aiml.sh — Python 3.12 + PyTorch + AI/ML Stack v6.3
 #
 # Szerepe a INFRA rendszerben
 # ───────────────────────────
@@ -44,15 +44,25 @@
 #               infra_require NEM blokkol fix módban (lib kezeli)
 #               REBOOT_NEEDED NEM propagálódik (master kezeli)
 #
+# Változtatások v6.3 (COMP STATE implementáció)
+# ─────────────────────────────────────────────
+#   - COMP STATE rendszer bevezetése (minta: 06_editors.sh)
+#     Függvények: lib/00_lib_comp.sh
+#       comp_save_state "$INFRA_NUM"      — COMP_STATUS[] + COMP_VER[] → state
+#       comp_load_state "$INFRA_NUM"      — state → COMP_STATUS[] + COMP_VER[]
+#       comp_state_exists "$INFRA_NUM"    — bool: van-e mentett check?
+#       comp_state_age_hours "$INFRA_NUM" — hány óra régi a mentett check?
+#     00_master.sh exportálja: COMP_USE_CACHED=true/false
+#   - Komponens felmérés: COMP_USE_CACHED blokk — cached load VAGY friss check
+#   - check mód: comp_save_state a felmérés VÉGÉN (pre=post állapot)
+#   - install/update/fix/reinstall: post-install re-check + comp_save_state
+#     a script VÉGÉN, minden telepítés UTÁN (valódi post-install állapot)
+#
 # Változtatások v6.2 (v6.4.2 CORE rendszer integráció)
 # ─────────────────────────────────────────────────────
 #   - fix mód: kezeli a masterből kapott "fix" RUN_MODE-ot (≈ install)
-#     fix módban: infra_require("01b") nem blokkol (lib/00_lib_state.sh kezeli)
-#     fix módban: REBOOT_NEEDED nem propagálódik (00_master.sh kezeli)
 #   - infra_require "01b" → lowercase (case-insensitive lib kompatibilitás)
-#     infra_require() a lib-ben auto-uppercase-el: "01b" → MOD_01B_DONE
-#   - PYTORCH_INDEX validáció: cuda_pytorch_index() segédfüggvény meghívása
-#     ha az infra state-ből olvasott index inkonzisztens a CUDA verzióval
+#   - PYTORCH_INDEX validáció: cuda_pytorch_index() segédfüggvény
 #   - lib split kompatibilitás: comp_check_torch() a lib/00_lib_comp.sh-ban él
 #
 # Dokumentáció referenciák
@@ -75,7 +85,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 #   lib/00_lib_hw.sh     — hw_detect, hw_show, hw_has_nvidia
 #   lib/00_lib_ui.sh     — dialog_*, progress_*
 #   lib/00_lib_state.sh  — infra_state_*, infra_require, detect_run_mode
-#   lib/00_lib_comp.sh   — comp_check_*, version_ok, cuda_pytorch_index
+#   lib/00_lib_comp.sh   — comp_check_*, version_ok, cuda_pytorch_index,
+#                          comp_save_state, comp_load_state, comp_state_exists
 #   lib/00_lib_apt.sh    — apt_install_*, run_with_progress
 LIB="$SCRIPT_DIR/00_lib.sh"
 [ -f "$LIB" ] && source "$LIB" \
@@ -352,104 +363,139 @@ export PATH="$PYENV_ROOT/bin:$_REAL_HOME/.local/bin:$PATH"
 [ -d "$PYENV_ROOT/bin" ] && eval "$(pyenv init -)" 2>/dev/null || true
 
 # =============================================================================
-# ██  ÁLLAPOT FELMÉRÉS  ██
+# ██  KOMPONENS FELMÉRÉS  ██
 # =============================================================================
+#
+# COMP STATE LOGIKA (mód-tudatos gyorsítótár):
+#   COMP_USE_CACHED=true + comp_state_exists → cached load (nincs friss check)
+#   Egyéb esetben: friss check futtatása
+#
+#   check mód     → comp_save_state a felmérés VÉGÉN (semmi sem változik)
+#   install/update/fix/reinstall → comp_save_state a script VÉGÉN,
+#     post-install re-check UTÁN (valódi telepítés utáni állapot)
+#
+# Forrás: compstate_implementációs_sablon_az_egyes_szálaknak
+#         Minta: 06_editors.sh referencia implementáció
 
 log "COMP" "━━━ Komponens állapot felmérés ━━━"
 
-# 1. Fordítási függőségek
-_build_deps_ok=true
-for pkg in liblzma-dev libgdbm-dev libreadline-dev libsqlite3-dev \
-           libbz2-dev libffi-dev libssl-dev; do
-  dpkg -l "$pkg" 2>/dev/null | grep -q "^ii" || { _build_deps_ok=false; break; }
-done
-$_build_deps_ok \
-  && COMP_STATUS[build_deps]="ok" \
-  || COMP_STATUS[build_deps]="missing"
-log "COMP" "  build_deps: ${COMP_STATUS[build_deps]}"
-
-# 2. pyenv
-if command -v pyenv &>/dev/null || [ -x "$PYENV_ROOT/bin/pyenv" ]; then
-  COMP_STATUS[pyenv]="ok"
-  COMP_VER[pyenv]="$(pyenv --version 2>/dev/null | grep -oP '[\d.]+' | head -1)"
+# ── COMP STATE: cached load VAGY friss ellenőrzés ────────────────────────────
+if [ "${COMP_USE_CACHED:-false}" = "true" ] && comp_state_exists "$INFRA_NUM"; then
+  # ── Mentett eredmény betöltése ─────────────────────────────────────────────
+  # comp_load_state: COMP_STATUS[] és COMP_VER[] feltöltése a state fájlból.
+  # NEM futtat check-et — csak a korábban mentett értékeket olvassa vissza.
+  comp_load_state "$INFRA_NUM"
+  _state_age=$(comp_state_age_hours "$INFRA_NUM")
+  log "COMP" "Mentett check eredmény betöltve — INFRA $INFRA_NUM (${_state_age} óra)"
 else
-  COMP_STATUS[pyenv]="missing"
+  # ── Friss komponens ellenőrzés ─────────────────────────────────────────────
+
+  # 1. Fordítási függőségek — az összes szükséges lib egyszerre
+  # dpkg -l loop: legalább a kulcs csomagok telepítve vannak-e?
+  _build_deps_ok=true
+  for pkg in liblzma-dev libgdbm-dev libreadline-dev libsqlite3-dev \
+             libbz2-dev libffi-dev libssl-dev; do
+    dpkg -l "$pkg" 2>/dev/null | grep -q "^ii" || { _build_deps_ok=false; break; }
+  done
+  $_build_deps_ok \
+    && COMP_STATUS[build_deps]="ok" \
+    || COMP_STATUS[build_deps]="missing"
+  log "COMP" "  build_deps: ${COMP_STATUS[build_deps]}"
+
+  # 2. pyenv — Python verziókezelő
+  # Explicit PATH: sudo kontextusban ~/.pyenv/bin nem biztos hogy PATH-ban van
+  if command -v pyenv &>/dev/null || [ -x "$PYENV_ROOT/bin/pyenv" ]; then
+    COMP_STATUS[pyenv]="ok"
+    COMP_VER[pyenv]="$(pyenv --version 2>/dev/null | grep -oP '[\d.]+' | head -1)"
+  else
+    COMP_STATUS[pyenv]="missing"
+  fi
+  log "COMP" "  pyenv: ${COMP_STATUS[pyenv]} ${COMP_VER[pyenv]:-}"
+
+  # 3. Python 3.12.x — pyenv által fordított bináris
+  # comp_check_python: lib/00_lib_comp.sh
+  comp_check_python "$PY_VER" "$PYENV_ROOT"
+  log "COMP" "  python: ${COMP_STATUS[python]:-missing} ${COMP_VER[python]:-}"
+
+  # 4. lzma modul — KRITIKUS! (PyTorch .pt fájlok xz tömörítése)
+  # A pyenv Python binárisán futtatjuk — nem a rendszer Pythonon!
+  if [ -x "$PY_BIN" ] && "$PY_BIN" -c "import lzma, bz2, readline" 2>/dev/null; then
+    COMP_STATUS[lzma_ok]="ok"
+  else
+    COMP_STATUS[lzma_ok]="missing"
+  fi
+  log "COMP" "  lzma_ok: ${COMP_STATUS[lzma_ok]}"
+
+  # 5. uv — Astral csomagkezelő
+  # comp_check_uv: explicit path ($VENV_UV) + PATH fallback
+  comp_check_uv "${MIN_VER[uv]}" "$VENV_UV"
+  log "COMP" "  uv: ${COMP_STATUS[uv]:-missing} ${COMP_VER[uv]:-}"
+
+  # 6. AI/ML venv — könyvtár + Python bináris létezés
+  if [ -d "$VENV_DIR" ] && [ -x "$VENV_PY" ]; then
+    COMP_STATUS[venv]="ok"
+  else
+    COMP_STATUS[venv]="missing"
+  fi
+  log "COMP" "  venv: ${COMP_STATUS[venv]}"
+
+  # 7. PyTorch — import + CUDA elérhetőség logolása
+  # comp_check_torch: lib/00_lib_comp.sh (v6.4)
+  # FONTOS: REBOOT előtt cuda=False normális (NVIDIA kernel modul nem aktív)
+  comp_check_torch "" "$VENV_PY"
+  log "COMP" "  torch: ${COMP_STATUS[torch]:-missing} ${COMP_VER[torch]:-}"
+
+  # 8. FastAPI — API framework (venv Python import alapján)
+  if [ -x "$VENV_PY" ] && "$VENV_PY" -c "import fastapi" 2>/dev/null; then
+    COMP_STATUS[fastapi]="ok"
+  else
+    COMP_STATUS[fastapi]="missing"
+  fi
+  log "COMP" "  fastapi: ${COMP_STATUS[fastapi]}"
+
+  # 9. JupyterLab — notebook IDE (jupyter CLI bináris)
+  if [ -x "$VENV_DIR/bin/jupyter" ]; then
+    COMP_STATUS[jupyter]="ok"
+    COMP_VER[jupyter]="$("$VENV_DIR/bin/jupyter" --version 2>/dev/null | head -1)"
+  else
+    COMP_STATUS[jupyter]="missing"
+  fi
+  log "COMP" "  jupyter: ${COMP_STATUS[jupyter]}"
+
+  # 10. LangChain — AI keretrendszer (venv Python import)
+  if [ -x "$VENV_PY" ] && "$VENV_PY" -c "import langchain" 2>/dev/null; then
+    COMP_STATUS[langchain]="ok"
+  else
+    COMP_STATUS[langchain]="missing"
+  fi
+  log "COMP" "  langchain: ${COMP_STATUS[langchain]}"
+
+  # 11. HuggingFace Hub (venv Python import)
+  if [ -x "$VENV_PY" ] && "$VENV_PY" -c "import huggingface_hub" 2>/dev/null; then
+    COMP_STATUS[huggingface_hub]="ok"
+  else
+    COMP_STATUS[huggingface_hub]="missing"
+  fi
+  log "COMP" "  huggingface_hub: ${COMP_STATUS[huggingface_hub]}"
+
+  # 12. Projekt template — fájlok léteznek-e?
+  if [ -f "$TEMPLATE_DIR/pyproject.toml" ] && \
+     [ -f "$TEMPLATE_DIR/.cursorrules" ]; then
+    COMP_STATUS[template]="ok"
+  else
+    COMP_STATUS[template]="missing"
+  fi
+  log "COMP" "  template: ${COMP_STATUS[template]}"
+
+  # ── COMP STATE mentés — CHECK módban az elején ──────────────────────────────
+  # Check módban semmi sem változik → pre-check = post-check állapot.
+  # Install/update/fix/reinstall módban NEM mentünk itt — ott a script
+  # VÉGÉN fut re-check + comp_save_state, a telepítések UTÁN.
+  if [ "${RUN_MODE:-install}" = "check" ]; then
+    comp_save_state "$INFRA_NUM"
+    log "COMP" "Check mód: COMP state mentve (INFRA $INFRA_NUM)"
+  fi
 fi
-log "COMP" "  pyenv: ${COMP_STATUS[pyenv]} ${COMP_VER[pyenv]:-}"
-
-# 3. Python 3.12.x — pyenv által fordított bináris
-# comp_check_python: lib/00_lib_comp.sh
-comp_check_python "$PY_VER" "$PYENV_ROOT"
-log "COMP" "  python: ${COMP_STATUS[python]:-missing} ${COMP_VER[python]:-}"
-
-# 4. lzma modul — KRITIKUS! (PyTorch .pt fájlok xz tömörítése)
-if [ -x "$PY_BIN" ] && "$PY_BIN" -c "import lzma, bz2, readline" 2>/dev/null; then
-  COMP_STATUS[lzma_ok]="ok"
-else
-  COMP_STATUS[lzma_ok]="missing"
-fi
-log "COMP" "  lzma_ok: ${COMP_STATUS[lzma_ok]}"
-
-# 5. uv — Astral csomagkezelő
-# comp_check_uv: lib/00_lib_comp.sh
-comp_check_uv "${MIN_VER[uv]}" "$VENV_UV"
-log "COMP" "  uv: ${COMP_STATUS[uv]:-missing} ${COMP_VER[uv]:-}"
-
-# 6. AI/ML venv
-if [ -d "$VENV_DIR" ] && [ -x "$VENV_PY" ]; then
-  COMP_STATUS[venv]="ok"
-else
-  COMP_STATUS[venv]="missing"
-fi
-log "COMP" "  venv: ${COMP_STATUS[venv]}"
-
-# 7. PyTorch — import + CUDA elérhetőség
-# comp_check_torch: lib/00_lib_comp.sh (v6.4 — logol: cuda.is_available())
-# FONTOS: REBOOT előtt cuda=False normális (NVIDIA kernel modul nem aktív)
-comp_check_torch "" "$VENV_PY"
-log "COMP" "  torch: ${COMP_STATUS[torch]:-missing} ${COMP_VER[torch]:-}"
-
-# 8. FastAPI
-if [ -x "$VENV_PY" ] && "$VENV_PY" -c "import fastapi" 2>/dev/null; then
-  COMP_STATUS[fastapi]="ok"
-else
-  COMP_STATUS[fastapi]="missing"
-fi
-log "COMP" "  fastapi: ${COMP_STATUS[fastapi]}"
-
-# 9. JupyterLab
-if [ -x "$VENV_DIR/bin/jupyter" ]; then
-  COMP_STATUS[jupyter]="ok"
-  COMP_VER[jupyter]="$("$VENV_DIR/bin/jupyter" --version 2>/dev/null | head -1)"
-else
-  COMP_STATUS[jupyter]="missing"
-fi
-log "COMP" "  jupyter: ${COMP_STATUS[jupyter]}"
-
-# 10. LangChain
-if [ -x "$VENV_PY" ] && "$VENV_PY" -c "import langchain" 2>/dev/null; then
-  COMP_STATUS[langchain]="ok"
-else
-  COMP_STATUS[langchain]="missing"
-fi
-log "COMP" "  langchain: ${COMP_STATUS[langchain]}"
-
-# 11. HuggingFace Hub
-if [ -x "$VENV_PY" ] && "$VENV_PY" -c "import huggingface_hub" 2>/dev/null; then
-  COMP_STATUS[huggingface_hub]="ok"
-else
-  COMP_STATUS[huggingface_hub]="missing"
-fi
-log "COMP" "  huggingface_hub: ${COMP_STATUS[huggingface_hub]}"
-
-# 12. Projekt template
-if [ -f "$TEMPLATE_DIR/pyproject.toml" ] && \
-   [ -f "$TEMPLATE_DIR/.cursorrules" ]; then
-  COMP_STATUS[template]="ok"
-else
-  COMP_STATUS[template]="missing"
-fi
-log "COMP" "  template: ${COMP_STATUS[template]}"
 
 # ── Összesítés ────────────────────────────────────────────────────────────────
 MISSING=0
@@ -1019,7 +1065,7 @@ if $_tmpl_needs_install; then
     cat > "$TEMPLATE_DIR/pyproject.toml" << 'TOML_EOF'
 # =============================================================================
 # pyproject.toml — Python AI/ML projekt konfiguráció
-# Generálta: vibe-coding-infra 03_python_aiml.sh v6.2
+# Generálta: vibe-coding-infra 03_python_aiml.sh v6.3
 # Python: 3.12+ | Stack: PyTorch, FastAPI, LangChain, HuggingFace
 # =============================================================================
 
@@ -1095,7 +1141,7 @@ ENV_EOF
     cat > "$TEMPLATE_DIR/.cursorrules" << CURSOR_EOF
 # =============================================================================
 # .cursorrules — AI pair programming irányelvek
-# Generálta: vibe-coding-infra 03_python_aiml.sh v6.2
+# Generálta: vibe-coding-infra 03_python_aiml.sh v6.3
 # Stack: Python 3.12 + PyTorch ${PYTORCH_INDEX} + LangChain + HuggingFace + FastAPI
 # =============================================================================
 
@@ -1198,7 +1244,6 @@ fi
 # ── INFRA state frissítés ─────────────────────────────────────────────────────
 # MOD_03_DONE=true → 02_local_ai_stack.sh infra_require("03") ellenőrzi
 # Legalább egy sikeres lépés VAGY nulla hiba esetén true-ra állítjuk.
-# fix módban is beállítjuk — a javítás sikeres komponensek esetén érvényes.
 if [ "$FAIL" -eq 0 ] || [ "$OK" -gt 0 ]; then
   infra_state_set "MOD_03_DONE" "true"
   log "STATE" "MOD_03_DONE=true — 02_local_ai_stack.sh futtatható"
@@ -1211,6 +1256,106 @@ rm -f "$LOCK_FILE"
 
 # ── Végeredmény összesítő ─────────────────────────────────────────────────────
 show_result "$OK" "$SKIP" "$FAIL"
+
+# =============================================================================
+# ██  POST-INSTALL COMP STATE RE-CHECK + MENTÉS  ██
+# =============================================================================
+#
+# LOGIKA:
+#   check mód     → comp_save_state az ELEJÉN futott (semmi sem változott)
+#   install/update/fix/reinstall → re-check ITT fut, a telepítések UTÁN.
+#     Ez biztosítja hogy a state a VALÓDI telepítés utáni állapotot tükrözze.
+#     Ha az elején mentünk volna, a state a PRE-install állapotot mutatná
+#     (pl. az újonnan telepített torch "missing"-nek látszana).
+#
+# Forrás: compstate_implementációs_sablon_az_egyes_szálaknak
+#         Minta: 06_editors.sh post-install re-check blokk
+
+if [[ "${RUN_MODE:-install}" =~ ^(install|update|fix|reinstall)$ ]]; then
+  log "COMP" "Post-install re-check futtatása (mód: $RUN_MODE)..."
+
+  # ── Fordítási függőségek újraellenőrzése ────────────────────────────────────
+  _build_deps_ok=true
+  for pkg in liblzma-dev libgdbm-dev libreadline-dev libsqlite3-dev \
+             libbz2-dev libffi-dev libssl-dev; do
+    dpkg -l "$pkg" 2>/dev/null | grep -q "^ii" || { _build_deps_ok=false; break; }
+  done
+  $_build_deps_ok \
+    && COMP_STATUS[build_deps]="ok" \
+    || COMP_STATUS[build_deps]="missing"
+
+  # ── pyenv ─────────────────────────────────────────────────────────────────
+  if command -v pyenv &>/dev/null || [ -x "$PYENV_ROOT/bin/pyenv" ]; then
+    COMP_STATUS[pyenv]="ok"
+    COMP_VER[pyenv]="$(pyenv --version 2>/dev/null | grep -oP '[\d.]+' | head -1)"
+  else
+    COMP_STATUS[pyenv]="missing"
+    COMP_VER[pyenv]=""
+  fi
+
+  # ── Python + lzma ─────────────────────────────────────────────────────────
+  comp_check_python "$PY_VER" "$PYENV_ROOT"
+  if [ -x "$PY_BIN" ] && "$PY_BIN" -c "import lzma, bz2, readline" 2>/dev/null; then
+    COMP_STATUS[lzma_ok]="ok"
+  else
+    COMP_STATUS[lzma_ok]="missing"
+  fi
+
+  # ── uv ─────────────────────────────────────────────────────────────────────
+  comp_check_uv "${MIN_VER[uv]}" "$VENV_UV"
+
+  # ── venv ───────────────────────────────────────────────────────────────────
+  if [ -d "$VENV_DIR" ] && [ -x "$VENV_PY" ]; then
+    COMP_STATUS[venv]="ok"
+  else
+    COMP_STATUS[venv]="missing"
+  fi
+
+  # ── PyTorch (CUDA elérhetőség) ─────────────────────────────────────────────
+  comp_check_torch "" "$VENV_PY"
+
+  # ── FastAPI ────────────────────────────────────────────────────────────────
+  if [ -x "$VENV_PY" ] && "$VENV_PY" -c "import fastapi" 2>/dev/null; then
+    COMP_STATUS[fastapi]="ok"
+  else
+    COMP_STATUS[fastapi]="missing"
+  fi
+
+  # ── JupyterLab ─────────────────────────────────────────────────────────────
+  if [ -x "$VENV_DIR/bin/jupyter" ]; then
+    COMP_STATUS[jupyter]="ok"
+    COMP_VER[jupyter]="$("$VENV_DIR/bin/jupyter" --version 2>/dev/null | head -1)"
+  else
+    COMP_STATUS[jupyter]="missing"
+    COMP_VER[jupyter]=""
+  fi
+
+  # ── LangChain ──────────────────────────────────────────────────────────────
+  if [ -x "$VENV_PY" ] && "$VENV_PY" -c "import langchain" 2>/dev/null; then
+    COMP_STATUS[langchain]="ok"
+  else
+    COMP_STATUS[langchain]="missing"
+  fi
+
+  # ── HuggingFace Hub ────────────────────────────────────────────────────────
+  if [ -x "$VENV_PY" ] && "$VENV_PY" -c "import huggingface_hub" 2>/dev/null; then
+    COMP_STATUS[huggingface_hub]="ok"
+  else
+    COMP_STATUS[huggingface_hub]="missing"
+  fi
+
+  # ── Template ───────────────────────────────────────────────────────────────
+  if [ -f "$TEMPLATE_DIR/pyproject.toml" ] && \
+     [ -f "$TEMPLATE_DIR/.cursorrules" ]; then
+    COMP_STATUS[template]="ok"
+  else
+    COMP_STATUS[template]="missing"
+  fi
+
+  # ── COMP STATE mentés — telepítés utáni valódi állapot ────────────────────
+  comp_save_state "$INFRA_NUM"
+  log "COMP" "Post-install COMP state mentve: COMP_03_* (telepítés utáni valós állapot)"
+fi
 
 # ── Összefoglalás dialóg ──────────────────────────────────────────────────────
 dialog_msg "[$INFRA_NAME] — Következő lépések" "
