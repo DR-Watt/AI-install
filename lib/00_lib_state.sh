@@ -1,8 +1,15 @@
 #!/bin/bash
 # ============================================================================
-# 00_lib_state.sh — Vibe Coding Workspace lib v6.4
+# 00_lib_state.sh — Vibe Coding Workspace lib v6.4.5
 #
 # LEÍRÁS: INFRA state kezelés: init/set/get/validate, infra_require, detect_run_mode
+#
+# VÁLTOZTATÁSOK v6.4.5 (lazy init — stack-specifikus kulcsok kiszedve):
+#   - infra_state_init(): csak HW_* + MOD_* + REBOOT_* kulcsok (MINDIG jelen lévők)
+#     Stack-specifikus kulcsok (INST_*, FEAT_*, GPU_MODE, stb.) az adott szál írja
+#     → friss state fájl nem tartalmaz üres placeholder kulcsokat
+#     → infra_state_get() default értékkel kezeli a hiányzókat (validate biztonságos)
+#   - Séma dokumentáció megújítva: ki mit ír, mikor jelenik meg
 # BETÖLTÉS: source-olja a 00_lib.sh master loader
 # NE futtasd közvetlenül!
 # ============================================================================
@@ -16,60 +23,94 @@
 #
 # SÉMA — összes lehetséges kulcs és jelentése:
 # ─────────────────────────────────────────────────────────────────────────────
-#  CSOPORTONKÉNT:
+#  CSOPORTONKÉNT — ki írja, mikor jelenik meg:
 #
-#  [HW] — Hardware, hw_detect() + 01a írja
+#  [HW] — infra_state_init() írja hw_detect() eredményéből — MINDIG jelen van
 #    HW_PROFILE        pl. "desktop-rtx"
 #    HW_GPU_ARCH       pl. "blackwell"
 #    HW_GPU_NAME       pl. "NVIDIA GeForce RTX 5090 (Blackwell SM_120)"
 #    HW_CUDA_ARCH      pl. "120"
 #    HW_VLLM_OK        "true" | "false"
-#    HW_NVIDIA_PKG     pl. "nvidia-driver-570-open"
+#    HW_NVIDIA_PKG     pl. "nvidia-driver-580-open"
 #    HW_IS_NOTEBOOK    "true" | "false"
 #
-#  [INST] — Installed versions, az adott szál írja telepítés után
-#    INST_DRIVER_VER   pl. "570.211.01"       — 01a írja
-#    INST_CUDA_VER     pl. "12.6"              — 01a írja (csak major.minor!)
-#    INST_CUDNN_VER    pl. "9.20.0"            — 01a írja
-#    INST_DOCKER_VER   pl. "29.3.1"            — 01a írja
-#    INST_ZSH_VER      pl. "5.9"               — 01b írja
-#    INST_OMZ_COMMIT   pl. "a3b1c2d"           — 01b írja (git commit hash)
-#    INST_OLLAMA_VER   pl. "0.6.5"             — 02 írja
-#    INST_VLLM_VER     pl. "0.5.0"             — 02 írja
-#    INST_PYTHON_VER   pl. "3.12.9"            — 03 írja (pyenv által fordított)
-#    INST_UV_VER       pl. "0.4.18"            — 03 írja (Astral uv verzió)
-#    INST_TORCH_VER    pl. "2.6.0+cu126"       — 03 írja (PyTorch+CUDA index)
+#  [MOD] — infra_state_init() írja (üres), az adott szál állítja "true"-ra
+#           MINDIG jelen van (de értéke üres amíg a szál nem futott le)
+#    MOD_01A_DONE      "true" | ""  — 01a kész (REBOOT előtt)
+#    MOD_01A_REBOOTED  "true" | ""  — REBOOT megtörtént (01b ellenőrzi)
+#    MOD_01B_DONE      "true" | ""  — 01b kész → 03/02/06 előfeltétel
+#    MOD_02_DONE       "true" | ""  — 02 kész (Ollama/vLLM/TQ)
+#    MOD_03_DONE       "true" | ""  — 03 kész → 02/06 előfeltétel
 #
-#  [FEAT] — Feature flags
-#    PYTORCH_INDEX     pl. "cu126" | "cu128"   — 01a írja, PyTorch whl index
-#    FEAT_GPU_ACCEL    "true" | "false"         — GPU gyorsítás elérhető-e
-#    FEAT_DOCKER_GPU   "true" | "false"         — Docker GPU runtime él-e
-#    FEAT_VLLM         "true" | "false"         — vLLM futtatható-e
-#    FEAT_SHELL_ZSH    "true" | "false"         — 01b írja, Zsh az aktív shell
-#    FEAT_TURBOQUANT   "true" | "false"         — 02 írja, TQ bináris elérhető-e
-#    FEAT_OLLAMA_GPU   "true" | "false"         — 02 írja, Ollama GPU módban fut-e
-#    TURBOQUANT_BUILD_MODE "cpu"|"gpu89"|"gpu120" — 02 írja, utolsó TQ build mód
+#  [REBOOT] — infra_state_init() írja, 01a állítja, master olvassa
+#             MINDIG jelen van
+#    REBOOT_NEEDED     "true" | "false"
+#    REBOOT_REASON     pl. "NVIDIA driver + initramfs"
+#    REBOOT_BY_INFRA   pl. "01a"
 #
-#  [MOD] — Module completion flags, az adott szál írja
-#    MOD_01A_DONE      "true" | ""  — 01a_system_foundation kész (REBOOT előtt)
-#    MOD_01A_REBOOTED  "true" | ""  — REBOOT megtörtént (01b ellenőrzi nvidia-smi-val)
-#    MOD_01B_DONE      "true" | ""  — 01b_post_reboot kész → 03 előfeltétel
-#    MOD_02_DONE       "true" | ""  — 02_local_ai_stack kész (Ollama/vLLM)
-#    MOD_03_DONE       "true" | ""  — Python/PyTorch kész → 02, 06 előfeltétel
-#                                     (infra_require("03") ellenőrzi)
+#  ── Alábbi kulcsok CSAK az adott szál futása után jelennek meg ──────────────
 #
-#  [REBOOT] — Reboot koordináció (00_master.sh olvassa)
-#    REBOOT_NEEDED     "true" | "false"         — 01a állítja, master olvassa
-#    REBOOT_REASON     pl. "NVIDIA driver"       — olvasható indoklás
-#    REBOOT_BY_INFRA   pl. "01a"                 — melyik modul kérte
+#  [01a] — 01a_system_foundation.sh írja telepítés után
+#    INST_DRIVER_VER   pl. "580.126.09"
+#    INST_CUDA_VER     pl. "12.6"  (major.minor)
+#    INST_CUDNN_VER    pl. "9.20.0.48"
+#    INST_DOCKER_VER   pl. "29.4.0"
+#    PYTORCH_INDEX     pl. "cu126" | "cu128"  (CUDA verzióból számítva)
+#    FEAT_GPU_ACCEL    "true" | "false"
+#    FEAT_DOCKER_GPU   "true" | "false"
+#    FEAT_VLLM         "true" | "false"
+#    GPU_MODE          "hybrid" | "dedicated"
+#    HW_NVIDIA_OPEN    "true" | "false"
+#    MOK_ENROLL_PENDING "true" | "false"
+#
+#  [01b] — 01b_post_reboot.sh írja
+#    INST_ZSH_VER      pl. "5.9"
+#    INST_OMZ_COMMIT   pl. "7c10d98"
+#    FEAT_SHELL_ZSH    "true" | "false"
+#
+#  [02] — 02_local_ai_stack.sh írja
+#    INST_OLLAMA_VER   pl. "0.6.5"
+#    INST_VLLM_VER     pl. "0.5.0"
+#    FEAT_TURBOQUANT   "true" | "false"
+#    FEAT_OLLAMA_GPU   "true" | "false"
+#    TURBOQUANT_BUILD_MODE "cpu" | "gpu89" | "gpu120"
+#
+#  [03] — 03_python_aiml.sh írja
+#    INST_PYTHON_VER   pl. "3.12.9"
+#    INST_UV_VER       pl. "0.11.3"
+#    INST_TORCH_VER    pl. "2.10.0+cu126"
+#
+#  [COMP] — 00_lib_comp.sh comp_save_state() írja, az adott szál hívja
+#    COMP_01A_TS, COMP_01A_S_*, COMP_01A_V_*   — 01a komponens check cache
+#    COMP_01B_TS, ...                            — 01b komponens check cache
+#    COMP_02_TS, ...  / COMP_03_TS, ...
+#    COMP_06_TS, ...  / stb.
+#
+#  [LEGACY] — régi verziókból maradt, kanonikus INST_* párjuk van
+#    CUDA_VER          → lásd INST_CUDA_VER  (01a írja, validate() logol)
+#    DOCKER_VER        → lásd INST_DOCKER_VER
 # ─────────────────────────────────────────────────────────────────────────────
 
-# infra_state_init: az összes kulcs alapértékének beírása HA MÉG NINCS BENNE.
+# infra_state_init: GLOBÁLIS kulcsok beírása HA MÉG NINCS BENNE.
 # Meglévő értékeket NEM írja felül — biztonságosan hívható többször.
+#
+# ELVEK (v6.4.5):
+#   - CSAK globális kulcsok kerülnek be: HW_* (detektált), MOD_* (completion), REBOOT_*
+#   - Stack-specifikus kulcsok NEM kerülnek be az init-ben — az adott szál írja:
+#       01a: INST_DRIVER_VER, INST_CUDA/CUDNN/DOCKER_VER, PYTORCH_INDEX,
+#            FEAT_GPU_ACCEL, FEAT_DOCKER_GPU, FEAT_VLLM, GPU_MODE, HW_NVIDIA_OPEN
+#       01b: INST_ZSH_VER, INST_OMZ_COMMIT, FEAT_SHELL_ZSH
+#       02:  INST_OLLAMA_VER, INST_VLLM_VER, FEAT_TURBOQUANT, FEAT_OLLAMA_GPU,
+#            TURBOQUANT_BUILD_MODE
+#       03:  INST_PYTHON_VER, INST_UV_VER, INST_TORCH_VER
+#       nvidia_mok_enroll (lib): MOK_ENROLL_PENDING
+#   - infra_state_get() default értékkel kezeli a hiányzó kulcsokat → validate() biztonságos
+#   - Eredmény: tiszta friss state fájl csak a valóban ismert/szükséges adatokkal
 infra_state_init() {
   mkdir -p "$(dirname "$INFRA_STATE_FILE")"
 
-  # Segéd: csak akkor ír, ha a kulcs nem létezik
+  # Segéd: csak akkor ír, ha a kulcs még nem létezik a state fájlban.
+  # Meglévő kulcsokat NEM írja felül (idempotens).
   local _init_key
   _init_key() {
     local k="$1" v="$2"
@@ -77,7 +118,9 @@ infra_state_init() {
       || printf '%s=%s\n' "$k" "$v" >> "$INFRA_STATE_FILE"
   }
 
-  # [HW] — hw_detect() által ismertek
+  # ── [HW] Hardver detektálás eredménye ────────────────────────────────────────
+  # hw_detect() (00_lib_hw.sh) már beállítja ezeket bash változóként,
+  # itt csak a state fájlba írjuk be ha még nincs ott.
   _init_key "HW_PROFILE"     "${HW_PROFILE:-unknown}"
   _init_key "HW_GPU_ARCH"    "${HW_GPU_ARCH:-unknown}"
   _init_key "HW_GPU_NAME"    "${HW_GPU_NAME:-}"
@@ -86,58 +129,23 @@ infra_state_init() {
   _init_key "HW_NVIDIA_PKG"  "${HW_NVIDIA_PKG:-}"
   _init_key "HW_IS_NOTEBOOK" "${HW_IS_NOTEBOOK:-false}"
 
-  # [INST] — telepítés után töltődnek fel, az adott szál írja
-  _init_key "INST_DRIVER_VER" ""   # 01a írja
-  _init_key "INST_CUDA_VER"   ""   # 01a írja
-  _init_key "INST_CUDNN_VER"  ""   # 01a írja
-  _init_key "INST_DOCKER_VER" ""   # 01a írja
-  _init_key "INST_ZSH_VER"    ""   # 01b írja
-  _init_key "INST_OMZ_COMMIT" ""   # 01b írja
-  _init_key "INST_OLLAMA_VER" ""   # 02 írja
-  _init_key "INST_VLLM_VER"   ""   # 02 írja
-  _init_key "INST_PYTHON_VER" ""   # 03 írja (pyenv Python verzió pl. "3.12.9")
-  _init_key "INST_UV_VER"     ""   # 03 írja (Astral uv verzió pl. "0.4.18")
-  _init_key "INST_TORCH_VER"  ""   # 03 írja (PyTorch verzió pl. "2.6.0+cu126")
+  # ── [MOD] Modul completion flag-ek ───────────────────────────────────────────
+  # Alapértelmezés: üres (nem kész). Az adott szál írja "true"-ra ha kész.
+  # Más szálak infra_require() hívással ellenőrzik ezeket.
+  _init_key "MOD_01A_DONE"     ""   # 01a_system_foundation.sh írja
+  _init_key "MOD_01A_REBOOTED" ""   # 01b ellenőrzi nvidia-smi-val a REBOOT után
+  _init_key "MOD_01B_DONE"     ""   # 01b_post_reboot.sh → 03/02/06 előfeltétel
+  _init_key "MOD_02_DONE"      ""   # 02_local_ai_stack.sh (Ollama/vLLM/TQ)
+  _init_key "MOD_03_DONE"      ""   # 03_python_aiml.sh → 02/06 előfeltétel
 
-  # [FEAT] — alapértelmezés: amit a HW profilból tudunk
-  _init_key "PYTORCH_INDEX"  "cu126"  # 01a pontosítja CUDA telepítés után
-  _init_key "FEAT_GPU_ACCEL" "$(hw_has_nvidia && echo true || echo false)"
-  _init_key "FEAT_DOCKER_GPU" "false"  # 01a állítja true-ra ha CTK kész
-  _init_key "FEAT_VLLM"      "${HW_VLLM_OK:-false}"
-  _init_key "FEAT_SHELL_ZSH" "false"  # 01b állítja true-ra ha zsh az aktív shell
-  _init_key "FEAT_TURBOQUANT" "false" # 02 állítja true-ra ha TQ bináris kész
-  _init_key "FEAT_OLLAMA_GPU" "false" # 02 állítja, Ollama GPU módban fut-e
-  _init_key "TURBOQUANT_BUILD_MODE" "" # 02 írja: cpu|gpu89|gpu120
-
-  # [MOD] — alapértelmezés: üres (nem kész)
-  # v6.1: MOD_01_DONE/REBOOTED → MOD_01A_DONE/REBOOTED + MOD_01B_DONE
-  # v6.2: MOD_02_DONE hozzáadva
-  _init_key "MOD_01A_DONE"    ""   # 01a_system_foundation kész
-  _init_key "MOD_01A_REBOOTED" ""  # REBOOT megtörtént (01b ellenőrzi)
-  _init_key "MOD_01B_DONE"    ""   # 01b_post_reboot kész → 03 előfeltétel
-  _init_key "MOD_02_DONE"     ""   # 02_local_ai_stack kész (Ollama/vLLM/TQ)
-  _init_key "MOD_03_DONE"     ""   # Python/PyTorch kész → 02, 06 előfeltétel
-
-  # [REBOOT] — reboot koordináció
+  # ── [REBOOT] Reboot koordináció ──────────────────────────────────────────────
+  # 01a írja REBOOT_NEEDED=true ha driver/initramfs változott.
+  # 00_master.sh olvassa és kínálja fel az azonnali rebootot.
   _init_key "REBOOT_NEEDED"   "false"
   _init_key "REBOOT_REASON"   ""
   _init_key "REBOOT_BY_INFRA" ""
 
-  # [HW-EXT] — 01a által írt GPU konfiguráció, nem detektált hanem konfigurált értékek
-  # GPU_MODE: "hybrid" | "dedicated" — xorg.conf konfig alapján
-  # HW_NVIDIA_OPEN: "true" | "false" — open kernel module használatban van-e
-  # MOK_ENROLL_PENDING: "true" | "false" — UEFI MOK enrollment vár-e
-  _init_key "GPU_MODE"           ""      # 01a írja: hybrid|dedicated
-  _init_key "HW_NVIDIA_OPEN"    ""      # 01a írja: true|false
-  _init_key "MOK_ENROLL_PENDING" "false" # 01a írja (nvidia_mok_enroll via lib_comp)
-
-  # [LEGACY] — korábbi verziókból maradt kulcsok, most már INST_* prefixszel vannak
-  # CUDA_VER → alias INST_CUDA_VER-hez (01a írja mindkettőt, validate cleanup-olja)
-  # DOCKER_VER → alias INST_DOCKER_VER-hez (01a írja mindkettőt)
-  # Megjegyzés: _init_key NEM írja felül ha már létezik — régi értékek megmaradnak
-  # A validate() REBOOT_NEEDED=false állapotban REBOOT_REASON/BY_INFRA-t üresíti
-
-  # Tulajdonos visszaállítása — sudo alatt futtattuk, de user-nek kell olvasnia
+  # Tulajdonos visszaállítása — sudo alatt root:root lett volna
   chown "${_REAL_UID:-$(id -u)}:${_REAL_GID:-$(id -g)}" "$INFRA_STATE_FILE" 2>/dev/null || true
   chmod 644 "$INFRA_STATE_FILE" 2>/dev/null || true
 
