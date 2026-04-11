@@ -1,6 +1,12 @@
 #!/bin/bash
 # =============================================================================
-# 00_master.sh — Vibe Coding Workspace Installer v6.4.3
+# 00_master.sh — Vibe Coding Workspace Installer v6.4.4
+#
+# Változtatások v6.4.4 (módnév dialógokban + COMP STATE részletes log):
+#   - dialog fejlécek: [$MODE_TITLE] prefix minden módválasztás utáni ablakban
+#     COMP STATE ajánlat, Kilépés, Megerősítés, Hiba dialog
+#   - COMP STATE log: "felhasználó → IGEN/NEM" döntés explicit logolva
+#     COMP_USE_CACHED=true/false okának szöveges magyarázata a logban
 #
 # Változtatások v6.4.3 (COMP STATE integráció):
 #   - COMP_USE_CACHED export: mentett check eredmények felajánlása
@@ -93,7 +99,7 @@ infra_state_validate
 infra_state_show
 
 # ── Üdvözlő + telepítési rend ─────────────────────────────────────────────────
-dialog_msg "Vibe Coding Workspace v6.4.3" "
+dialog_msg "Vibe Coding Workspace v6.4.4" "
   Ubuntu 24 LTS + RTX 5090 fejlesztői környezet
 
   GPU:     $HW_GPU_NAME
@@ -168,7 +174,7 @@ _CACHED_LIST="$(echo "$_CACHED_SUMMARY" | tail -n +2)"
 
 if [ "${_CACHED_COUNT:-0}" -gt 0 ]; then
   # Van legalább egy mentett check eredmény → felajánljuk
-  if dialog_yesno "Mentett check eredmények" "
+  if dialog_yesno "[$MODE_TITLE] Mentett check eredmények felajánlása" "
   ${_CACHED_COUNT} INFRA modulhoz van mentett komponens állapot:
 
 ${_CACHED_LIST}
@@ -178,18 +184,23 @@ ${_CACHED_LIST}
           (Mentett állapot a state fájlból töltődik)
   NEM   → Minden modul frissen ellenőriz (lassabb, de pontosabb)" 20; then
     COMP_USE_CACHED=true
-    log "MODE" "COMP state: mentett check eredmények betöltve (${_CACHED_COUNT} modul)"
+    log "MODE" "COMP state: felhasználó → IGEN — mentett check betöltve (${_CACHED_COUNT} modul)"
   else
     COMP_USE_CACHED=false
-    log "MODE" "COMP state: friss check futtatása minden modulon"
+    log "MODE" "COMP state: felhasználó → NEM — friss check kérve"
   fi
 else
-  # Nincs mentett check → automatikusan friss check
-  log "MODE" "COMP state: nincs mentett check — friss check minden modulon"
+  # Nincs mentett check → automatikusan friss check, felajánlás nem jelenik meg
+  log "MODE" "COMP state: nincs mentett check — automatikus friss check"
 fi
 
 export COMP_USE_CACHED
-log "MODE" "COMP_USE_CACHED=$COMP_USE_CACHED"
+# A döntés eredményét és okát explicit logoljuk — AI log olvashatóság miatt
+if [ "$COMP_USE_CACHED" = "true" ]; then
+  log "MODE" "COMP_USE_CACHED=true — mentett komponens állapot aktív (friss check nem fut)"
+else
+  log "MODE" "COMP_USE_CACHED=false — friss komponens ellenőrzés fut minden modulban"
+fi
 
 # ── INFRA checklist meta-adatok ───────────────────────────────────────────────
 # INFRA_REBOOT: ezek az ID-k után REBOOT szükséges (a checklist-ben jelöljük)
@@ -237,7 +248,7 @@ SELECTED=$(dialog_checklist \
   "30" "16" \
   "${CHECKLIST_ARGS[@]}")
 
-[ -z "$SELECTED" ] && { dialog_msg "Kilépés" "\n  Semmi nem lett kijelölve."; exit 0; }
+[ -z "$SELECTED" ] && { dialog_msg "[$MODE_TITLE] Kilépés" "\n  Semmi nem lett kijelölve."; exit 0; }
 
 # ── Megerősítés ───────────────────────────────────────────────────────────────
 CONFIRM_MSG="\n  [$MODE_TITLE — $RUN_MODE mód]\n\n  Kijelölt modulok:\n"
@@ -252,8 +263,8 @@ done
 $HAS_REBOOT && CONFIRM_MSG+="\n  ⚠  REBOOT szükséges a jelölt modul(ok) után!\n"
 CONFIRM_MSG+="\n  Folytatjuk?"
 
-dialog_yesno "Megerősítés" "$(printf '%b' "$CONFIRM_MSG")" 22 || {
-  dialog_msg "Kilépés" "\n  Megszakítva."
+dialog_yesno "[$MODE_TITLE] Megerősítés" "$(printf '%b' "$CONFIRM_MSG")" 22 || {
+  dialog_msg "[$MODE_TITLE] Kilépés" "\n  Megszakítva."
   exit 0
 }
 
@@ -297,7 +308,7 @@ for id in $(printf '%s' "$SELECTED" | tr -d '"' | tr ' ' '\n' | sort); do
         log "SKIP" "INFRA $id kihagyva (hardver inkompatibilis)" ;;
     *)  ((TOTAL_FAIL++))
         log "FAIL" "INFRA $id hibával végzett (exit $EC)"
-        dialog_yesno "Hiba — INFRA $id" \
+        dialog_yesno "[$MODE_TITLE] Hiba — INFRA $id" \
           "\n  ${INFRA_NAME[$id]} hibával végzett.\n\n  Folytatjuk a többivel?" 12 || break ;;
   esac
 done

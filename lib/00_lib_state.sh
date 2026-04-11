@@ -123,11 +123,31 @@ infra_state_init() {
   _init_key "REBOOT_REASON"   ""
   _init_key "REBOOT_BY_INFRA" ""
 
+  # [HW-EXT] — 01a által írt GPU konfiguráció, nem detektált hanem konfigurált értékek
+  # GPU_MODE: "hybrid" | "dedicated" — xorg.conf konfig alapján
+  # HW_NVIDIA_OPEN: "true" | "false" — open kernel module használatban van-e
+  # MOK_ENROLL_PENDING: "true" | "false" — UEFI MOK enrollment vár-e
+  _init_key "GPU_MODE"           ""      # 01a írja: hybrid|dedicated
+  _init_key "HW_NVIDIA_OPEN"    ""      # 01a írja: true|false
+  _init_key "MOK_ENROLL_PENDING" "false" # 01a írja (nvidia_mok_enroll via lib_comp)
+
+  # [LEGACY] — korábbi verziókból maradt kulcsok, most már INST_* prefixszel vannak
+  # CUDA_VER → alias INST_CUDA_VER-hez (01a írja mindkettőt, validate cleanup-olja)
+  # DOCKER_VER → alias INST_DOCKER_VER-hez (01a írja mindkettőt)
+  # Megjegyzés: _init_key NEM írja felül ha már létezik — régi értékek megmaradnak
+  # A validate() REBOOT_NEEDED=false állapotban REBOOT_REASON/BY_INFRA-t üresíti
+
+  # Tulajdonos visszaállítása — sudo alatt futtattuk, de user-nek kell olvasnia
+  chown "${_REAL_UID:-$(id -u)}:${_REAL_GID:-$(id -g)}" "$INFRA_STATE_FILE" 2>/dev/null || true
+  chmod 644 "$INFRA_STATE_FILE" 2>/dev/null || true
+
   log "STATE" "State fájl inicializálva: $INFRA_STATE_FILE"
 }
 
 # infra_state_set: kulcs értékének beállítása/frissítése.
 # Ha a kulcs már létezik, frissíti. Ha nem, hozzáadja.
+# SUDO VÉDELME: sudo alatt a fájl root:root lesz — chown javítja vissza
+# a valódi user tulajdonára (_REAL_UID:_REAL_GID, 00_lib_core.sh állítja).
 infra_state_set() {
   local key="$1" val="$2"
   mkdir -p "$(dirname "$INFRA_STATE_FILE")"
@@ -136,6 +156,9 @@ infra_state_set() {
   else
     printf '%s=%s\n' "$key" "$val" >> "$INFRA_STATE_FILE"
   fi
+  # Tulajdonos visszaállítása ha sudo alatt futtattuk (chown nem dob hibát ha nincs mit csinálni)
+  chown "${_REAL_UID:-$(id -u)}:${_REAL_GID:-$(id -g)}" "$INFRA_STATE_FILE" 2>/dev/null || true
+  chmod 644 "$INFRA_STATE_FILE" 2>/dev/null || true
   log "STATE" "${key}=${val}"
 }
 
@@ -243,6 +266,29 @@ infra_state_validate() {
       ((errors++))
     fi
   fi
+
+  # REBOOT stale cleanup: ha REBOOT_NEEDED=false, de REASON/BY_INFRA nem üres → stale adat
+  # Ez azért fordul elő, mert a REBOOT_REASON/BY_INFRA csak REBOOT_NEEDED=true esetén
+  # relevánsan, és a master REBOOT_NEEDED=false-ra állít vissza — de a reason megmarad.
+  local reboot_needed reboot_reason reboot_by
+  reboot_needed=$(infra_state_get "REBOOT_NEEDED" "false")
+  reboot_reason=$(infra_state_get "REBOOT_REASON" "")
+  reboot_by=$(infra_state_get "REBOOT_BY_INFRA" "")
+  if [ "$reboot_needed" = "false" ] &&      { [ -n "$reboot_reason" ] || [ -n "$reboot_by" ]; }; then
+    log "STATE" "REBOOT stale cleanup: REBOOT_REASON='$reboot_reason' REBOOT_BY='$reboot_by' → üresítve"
+    infra_state_set "REBOOT_REASON"   ""
+    infra_state_set "REBOOT_BY_INFRA" ""
+    ((errors++))
+  fi
+
+  # Legacy kulcs detektálás: CUDA_VER és DOCKER_VER duplikálják az INST_* párjaikat.
+  # Ezeket a régi 01a szál írta közvetlenül — az új INST_* prefixes változat a canonical.
+  # Logolunk de NEM töröljük (a 01a szál esetleg még írja) — dokumentálás célú.
+  local cuda_ver_leg docker_ver_leg
+  cuda_ver_leg=$(infra_state_get "CUDA_VER" "")
+  docker_ver_leg=$(infra_state_get "DOCKER_VER" "")
+  [ -n "$cuda_ver_leg" ] &&     log "STATE" "Legacy kulcs: CUDA_VER=$cuda_ver_leg (kanonikus: INST_CUDA_VER)"
+  [ -n "$docker_ver_leg" ] &&     log "STATE" "Legacy kulcs: DOCKER_VER=$docker_ver_leg (kanonikus: INST_DOCKER_VER)"
 
   [ $errors -eq 0 ] \
     && log "STATE" "Validáció OK — nincs inkonzisztencia" \

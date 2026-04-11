@@ -6,6 +6,10 @@
 # BETÖLTÉS: source-olja a 00_lib.sh master loader
 # NE futtasd közvetlenül!
 #
+# VÁLTOZTATÁSOK v6.4.2 (részletes COMP STATE log + comp_log_source):
+#   - comp_load_state(): ok/missing/old/broken számok betöltés után
+#   - comp_log_source(): felmérés forrásának logolása child scriptekhez
+#
 # VÁLTOZTATÁSOK v6.4.1 (comp_check_vscode PATH fix):
 #   - comp_check_vscode(): explicit PATH="/usr/bin:/usr/local/bin:$PATH"
 #     Tünet: sudo alatt root PATH nem tartalmazza /usr/bin-t → code "missing"
@@ -682,7 +686,20 @@ comp_load_state() {
     fi
   done < "$INFRA_STATE_FILE"
 
-  log "STATE" "Komponens állapot betöltve: ${pfx} (check: $ts)"
+  # Összesítés: hány komponens töltődött be és milyen státuszban
+  local _ok=0 _miss=0 _old=0 _brk=0
+  for _k in "${!COMP_STATUS[@]}"; do
+    case "${COMP_STATUS[$_k]}" in
+      ok)      ((_ok++))  ;;
+      missing) ((_miss++));;
+      old)     ((_old++)) ;;
+      broken)  ((_brk++)) ;;
+    esac
+  done
+  local _age
+  _age=$(comp_state_age_hours "$infra_num")
+  log "COMP" "Mentett állapot betöltve: INFRA ${infra_num} — check: ${ts} (${_age}h ezelőtt)"
+  log "COMP" "  Összesítés: ✓ ok=${_ok}  ✗ missing=${_miss}  ⚠ old=${_old}$([ $_brk -gt 0 ] && echo \"  ⚡ broken=${_brk}\" || echo \"\")"
   return 0
 }
 
@@ -712,6 +729,36 @@ comp_state_age_hours() {
   then=$(date -d "$ts" +%s 2>/dev/null || echo "0")
   now=$(date +%s)
   echo $(( (now - then) / 3600 ))
+}
+
+# comp_log_source: loggolja hogy a komponens állapot honnan jön.
+# A child script a felmérés blokk LEGELEJÉN hívja — a [COMP] logban
+# egyértelmű legyen a felmérés forrása és oka.
+#
+# LOGIKA:
+#   COMP_USE_CACHED=true + van mentett state -> "Mentett állapot betöltve (Xh)"
+#   COMP_USE_CACHED=true + nincs mentett state -> "Friss felmérés (mentett n.a.)"
+#   COMP_USE_CACHED=false + check mód -> "Friss felmérés (eredmény mentésre kerül)"
+#   COMP_USE_CACHED=false + más mód -> "Friss felmérés (nem kérte a felhasználó: cache=off)"
+#
+# Paraméterek: $1=infra_num (pl. "01a", "06")
+comp_log_source() {
+  local infra_num="$1"
+  if [ "${COMP_USE_CACHED:-false}" = "true" ]; then
+    if comp_state_exists "$infra_num"; then
+      local _age
+      _age=$(comp_state_age_hours "$infra_num")
+      log "COMP" "━━━ Komponens állapot: mentett check betöltve (${_age}h ezelőtt) ━━━"
+    else
+      log "COMP" "━━━ Komponens állapot: mentett nem elérhető — friss felmérés ━━━"
+    fi
+  else
+    if [ "${RUN_MODE:-install}" = "check" ]; then
+      log "COMP" "━━━ Friss komponens felmérés (check mód — eredmény mentésre kerül) ━━━"
+    else
+      log "COMP" "━━━ Friss komponens felmérés (nem kérte a felhasználó: cache=off) ━━━"
+    fi
+  fi
 }
 
 # comp_state_master_summary: összes INFRA modul cached state összefoglalója
