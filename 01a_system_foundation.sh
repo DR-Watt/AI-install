@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# 01a_system_foundation.sh — System Foundation v6.5
+# 01a_system_foundation.sh — System Foundation v6.6
 #                            Ubuntu 24 LTS | NVIDIA | CUDA | Docker
 #
 # Szerepe az INFRA rendszerben
@@ -9,35 +9,41 @@
 #
 # Dokumentáció
 # ────────────
-#   CUDA:   https://docs.nvidia.com/cuda/cuda-installation-guide-linux/
-#   Docker: https://docs.docker.com/engine/install/ubuntu/
-#   CTK:    https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/
+#   CUDA:     https://docs.nvidia.com/cuda/cuda-installation-guide-linux/
+#   NVIDIA:   https://docs.nvidia.com/datacenter/tesla/driver-installation-guide/ubuntu.html
+#   Docker:   https://docs.docker.com/engine/install/ubuntu/
+#   CTK:      https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/
+#
+# Változtatások v6.6 (2026-04-11 logok alapján):
+#
+#   1. APT mirror resilience (hu.archive.ubuntu.com timeout)
+#      - apt-get update: --timeout=30, nem-fatális hiba (|| true)
+#        Ha a mirror nem érhető el, a gyorsítótárazott lista marad
+#      - apt-get install: --fix-missing flag minden hívásnál
+#        Ha egy csomag nem tölthető le (hálózati hiba), átugorja de telepíti a többit
+#      - Alap csomagok: pkg_installed dönt (nem az apt exit kód!)
+#        ha minden kritikus csomag már fent van → SKIP (nem FAIL/OK confusion)
+#
+#   2. NVIDIA driver verzió detektálás + 590+ névváltás
+#      NVIDIA hivatalos doc (r595, 2026-03-09):
+#        "Starting with branch 590, packages renamed: nvidia-open (no branch number)"
+#      Forrás: https://docs.nvidia.com/datacenter/tesla/driver-installation-guide/ubuntu.html
+#      Prioritás: Ubuntu restricted (580, stabil) > CUDA repo nvidia-open (590+)
+#      590 és 595 Ubuntu 24.04-en: feature branch (nem production)
+#
+#   3. Driver install failsafe
+#      Ha a célcsomag (pl. 580-open) telepítése sikertelen:
+#      → automatikus fallback nvidia-driver-570-open-ra (Blackwell minimum)
+#      → Ha az is sikertelen: FAIL + erős figyelmeztetés (reboot előtt NE indítsunk!)
+#
+#   4. Docker CE + NVIDIA CTK: architekturális megjegyzés
+#      Docker CE nem igényel rebootot, de NVIDIA CTK előfeltétele Docker
+#      Jövőbeli 04_docker.sh szétválasztás lehetséges
 #
 # Változtatások v6.5 (COMP STATE implementáció):
-#   COMP STATE rendszer bevezetése (sablon: compstate_implementációs_sablon)
 #   - COMP_USE_CACHED / comp_state_exists / comp_load_state blokk
-#     a komponens felmérés köré
-#   - check mód early exit: _FLOW="check" → dialog + state mentés + exit
-#   - Post-install re-check + comp_save_state:
-#     • rövid út (broken flow) végén
-#     • teljes út végén (install/update/fix/reinstall)
-#   - CUDA 13.x workaround komment bővítve (explicit PATH, sudo kontextus)
-#
-# Változtatások v6.4.2:
-#   - "Következő lépések" dialog: check módban egyszerűsített szöveg
-#   - dialog_yesno "Újraindítás most?": csak ha RUN_MODE != check ÉS OK > 0
-#
-# Változtatások v6.4.1:
-#   - INST_* state szinkronizálás a comp_check után (check módban is)
-#
-# Változtatások v6.4 (split lib v6.4 igazítás):
-#   - LIB betöltés: 00_lib.sh master loader (lib/ alkönyvtárból tölt)
-#   - REAL_USER / REAL_HOME: a lib _REAL_USER/_REAL_HOME értékeit veszi át
-#   - Driver finomítás ELTÁVOLÍTVA: hw_detect() dpkg alapján detektál
-#   - Helyi függvények megmaradnak 01a-ban (nvidia_driver_purge, mok, stb.)
-#
-# Változtatások v6.3 (STATE→ACTIONS mátrix):
-#   "missing" → teljes install, "broken" → MOK + konfig, "ok" → detect_run_mode
+#   - check mód early exit
+#   - Post-install re-check + comp_save_state (rövid + teljes út végén)
 # =============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -61,9 +67,14 @@ declare -A MIN_VER=(
   [nvidia_ctk]="1.0"
 )
 
+# NVIDIA driver failsafe: Blackwell minimálisan szükséges driver
+# Ha a célcsomag (580-open) telepítése sikertelen, ezt próbáljuk
+DRIVER_MIN_PKG_BLACKWELL="nvidia-driver-570-open"
+
 CUDA_KEYRING_URL="https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb"
 
 declare -A PKGS=(
+  # ccze: 00_lib.sh dual stream ANSI log kimenetéhez szükséges
   [base]="
     build-essential git curl wget unzip zip cmake ninja-build
     htop nvtop btop tree jq net-tools nmap
@@ -73,18 +84,27 @@ declare -A PKGS=(
     fonts-firacode fonts-jetbrains-mono zsh tmux screen
     p7zip-full ffmpeg imagemagick libssl-dev libffi-dev pkg-config ccze"
 
+  # Python fordítási függőségek — pyenv/CPython build előfeltételei
+  # Forrás: https://docs.python.org/3.13/ → Build from source
   [python_build]="
     liblzma-dev libgdbm-dev libreadline-dev libsqlite3-dev
     libbz2-dev zlib1g-dev libffi-dev tk-dev uuid-dev
     libncurses-dev libexpat1-dev libnss3-dev"
 
+  # CUDA toolkit csomagok — 3 réteg: toolkit + runtime lib + dev header
+  # Forrás: https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/
   [cuda_13_2]="cuda-toolkit-13-2 cuda-libraries-13-2 cuda-libraries-dev-13-2"
   [cuda_13_1]="cuda-toolkit-13-1 cuda-libraries-13-1 cuda-libraries-dev-13-1"
   [cuda_13_0]="cuda-toolkit-13-0 cuda-libraries-13-0 cuda-libraries-dev-13-0"
   [cuda_12_8]="cuda-toolkit-12-8 cuda-libraries-12-8 cuda-libraries-dev-12-8"
   [cuda_12_6]="cuda-toolkit-12-6 cuda-libraries-12-6 cuda-libraries-dev-12-6"
 
+  # cuDNN 9 + NCCL — NCCL 2.29.7+cuda13.2 backward-kompatibilis cu12 ABI-val
   [cudnn_nccl]="libcudnn9-cuda-12 libcudnn9-dev-cuda-12 libnccl2 libnccl-dev"
+
+  # Docker CE + NVIDIA CTK
+  # Architekturális megj.: Docker CE reboot nélkül működik; CTK előfeltétele.
+  # Jövőbeli refaktor: 04_docker.sh (tervezett szétválasztás)
   [docker]="docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin"
   [nvidia_ctk]="nvidia-container-toolkit"
 )
@@ -96,7 +116,9 @@ declare -A URLS=(
   [nvidia_ctk_list]="https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list"
 )
 
-APT_PIN_NVIDIA='# 01a_system_foundation v6.3
+# Ubuntu repo nvidia-* csomagjai > CUDA repo csomagjai
+# (Ubuntu-signált csomagok MOK enrollment nélkül betöltődnek)
+APT_PIN_NVIDIA='# 01a_system_foundation v6.6
 Package: nvidia-* libnvidia-* xserver-xorg-video-nvidia-*
 Pin: release o=Ubuntu
 Pin-Priority: 1001'
@@ -144,17 +166,68 @@ if ! infra_compatible "$INFRA_HW_REQ"; then
 fi
 
 # =============================================================================
-# DRIVER CSOMAGNÉV ÉS SOROZATSZÁM
+# DRIVER CSOMAGNÉV ÉS SOROZATSZÁM + 590+ NÉVVÁLTÁS DETEKTÁLÁS
 # =============================================================================
+# hw_detect() már meghatározta a ténylegesen telepített drivert (HW_NVIDIA_PKG).
+#
+# Ha semmi nincs telepítve, keressük a legjobb elérhető verziót:
+#   A. Ubuntu restricted: nvidia-driver-580-open (stabil, Canonical-signed)
+#   B. Ubuntu restricted: nvidia-driver-575-open
+#   C. NVIDIA CUDA repo:  nvidia-open (590+ új névformátum)
+#      NVIDIA r595 doc: "Starting with branch 590, packages renamed:
+#      nvidia-open (no branch number), nvidia-driver-pinning-<branch> for locking"
+#   D. Fallback: nvidia-driver-570-open (Blackwell minimum)
+#
+# 590/595 státusz Ubuntu 24.04-en (2026-04-11):
+#   590: Ubuntu multiverse/proposed (community build, instabilitás ismert)
+#   595: Ubuntu 26.04 only, 24.04-en nem érhető el
+#   → Ubuntu restricted 580 marad az ajánlott stabil verzió
 
 _DRIVER_PKG="${HW_NVIDIA_PKG}"
 _DRIVER_SERIES="$(printf '%s' "$_DRIVER_PKG" | grep -oP '\d+' | head -1)"
-if [ -z "$_DRIVER_PKG" ] || [ -z "$_DRIVER_SERIES" ]; then
-  _DRIVER_PKG="nvidia-driver-570-open"
-  _DRIVER_SERIES="570"
-  log "WARN" "HW_NVIDIA_PKG üres — fallback: $_DRIVER_PKG"
+
+if [ -z "$_DRIVER_PKG" ]; then
+  log "HW" "Telepített driver nincs — elérhető keresése..."
+
+  # A. Ubuntu restricted: 580-open (stabil, Canonical-signed, MOK nélkül tölt)
+  if apt-cache show nvidia-driver-580-open &>/dev/null; then
+    _DRIVER_PKG="nvidia-driver-580-open"; _DRIVER_SERIES="580"
+    log "HW" "Ubuntu restricted: nvidia-driver-580-open → preferált (stabil)"
+
+  # B. Ubuntu restricted: 575-open
+  elif apt-cache show nvidia-driver-575-open &>/dev/null; then
+    _DRIVER_PKG="nvidia-driver-575-open"; _DRIVER_SERIES="575"
+    log "HW" "Ubuntu restricted: nvidia-driver-575-open"
+
+  # C. NVIDIA CUDA repo: nvidia-open (590+ névformátum, feature branch)
+  elif apt-cache show nvidia-open &>/dev/null; then
+    _DRIVER_PKG="nvidia-open"; _DRIVER_SERIES="590"
+    log "HW" "NVIDIA CUDA repo: nvidia-open (590+ feature branch)"
+    log "WARN" "590 Ubuntu 24.04-en: multiverse/proposed, nem stabil production driver"
+
+  # D. Fallback: 570-open (Blackwell minimális)
+  else
+    _DRIVER_PKG="${DRIVER_MIN_PKG_BLACKWELL}"; _DRIVER_SERIES="570"
+    log "HW" "Fallback: $_DRIVER_PKG (minimális Blackwell driver)"
+  fi
+
+else
+  # Telepített driver volt — sorozatszám kinyerése
+  # 'nvidia-open' esetén (590+) nincsen szám a névben → dpkg-ből
+  if [ -z "$_DRIVER_SERIES" ]; then
+    _DRIVER_SERIES=$(dpkg-query -f '${Version}\n' -W "$_DRIVER_PKG" 2>/dev/null \
+      | grep -oP '^\d+' | head -1 || echo "590")
+  fi
 fi
-log "HW" "Driver csomag: $_DRIVER_PKG (sorozat: ${_DRIVER_SERIES})"
+
+# Blackwell biztonsági ellenőrzés: GB202/GB203 ZÁRT driver → "No devices found"
+if [ "$HW_GPU_ARCH" = "blackwell" ] && \
+   [[ "$_DRIVER_PKG" != *"-open" ]] && [ "$_DRIVER_PKG" != "nvidia-open" ]; then
+  _DRIVER_PKG="${_DRIVER_PKG}-open"
+  log "HW" "Blackwell: -open suffix kényszerítve → $_DRIVER_PKG"
+fi
+
+log "HW" "Végső driver csomag: $_DRIVER_PKG (sorozat: ${_DRIVER_SERIES:-?})"
 
 # =============================================================================
 # KOMPONENS FELMÉRÉS
@@ -162,16 +235,13 @@ log "HW" "Driver csomag: $_DRIVER_PKG (sorozat: ${_DRIVER_SERIES})"
 # COMP STATE rendszer: mentett check betöltése VAGY friss ellenőrzés.
 # COMP_USE_CACHED=true: 00_master.sh exportálja ha a user kérte.
 # Minta: 06_editors.sh (referencia implementáció)
-# lib: comp_state_exists / comp_load_state / comp_save_state → lib/00_lib_comp.sh
 
 log "COMP" "━━━ Komponens felmérés ━━━"
 
 if [ "${COMP_USE_CACHED:-false}" = "true" ] && comp_state_exists "$INFRA_NUM"; then
-  # ── Mentett eredmény betöltése ─────────────────────────────────────────────
   comp_load_state "$INFRA_NUM"
   log "COMP" "Mentett check betöltve — INFRA $INFRA_NUM ($(comp_state_age_hours "$INFRA_NUM") óra)"
 else
-  # ── Friss komponens ellenőrzés ─────────────────────────────────────────────
   comp_check_nvidia_driver "${MIN_VER[driver]}"
   comp_check_cuda          "${MIN_VER[cuda]}"
   comp_check_cudnn         "${MIN_VER[cudnn]}"
@@ -179,7 +249,6 @@ else
   comp_check_nvidia_ctk    "${MIN_VER[nvidia_ctk]}"
 
   # CUDA 13.x workaround: comp_check_cuda csak cuda-toolkit-12-* mintát ismer dpkg-ből.
-  # Ha CUDA 13.x van telepítve, nvcc alapján javítjuk a státuszt.
   # Explicit PATH szükséges: sudo kontextusban /usr/local/cuda/bin nem mindig elérhető.
   if [ "${COMP_STATUS[cuda]:-missing}" = "missing" ]; then
     _nvcc13=$(PATH="/usr/local/cuda/bin:$PATH" nvcc --version 2>/dev/null \
@@ -190,8 +259,7 @@ else
     fi
   fi
 
-  # "broken" lib workaround — ha a comp_check_nvidia_driver még nem javított
-  # változata fut, false positive "ok"-ot adhat "Nodeviceswerefound" verziószámmal.
+  # "broken" lib workaround — false positive "ok" "Nodeviceswerefound" esetén
   if [ "${COMP_STATUS[nvidia_driver]:-missing}" = "ok" ] && \
      ! echo "${COMP_VER[nvidia_driver]:-}" | grep -qE '^[0-9][0-9.]+$'; then
     log "WARN" "Driver version false positive: '${COMP_VER[nvidia_driver]}' → broken"
@@ -199,8 +267,7 @@ else
     COMP_VER[nvidia_driver]="(kernel modul nem fut)"
   fi
 
-  # check módban itt mentünk — más módokban a script VÉGÉN (post-install után).
-  # Check módban semmi sem változik → pre-check = post-check állapot.
+  # check módban itt mentünk — más módokban a script VÉGÉN (post-install után)
   if [ "$RUN_MODE" = "check" ]; then
     comp_save_state "$INFRA_NUM"
     log "COMP" "Check mód: COMP state mentve"
@@ -351,7 +418,6 @@ elif [ "$_FLOW" = "skip" ]; then
   log "SKIP" "Minden OK → kilépés"; exit 0
 
 elif [ "$_FLOW" = "check" ]; then
-  # check mód: comp_save_state már lefutott az elején → csak kilépés
   dialog_msg "[Ellenőrző] INFRA ${INFRA_NUM}" \
     "\n${STATUS}\n  [check mód — változtatás nem történt]"
   log "COMP" "Check mód: kilépés (nincs telepítés)"
@@ -473,8 +539,7 @@ if [ "$_FLOW" = "short" ]; then
     infra_state_set "REBOOT_BY_INFRA" "$INFRA_NUM"
   fi
 
-  # ── Post-install COMP STATE mentés — rövid út ──────────────────────────────
-  # Sablon: compstate_implementációs_sablon_az_egyes_szálaknak
+  # Post-install COMP STATE mentés — rövid út
   if [[ "$RUN_MODE" =~ ^(install|update|fix|reinstall)$ ]]; then
     log "COMP" "Post-install re-check (rövid út, mód: $RUN_MODE)..."
     comp_check_nvidia_driver "${MIN_VER[driver]}"
@@ -521,6 +586,15 @@ fi
 # =============================================================================
 # 1. LÉPÉS — ALAP RENDSZER CSOMAGOK
 # =============================================================================
+# v6.6: APT mirror resilience
+# hu.archive.ubuntu.com 2026-04-11 logban timeout-olt (ubuntu-drivers-common)
+# Megoldás:
+#   1. apt-get update: --timeout=30, nem-fatális (|| true)
+#      Ha timeout → gyorsítótárazott lista marad (legtöbbször elegendő)
+#   2. apt-get install: --fix-missing
+#      Hálózati hiba esetén átugorja a nem letölthető csomagot
+#   3. Eredmény ellenőrzés: pkg_installed a KRITIKUS csomagokra
+#      Nem az apt exit kód (100 = 1 csomag nem töltődött, a többi OK)
 
 log "STEP" "━━━ 1/7: Alap rendszer csomagok ━━━"
 
@@ -528,15 +602,39 @@ if [ "$_DRV_STATUS" = "missing" ] || [ "$_DRV_STATUS" = "old" ] || \
    [ "$RUN_MODE" = "reinstall" ] || [ "$RUN_MODE" = "update" ]; then
 
   if ask_proceed "Alap fejlesztői csomagok + Python build deps?"; then
-    sudo_log "apt-get update" apt-get update -qq
+    # apt-get update timeout=30 — ha a mirror nem érhető el, nem szabad megakadni
+    log "APT" "apt-get update (Acquire::http::Timeout=30)..."
+    apt-get -o Acquire::http::Timeout=30 update -qq 2>&1 | \
+      tee -a "$LOGFILE_AI" || \
+      log "WARN" "apt-get update részleges hiba — gyorsítótárazott lista marad"
+
+    # --fix-missing: ha 1-2 csomag (pl. ubuntu-drivers-common upgrade) nem tölthető le
+    # a többi települ, nem áll le a teljes folyamat
     apt_install_progress "Alap csomagok" \
       "Ubuntu alap + Python fordítási függőségek..." \
+      --fix-missing \
       ${PKGS[base]} ${PKGS[python_build]}
 
-    if pkg_installed "build-essential" && pkg_installed "liblzma-dev"; then
-      ((OK++)); log "OK" "Alap csomagok OK"
+    # Eredmény: pkg_installed dönt a KRITIKUS csomagokra
+    # (apt exit 100 = 1 csomag nem töltődött le, de a többi OK — ez nem FAIL)
+    if pkg_installed "build-essential" && pkg_installed "liblzma-dev" && \
+       pkg_installed "zsh" && pkg_installed "ccze"; then
+      ((OK++)); log "OK" "Alap csomagok OK (kritikus csomagok telepítve)"
     else
-      ((FAIL++)); log "FAIL" "Alap csomagok részleges hiba"
+      # Hány kritikus csomag hiányzik?
+      _missing_critical=0
+      for _chk_pkg in build-essential zsh ccze liblzma-dev; do
+        pkg_installed "$_chk_pkg" || {
+          ((_missing_critical++))
+          log "WARN" "Hiányzó kritikus csomag: $_chk_pkg"
+        }
+      done
+      if [ "$_missing_critical" -gt 2 ]; then
+        ((FAIL++)); log "FAIL" "Alap csomagok: $_missing_critical kritikus csomag hiányzik"
+      else
+        # 1-2 nem-kritikus hiány (pl. ubuntu-drivers-common upgrade) → nem blokkoló
+        ((SKIP++)); log "WARN" "Alap csomagok: $_missing_critical csomag hiányzik — továbblép"
+      fi
     fi
   else
     ((SKIP++)); log "SKIP" "Alap csomagok kihagyva"
@@ -546,6 +644,9 @@ fi
 # =============================================================================
 # 2. LÉPÉS — NVIDIA OPEN DRIVER
 # =============================================================================
+# v6.6: Driver install failsafe
+# Ha a célcsomag telepítése sikertelen → fallback a minimális Blackwell driverre
+# (nvidia-driver-570-open) hogy reboot után ne legyen fekete képernyő.
 
 log "STEP" "━━━ 2/7: NVIDIA open driver ($_DRIVER_PKG) ━━━"
 
@@ -556,6 +657,7 @@ if [ "$_DRV_STATUS" = "missing" ] || [ "$_DRV_STATUS" = "old" ] || \
 
     progress_open "NVIDIA Open Driver — ${_DRIVER_PKG}" "Előkészítés..."
 
+    # CUDA repo ideiglenes kikapcsolása (APT pinning konfliktus)
     progress_set 5 "CUDA repo ideiglenes deaktiválása..."
     declare -a _CUDA_REPO_MOVED=()
     for _f in /etc/apt/sources.list.d/cuda*.list \
@@ -566,47 +668,88 @@ if [ "$_DRV_STATUS" = "missing" ] || [ "$_DRV_STATUS" = "old" ] || \
         log "APT" "CUDA repo deaktiválva: $_f"
     done
 
+    # Régi NVIDIA csomagok tiszta eltávolítása (DEBIAN_FRONTEND=noninteractive)
     progress_set 14 "Régi NVIDIA csomagok eltávolítása..."
     nvidia_driver_purge "$LOGFILE_AI"
 
+    # APT pinning — Ubuntu repo > CUDA repo
     progress_set 32 "APT pinning..."
     echo "$APT_PIN_NVIDIA" > /etc/apt/preferences.d/99-nvidia-ubuntu-priority
 
-    progress_set 40 "APT lista frissítése..."; apt-get update -qq >> "$LOGFILE_AI" 2>&1
+    # Driver telepítés
+    progress_set 40 "APT lista frissítése..."
+    apt-get -o Acquire::http::Timeout=30 update -qq >> "$LOGFILE_AI" 2>&1 || true
     progress_set 50 "${_DRIVER_PKG} letöltése és telepítése (~450MB)..."
     DEBIAN_FRONTEND=noninteractive apt-get install -y \
+      --fix-missing \
       -o Dpkg::Options::="--force-confdef" \
       -o Dpkg::Options::="--force-confold" \
       "${_DRIVER_PKG}" nvidia-prime >> "$LOGFILE_AI" 2>&1
     _DRV_EC=$?
 
+    # CUDA repo visszakapcsolása
     progress_set 88 "CUDA repo visszakapcsolása..."
     for _entry in "${_CUDA_REPO_MOVED[@]}"; do
       _bak="${_entry%%|*}"; _orig="${_entry##*|}"
       [ -f "$_bak" ] && mv "$_bak" "$_orig" 2>/dev/null && \
         log "APT" "CUDA repo visszakapcsolva: $_orig"
     done
-    apt-get update -qq >> "$LOGFILE_AI" 2>&1
+    apt-get -o Acquire::http::Timeout=30 update -qq >> "$LOGFILE_AI" 2>&1 || true
     progress_close
 
     if pkg_installed "$_DRIVER_PKG"; then
       log "OK" "NVIDIA driver telepítve: $_DRIVER_PKG"
       infra_state_set "HW_NVIDIA_PKG"        "$_DRIVER_PKG"
       infra_state_set "NVIDIA_DRIVER_PKG"    "$_DRIVER_PKG"
-      infra_state_set "NVIDIA_DRIVER_SERIES" "$_DRIVER_SERIES"
+      infra_state_set "NVIDIA_DRIVER_SERIES" "${_DRIVER_SERIES:-?}"
       ((OK++))
     else
-      log "FAIL" "NVIDIA driver SIKERTELEN (exit ${_DRV_EC})"
-      dialog_warn "NVIDIA Driver — Hiba" "
-  Sikertelen: $_DRIVER_PKG  (exit ${_DRV_EC})
+      # ── DRIVER INSTALL FAILSAFE ────────────────────────────────────────────
+      # A célcsomag telepítése sikertelen. Megpróbáljuk a minimális Blackwell
+      # drivert bejuttatni hogy reboot után a rendszer működőképes legyen.
+      log "FAIL" "NVIDIA driver SIKERTELEN (exit ${_DRV_EC}): $_DRIVER_PKG"
+      log "INFO" "Failsafe driver telepítése: $DRIVER_MIN_PKG_BLACKWELL..."
+
+      DEBIAN_FRONTEND=noninteractive apt-get install -y \
+        --fix-missing \
+        -o Dpkg::Options::="--force-confdef" \
+        -o Dpkg::Options::="--force-confold" \
+        "$DRIVER_MIN_PKG_BLACKWELL" >> "$LOGFILE_AI" 2>&1
+
+      if pkg_installed "$DRIVER_MIN_PKG_BLACKWELL"; then
+        log "WARN" "Failsafe driver telepítve: $DRIVER_MIN_PKG_BLACKWELL"
+        log "WARN" "Célcsomag ($__DRIVER_PKG) nem volt telepíthető!"
+        infra_state_set "HW_NVIDIA_PKG"        "$DRIVER_MIN_PKG_BLACKWELL"
+        infra_state_set "NVIDIA_DRIVER_PKG"    "$DRIVER_MIN_PKG_BLACKWELL"
+        infra_state_set "NVIDIA_DRIVER_SERIES" "570"
+        _DRIVER_PKG="$DRIVER_MIN_PKG_BLACKWELL"
+        _DRIVER_SERIES="570"
+        dialog_warn "NVIDIA Driver — Failsafe" "
+  A kívánt driver ($_DRIVER_PKG) nem volt telepíthető.
+  Fallback driver telepítve: $DRIVER_MIN_PKG_BLACKWELL
+
+  A rendszer reboot után működőképes lesz, de
+  később érdemes frissíteni a 580+ verzióra:
+    sudo apt update && sudo apt install nvidia-driver-580-open
+
+  Log: $LOGFILE_AI" 18
+        ((SKIP++))   # részleges siker — nem teljes OK, nem katasztrófa
+      else
+        log "FAIL" "Failsafe driver is sikertelen: $DRIVER_MIN_PKG_BLACKWELL"
+        dialog_warn "NVIDIA Driver — SÚLYOS HIBA" "
+  Sem a céldriver, sem a fallback driver nem volt telepíthető.
 
   Lehetséges okok:
+    • Hálózati hiba (APT repo nem elérhető)
     • Kernel inkompatibilitás: uname -r
-    • Régi nouveau aktív: lsmod | grep nouveau
     • dpkg félbeszakadt: sudo dpkg --configure -a
 
-  Log: $LOGFILE_AI" 16
-      ((FAIL++))
+  A rendszer REBOOT UTÁN NEM MŰKÖDŐKÉPES NVIDIA-val!
+  NE INDÍTSD ÚJRA amíg a driver nincs telepítve!
+
+  Log: $LOGFILE_AI" 18
+        ((FAIL++))
+      fi
     fi
   else
     ((SKIP++)); log "SKIP" "Driver kihagyva"
@@ -672,6 +815,7 @@ fi
 # =============================================================================
 # 4. LÉPÉS — CUDA TOOLKIT
 # =============================================================================
+# A CUDA repo az NVIDIA CDN-ről tölt (nem Ubuntu mirror) → stabilabb elérés
 
 log "STEP" "━━━ 4/7: CUDA toolkit ━━━"
 
@@ -684,9 +828,10 @@ if [ "${COMP_STATUS[cuda]:-missing}" != "ok" ] || \
       bash -c "wget -q '$CUDA_KEYRING_URL' -O /tmp/cuda-keyring.deb \
                && DEBIAN_FRONTEND=noninteractive dpkg -i /tmp/cuda-keyring.deb \
                && rm -f /tmp/cuda-keyring.deb"
-    [ $? -eq 0 ] && apt-get update -qq >> "$LOGFILE_AI" 2>&1 \
-                 && log "OK" "CUDA repo konfigurálva" \
-                 || { log "FAIL" "CUDA keyring sikertelen"; ((FAIL++)); }
+    [ $? -eq 0 ] && \
+      apt-get -o Acquire::http::Timeout=30 update -qq >> "$LOGFILE_AI" 2>&1 \
+      && log "OK" "CUDA repo konfigurálva" \
+      || { log "FAIL" "CUDA keyring sikertelen"; ((FAIL++)); }
   fi
 
   _best_cuda="$(cuda_best_available)"
@@ -744,7 +889,7 @@ if [ "${COMP_STATUS[cuda]:-missing}" != "ok" ] || \
 
     if ask_proceed "CUDA ${_CUDA_VER} telepítése? (~3.5 GB)"; then
       apt_install_progress "CUDA ${_CUDA_VER}" "CUDA ${_CUDA_VER} telepítése..." \
-        --no-install-recommends ${_CUDA_PKGS}
+        --no-install-recommends --fix-missing ${_CUDA_PKGS}
 
       export PATH="/usr/local/cuda/bin:$PATH"
       _INST_VER=$(nvcc --version 2>/dev/null | grep -oP 'release \K[\d.]+' | head -1)
@@ -803,7 +948,7 @@ log "STEP" "━━━ 4b: cuDNN 9 + NCCL ━━━"
 if [ "${COMP_STATUS[cudnn]:-missing}" != "ok" ] || [ "$RUN_MODE" = "reinstall" ]; then
   if ask_proceed "cuDNN 9 + NCCL telepítése?"; then
     apt_install_progress "cuDNN + NCCL" "cuDNN 9 + NCCL telepítése..." \
-      ${PKGS[cudnn_nccl]}
+      --fix-missing ${PKGS[cudnn_nccl]}
     if pkg_installed "libcudnn9-cuda-12" && pkg_installed "libnccl2"; then
       ((OK++)); log "OK" "cuDNN 9 + NCCL telepítve"
     else
@@ -822,7 +967,7 @@ _write_gpu_config() {
   local mode="${1:-hybrid}"
 
   cat > /etc/modprobe.d/99-blacklist-nouveau.conf << 'BEOF'
-# 01a_system_foundation v6.3 — Nouveau blacklist
+# 01a_system_foundation v6.6 — Nouveau blacklist
 blacklist nouveau
 blacklist lbm-nouveau
 options nouveau modeset=0
@@ -830,8 +975,9 @@ alias nouveau off
 alias lbm-nouveau off
 BEOF
 
+  # modeset=1: Wayland/GBM | fbdev=1: boot splash | NVreg: suspend VRAM megőrzés
   cat > /etc/modprobe.d/99-nvidia-options.conf << 'MEOF'
-# 01a_system_foundation v6.3 — NVIDIA kernel modul opciók
+# 01a_system_foundation v6.6 — NVIDIA kernel modul opciók
 options nvidia-drm modeset=1 fbdev=1
 options nvidia NVreg_PreserveVideoMemoryAllocations=1
 MEOF
@@ -839,6 +985,7 @@ MEOF
   if [ "$mode" = "hybrid" ]; then
     prime-select on-demand 2>/dev/null || true
 
+    # Intel iGPU Bus ID — hex→dec konverzió, Xorg "PCI:B:D:F" formátum
     local intel_busid
     intel_busid=$(lspci | grep -i "VGA.*Intel" | head -1 | awk '{print $1}' | \
       awk -F'[:.]' '{printf "PCI:%d:%d:%d",
@@ -847,7 +994,7 @@ MEOF
     log "CFG" "Intel iGPU Bus ID: $intel_busid"
 
     cat > /etc/X11/xorg.conf << XEOF
-# 01a_system_foundation v6.3 — Hibrid GPU mód (Intel iGPU + NVIDIA RTX)
+# 01a_system_foundation v6.6 — Hibrid GPU mód (Intel iGPU + NVIDIA RTX)
 Section "ServerLayout"
     Identifier "hybrid-layout"
     Screen 0 "iGPU-Screen"
@@ -880,13 +1027,13 @@ XEOF
     prime-select nvidia 2>/dev/null || true
 
     cat > /etc/modprobe.d/99-blacklist-igpu.conf << 'BEOF'
-# 01a_system_foundation v6.3 — Intel iGPU blacklist (dedikált NVIDIA mód)
+# 01a_system_foundation v6.6 — Intel iGPU blacklist (dedikált NVIDIA mód)
 blacklist i915
 blacklist intel_agp
 BEOF
 
     cat > /etc/X11/xorg.conf << 'XEOF'
-# 01a_system_foundation v6.3 — Dedikált GPU mód (csak NVIDIA RTX)
+# 01a_system_foundation v6.6 — Dedikált GPU mód (csak NVIDIA RTX)
 Section "ServerLayout"
     Identifier "dedicated-layout"
     Screen 0 "nvidia-screen"
@@ -920,6 +1067,15 @@ fi
 # =============================================================================
 # 6. LÉPÉS — DOCKER CE + NVIDIA CONTAINER TOOLKIT
 # =============================================================================
+# Architekturális megjegyzés:
+# Docker CE önmagában nem igényel rebootot. A NVIDIA CTK viszont pre-reboot
+# konfigurálást igényel (daemon.json beállítás), és a GPU-Docker integráció
+# csak reboot után (futó NVIDIA driver) fog ténylegesen működni.
+#
+# Ha a jövőben Docker CE és CTK kiválik egy 04_docker.sh szálba:
+# - comp_check_docker / comp_check_nvidia_ctk változatlan marad
+# - 02_local_ai_stack.sh infra_require("docker") fogja kezelni a függőséget
+# - registry.sh-ba kerül: 04_docker entry HW_REQ="" (hardver független)
 
 log "STEP" "━━━ 6/7: Docker CE ━━━"
 
@@ -933,10 +1089,12 @@ if [ "${COMP_STATUS[docker]:-missing}" != "ok" ] || [ "$RUN_MODE" = "reinstall" 
       printf 'deb [arch=%s signed-by=/etc/apt/keyrings/docker.gpg] %s %s stable\n' \
         "$(dpkg --print-architecture)" "${URLS[docker_repo]}" "$(lsb_release -cs)" \
         > /etc/apt/sources.list.d/docker.list
-      apt-get update -qq >> "$LOGFILE_AI" 2>&1
+      # Docker CDN-ről tölt (nem Ubuntu mirror) → stabil elérés
+      apt-get -o Acquire::http::Timeout=30 update -qq >> "$LOGFILE_AI" 2>&1 || true
     fi
 
-    apt_install_progress "Docker CE" "Docker CE + Buildx + Compose..." ${PKGS[docker]}
+    apt_install_progress "Docker CE" "Docker CE + Buildx + Compose..." \
+      --fix-missing ${PKGS[docker]}
 
     if pkg_installed "docker-ce"; then
       usermod -aG docker "$REAL_USER" 2>/dev/null || true
@@ -953,6 +1111,8 @@ if [ "${COMP_STATUS[docker]:-missing}" != "ok" ] || [ "$RUN_MODE" = "reinstall" 
 fi
 
 log "STEP" "━━━ NVIDIA Container Toolkit ━━━"
+# nvidia-cdi-refresh.service SIKERTELEN lesz pre-reboot állapotban — VÁRHATÓ!
+# /dev/nvidia* csak driver betöltés (reboot) után létezik.
 
 if [ "${COMP_STATUS[nvidia_ctk]:-missing}" != "ok" ] || [ "$RUN_MODE" = "reinstall" ]; then
   if ask_proceed "NVIDIA Container Toolkit telepítése?"; then
@@ -963,10 +1123,11 @@ if [ "${COMP_STATUS[nvidia_ctk]:-missing}" != "ok" ] || [ "$RUN_MODE" = "reinsta
       curl -sL "${URLS[nvidia_ctk_list]}" \
         | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
         > /etc/apt/sources.list.d/nvidia-container-toolkit.list
-      apt-get update -qq >> "$LOGFILE_AI" 2>&1
+      apt-get -o Acquire::http::Timeout=30 update -qq >> "$LOGFILE_AI" 2>&1 || true
     fi
 
-    apt_install_progress "NVIDIA CTK" "NVIDIA Container Toolkit..." ${PKGS[nvidia_ctk]}
+    apt_install_progress "NVIDIA CTK" "NVIDIA Container Toolkit..." \
+      --fix-missing ${PKGS[nvidia_ctk]}
 
     if pkg_installed "nvidia-container-toolkit"; then
       nvidia-ctk runtime configure --runtime=docker >> "$LOGFILE_AI" 2>&1
@@ -1011,7 +1172,7 @@ if [ "${OK:-0}" -gt 0 ] && \
    [ "$_FLOW" != "skip" ] && [ "$_FLOW" != "check" ] && \
    [ "${RUN_MODE:-install}" != "check" ]; then
   infra_state_set "REBOOT_NEEDED"   "true"
-  infra_state_set "REBOOT_REASON"   "NVIDIA ${_DRIVER_SERIES}-open driver + initramfs"
+  infra_state_set "REBOOT_REASON"   "NVIDIA ${_DRIVER_SERIES:-?}-open driver + initramfs"
   infra_state_set "REBOOT_BY_INFRA" "$INFRA_NUM"
   log "STATE" "REBOOT_NEEDED=true (OK=$OK lépés végrehajtva)"
 else
@@ -1022,11 +1183,6 @@ infra_state_show
 # =============================================================================
 # POST-INSTALL COMP STATE MENTÉS — teljes út
 # =============================================================================
-# A telepítések UTÁN friss re-check + state mentés.
-# Sablon: compstate_implementációs_sablon_az_egyes_szálaknak
-# Logika:
-#   check mód     → comp_save_state az ELEJÉN futott (semmi sem változott)
-#   install/update/fix/reinstall → re-check ITT, a telepítés UTÁN
 
 if [[ "$RUN_MODE" =~ ^(install|update|fix|reinstall)$ ]]; then
   log "COMP" "Post-install re-check (mód: $RUN_MODE)..."
