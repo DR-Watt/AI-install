@@ -1,6 +1,6 @@
 #!/bin/bash
 # ============================================================================
-# lib/00_lib_compat.sh — INFRA Kompatibilitási Mátrix v1.0
+# lib/00_lib_compat.sh — INFRA Kompatibilitási Mátrix v1.1
 #
 # CÉL: GPU/OS/Driver/CUDA/PyTorch összefüggések egyetlen kereshető adatszerkezetben.
 #      Megszünteti a szétszórt if/case elágazásokat hw_detect-ből és 01a-ból.
@@ -41,6 +41,14 @@
 #   NVIDIA CUDA Compatibility r595 (2026-03-31)
 #   NVIDIA Driver Installation Guide r595 (2026-03-09)
 #   Ubuntu package lists noble-updates/restricted (2026-04-11 telepítési log)
+#
+# FONTOS — cuda_native vs cuda_recommended különbség:
+#   cuda_native     = nvidia-smi által mutatott max. támogatott CUDA API verzió
+#                     (pl. 13.1 = driver tudna 13.1-et, de a toolkit még nem érhető el)
+#   cuda_recommended = TÉNYLEGESEN ELÉRHETŐ és TELEPÍTENDŐ cuda-toolkit-* csomag
+#                     (noble-on: max 12.6 amíg cuda-toolkit-13-x meg nem jelenik!)
+#   Ha cuda_recommended > cuda_best_available() → a kód helyes fallback-et alkalmaz.
+#   Frissítsd cuda_recommended-et ha új toolkit csomag jelenik meg a repóban.
 # ============================================================================
 
 # ─── Kompatibilitási Mátrix ──────────────────────────────────────────────────
@@ -62,9 +70,9 @@ _COMPAT_MATRIX["blackwell|noble|driver_repo"]="ubuntu_restricted"
 _COMPAT_MATRIX["blackwell|noble|canonical_signed"]="true"
 _COMPAT_MATRIX["blackwell|noble|cuda_native"]="13.1"
 _COMPAT_MATRIX["blackwell|noble|cuda_min"]="12.8"
-_COMPAT_MATRIX["blackwell|noble|cuda_recommended"]="13.1"
-_COMPAT_MATRIX["blackwell|noble|cuda_pkg"]="cuda-toolkit-13-1"
-_COMPAT_MATRIX["blackwell|noble|pytorch_index"]="cu128"
+_COMPAT_MATRIX["blackwell|noble|cuda_recommended"]="12.6"
+_COMPAT_MATRIX["blackwell|noble|cuda_pkg"]="cuda-toolkit-12-6"
+_COMPAT_MATRIX["blackwell|noble|pytorch_index"]="cu126"
 _COMPAT_MATRIX["blackwell|noble|vllm_support"]="yes"
 _COMPAT_MATRIX["blackwell|noble|turboquant_mode"]="gpu120"
 _COMPAT_MATRIX["blackwell|noble|ollama_gpu"]="true"
@@ -79,9 +87,9 @@ _COMPAT_MATRIX["ada|noble|driver_repo"]="ubuntu_restricted"
 _COMPAT_MATRIX["ada|noble|canonical_signed"]="true"
 _COMPAT_MATRIX["ada|noble|cuda_native"]="13.1"
 _COMPAT_MATRIX["ada|noble|cuda_min"]="12.4"
-_COMPAT_MATRIX["ada|noble|cuda_recommended"]="13.1"
-_COMPAT_MATRIX["ada|noble|cuda_pkg"]="cuda-toolkit-13-1"
-_COMPAT_MATRIX["ada|noble|pytorch_index"]="cu128"
+_COMPAT_MATRIX["ada|noble|cuda_recommended"]="12.6"
+_COMPAT_MATRIX["ada|noble|cuda_pkg"]="cuda-toolkit-12-6"
+_COMPAT_MATRIX["ada|noble|pytorch_index"]="cu126"
 _COMPAT_MATRIX["ada|noble|vllm_support"]="yes"
 _COMPAT_MATRIX["ada|noble|turboquant_mode"]="gpu89"
 _COMPAT_MATRIX["ada|noble|ollama_gpu"]="true"
@@ -96,9 +104,9 @@ _COMPAT_MATRIX["ampere|noble|driver_repo"]="ubuntu_restricted"
 _COMPAT_MATRIX["ampere|noble|canonical_signed"]="true"
 _COMPAT_MATRIX["ampere|noble|cuda_native"]="13.1"
 _COMPAT_MATRIX["ampere|noble|cuda_min"]="12.4"
-_COMPAT_MATRIX["ampere|noble|cuda_recommended"]="13.1"
-_COMPAT_MATRIX["ampere|noble|cuda_pkg"]="cuda-toolkit-13-1"
-_COMPAT_MATRIX["ampere|noble|pytorch_index"]="cu128"
+_COMPAT_MATRIX["ampere|noble|cuda_recommended"]="12.6"
+_COMPAT_MATRIX["ampere|noble|cuda_pkg"]="cuda-toolkit-12-6"
+_COMPAT_MATRIX["ampere|noble|pytorch_index"]="cu126"
 _COMPAT_MATRIX["ampere|noble|vllm_support"]="yes"
 _COMPAT_MATRIX["ampere|noble|turboquant_mode"]="gpu86"
 _COMPAT_MATRIX["ampere|noble|ollama_gpu"]="true"

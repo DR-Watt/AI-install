@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# 01a_system_foundation.sh — System Foundation v6.8
+# 01a_system_foundation.sh — System Foundation v6.9
 #                            Ubuntu 24/26 LTS | NVIDIA | CUDA | Docker
 #
 # Dokumentáció
@@ -92,7 +92,7 @@ declare -A URLS=(
   [nvidia_ctk_list]="https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list"
 )
 
-APT_PIN_NVIDIA='# 01a_system_foundation v6.8
+APT_PIN_NVIDIA='# 01a_system_foundation v6.9
 Package: nvidia-* libnvidia-* xserver-xorg-video-nvidia-*
 Pin: release o=Ubuntu
 Pin-Priority: 1001'
@@ -867,7 +867,7 @@ _write_gpu_config() {
   local mode="${1:-hybrid}"
 
   cat > /etc/modprobe.d/99-blacklist-nouveau.conf << 'BEOF'
-# 01a_system_foundation v6.8 — Nouveau blacklist
+# 01a_system_foundation v6.9 — Nouveau blacklist
 blacklist nouveau
 blacklist lbm-nouveau
 options nouveau modeset=0
@@ -876,7 +876,7 @@ alias lbm-nouveau off
 BEOF
 
   cat > /etc/modprobe.d/99-nvidia-options.conf << 'MEOF'
-# 01a_system_foundation v6.8 — NVIDIA kernel modul opciók
+# 01a_system_foundation v6.9 — NVIDIA kernel modul opciók
 options nvidia-drm modeset=1 fbdev=1
 options nvidia NVreg_PreserveVideoMemoryAllocations=1
 MEOF
@@ -890,7 +890,7 @@ MEOF
     intel_busid="${intel_busid:-PCI:0:2:0}"
     log "CFG" "Intel iGPU Bus ID: $intel_busid"
     cat > /etc/X11/xorg.conf << XEOF
-# 01a_system_foundation v6.8 — Hibrid GPU mód
+# 01a_system_foundation v6.9 — Hibrid GPU mód
 Section "ServerLayout"
     Identifier "hybrid-layout"
     Screen 0 "iGPU-Screen"
@@ -921,12 +921,12 @@ XEOF
   else
     prime-select nvidia 2>/dev/null || true
     cat > /etc/modprobe.d/99-blacklist-igpu.conf << 'BEOF'
-# 01a_system_foundation v6.8 — Intel iGPU blacklist
+# 01a_system_foundation v6.9 — Intel iGPU blacklist
 blacklist i915
 blacklist intel_agp
 BEOF
     cat > /etc/X11/xorg.conf << 'XEOF'
-# 01a_system_foundation v6.8 — Dedikált GPU mód
+# 01a_system_foundation v6.9 — Dedikált GPU mód
 Section "ServerLayout"
     Identifier "dedicated-layout"
     Screen 0 "nvidia-screen"
@@ -968,7 +968,7 @@ log "STEP" "━━━ 6/7: Docker CE ━━━"
 if [ "${COMP_STATUS[docker]:-missing}" != "ok" ] || [ "$RUN_MODE" = "reinstall" ]; then
   if ask_proceed "Docker CE telepítése?"; then
     install -m 0755 -d /etc/apt/keyrings
-    curl -fsSL "${URLS[docker_gpg]}" | gpg --dearmor -o /etc/apt/keyrings/docker.gpg 2>/dev/null
+    curl -fsSL "${URLS[docker_gpg]}" | gpg --batch --yes --dearmor -o /etc/apt/keyrings/docker.gpg
     chmod a+r /etc/apt/keyrings/docker.gpg
 
     if ! source_exists "download.docker.com"; then
@@ -1000,7 +1000,7 @@ log "STEP" "━━━ NVIDIA Container Toolkit ━━━"
 if [ "${COMP_STATUS[nvidia_ctk]:-missing}" != "ok" ] || [ "$RUN_MODE" = "reinstall" ]; then
   if ask_proceed "NVIDIA Container Toolkit telepítése?"; then
     curl -fsSL "${URLS[nvidia_ctk_gpg]}" \
-      | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg 2>/dev/null
+      | gpg --batch --yes --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
 
     if ! source_exists "nvidia.github.io/libnvidia-container"; then
       curl -sL "${URLS[nvidia_ctk_list]}" \
