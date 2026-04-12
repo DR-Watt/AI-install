@@ -301,9 +301,12 @@ else
   check_component "cursor" \
     "([ -f '$_REAL_HOME/bin/cursor' ] || [ -f '$_REAL_HOME/tools/cursor/cursor.AppImage' ]) && echo 1" "1"
 
-  # Kitty: explicit PATH — sudo alatt ~/.local/kitty.app/bin nem elérhető
+  # Kitty: explicit fájl alapú detektálás — NEM PATH-alapú!
+  # PATH-alapú lookup (akár env, akár cmd_exists) sudo alatt megtalálja a
+  # /root/.local/kitty.app/bin/kitty-t is → hamis pozitív.
+  # Explicit path: csak $\_REAL\_HOME-ban elfogadott bináris
   check_component "kitty" \
-    "PATH='$_REAL_HOME/bin:$_REAL_HOME/.local/kitty.app/bin:/usr/bin:$PATH' kitty --version 2>/dev/null | grep -oP '[\d.]+' | head -1" "${VER[kitty_min]}"
+    "( [ -x '$_REAL_HOME/.local/kitty.app/bin/kitty' ] && '$_REAL_HOME/.local/kitty.app/bin/kitty' --version 2>/dev/null || [ -x '$_REAL_HOME/bin/kitty' ] && '$_REAL_HOME/bin/kitty' --version 2>/dev/null ) | grep -oP '[\d.]+' | head -1" "${VER[kitty_min]}"
 
   # CLINE + Continue: code --list-extensions user kontextusban
   # (sudo alatt code nem fut → extension lista nem kérhető le root-ként)
@@ -721,12 +724,19 @@ if [ "${COMP_STATUS[kitty]:-missing}" != "ok" ] || [ "$RUN_MODE" = "reinstall" ]
       apt_install_log "curl" curl
     fi
 
-    # Telepítés: kovidgoyal.net telepítő script (sh /dev/stdin a pipe biztonságosabb)
+    # Telepítés: kovidgoyal.net telepítő script, user kontextusban
+    # FONTOS: sudo -u "$_REAL_USER" HOME="$_REAL_HOME" szükséges!
+    #   Nélküle: sudo/root alatt fut → $HOME=/root → /root/.local/kitty.app-ba telepít
+    #   (azonos probléma mint a VS Code extension-öknél)
+    # Forrás: https://sw.kovidgoyal.net/kitty/binary/ — hivatalos telepítő
     run_with_progress "Kitty" "Kitty terminál telepítése..." \
+      sudo -u "$_REAL_USER" HOME="$_REAL_HOME" \
       bash -c "curl -fsSL '${URLS[kitty_installer]}' | sh /dev/stdin launch=n"
 
-    # Ellenőrzés: system kitty VAGY ~/.local/kitty.app
-    if cmd_exists kitty || [ -f "$_REAL_HOME/.local/kitty.app/bin/kitty" ]; then
+    # Ellenőrzés: csak a VALÓDI user home-jában keresünk!
+    # cmd_exists kitty NEM megfelelő — sudo alatt root PATH-ban is megtalálná
+    # a /root/.local/kitty.app/bin/kitty-t → hamis pozitív
+    if [ -f "$_REAL_HOME/.local/kitty.app/bin/kitty" ]; then
 
       # PATH szimlink: ~/bin/kitty → ~/.local/kitty.app/bin/kitty
       if [ -f "$_REAL_HOME/.local/kitty.app/bin/kitty" ]; then
@@ -805,7 +815,7 @@ if [[ "$RUN_MODE" =~ ^(install|update|fix|reinstall)$ ]]; then
 
   check_component "cursor"     "([ -f '$_REAL_HOME/bin/cursor' ] || [ -f '$_REAL_HOME/tools/cursor/cursor.AppImage' ]) && echo 1" "1"
 
-  check_component "kitty"     "PATH='$_REAL_HOME/bin:$_REAL_HOME/.local/kitty.app/bin:/usr/bin:$PATH' kitty --version 2>/dev/null | grep -oP '[\d.]+' | head -1" "${VER[kitty_min]}"
+  check_component "kitty"     "( [ -x '$_REAL_HOME/.local/kitty.app/bin/kitty' ] && '$_REAL_HOME/.local/kitty.app/bin/kitty' --version 2>/dev/null || [ -x '$_REAL_HOME/bin/kitty' ] && '$_REAL_HOME/bin/kitty' --version 2>/dev/null ) | grep -oP '[\d.]+' | head -1" "${VER[kitty_min]}"
 
   check_component "cline"     "HOME='$_REAL_HOME' sudo -u '$_REAL_USER' code --list-extensions 2>/dev/null | grep -q saoudrizwan.claude-dev && echo 1" "1"
 
