@@ -1315,9 +1315,25 @@ _do_install() {
   log "INFO" "[$MOD_ID] Install mód..."
 
   # Előfeltétel ellenőrzés: 02 (Ollama+vLLM+TQ) + 06 (VSCode+CLINE+Continue)
-  # lib/00_lib_state.sh infra_require() — megáll ha hiányzik
-  infra_require "02" || return 1
-  infra_require "06" || return 1
+  #
+  # FONTOS: infra_require() helyett direkt grep a state fájlba!
+  # infra_require() az INFRA_NAME["02"] registry tömbből olvassa a modul nevét.
+  # Ha a 09-es script önállóan fut (00_registry.sh nincs source-olva),
+  # az INFRA_NAME tömb üres → infra_require() "INFRA 02" névvel hibát dob
+  # még akkor is, ha MOD_02_DONE=true szerepel a state fájlban.
+  # Megoldás: direkt grep a state fájlban — registry függőség nélkül.
+  local _prereq_state="${_REAL_HOME}/.infra-state"
+  if ! grep -q "^MOD_02_DONE=true" "$_prereq_state" 2>/dev/null; then
+    dialog_warn "Függőség hiányzik" \
+      "02 modul szükséges: Ollama + vLLM + TurboQuant\n\nFuttasd előbb:\n  RUN_MODE=install sudo bash 02_local_ai_stack.sh" 14
+    return 1
+  fi
+  if ! grep -q "^MOD_06_DONE=true" "$_prereq_state" 2>/dev/null; then
+    dialog_warn "Függőség hiányzik" \
+      "06 modul szükséges: VS Code + CLINE + Continue.dev\n\nFuttasd előbb:\n  RUN_MODE=install sudo bash 06_editors.sh" 14
+    return 1
+  fi
+  log "INFO" "Előfeltételek OK: MOD_02_DONE=true, MOD_06_DONE=true"
 
   # ── ai-model-ctl wrapper script ───────────────────────────────────────────
   # ~/bin/ könyvtár létrehozása (01b_post_reboot.sh PATH-ba teszi)
