@@ -111,9 +111,11 @@ readonly VLLM_GPU_MEM_UTIL="0.90"      # 90% VRAM → RTX 5090 32GB-ból ~28.8GB
 readonly VLLM_MAX_MODEL_LEN=16384      # context length (csökkentsd ha OOM)
 # NOTA: --swap-space eltávolítva — vLLM 0.19.0-ban nem létezik ez a flag
 readonly VLLM_ENABLE_PREFIX_CACHE=1    # --enable-prefix-caching flag
-# PID fájl: ki/bekapcsoláshoz
+# PID fájl: /tmp marad — process tracking, rövid életű
 readonly VLLM_PID_FILE="/tmp/vllm-rtx5090.pid"
-readonly VLLM_LOG_FILE="/tmp/vllm-rtx5090.log"
+# Log fájl: SCRIPT_DIR — INFRA konvenció (wrapper_ prefix, nem /tmp!)
+# Megj: nem dátum-stampelt, mert vLLM hosszú életű service
+VLLM_LOG_FILE="${SCRIPT_DIR}/wrapper_vllm.log"
 
 # ── TurboQuant konfiguráció ───────────────────────────────────────────────────
 # Forrás: https://github.com/0xSero/turboquant (official reference impl)
@@ -543,6 +545,26 @@ _vllm_start() {
     return 1
   fi
 
+  # Blackwell SM_120 PyTorch kompatibilitás ellenőrzés
+  # Ha a venv PyTorch cu126-ról van telepítve → sm_120 nem támogatott → crash
+  # Forrás: pytorch.org/get-started/locally (cu128 szükséges SM_120-hoz)
+  if ! _vllm_check_pytorch_blackwell; then
+    log "ERR" "PyTorch inkompatibilis: RTX 5090 SM_120 nem támogatott a jelenlegi cu126 wheel-lel"
+    local fix_choice
+    fix_choice=$(whiptail --title "PyTorch Blackwell inkompatibilitás" \
+      --menu "⚠ A jelenlegi PyTorch NEM támogatja az RTX 5090 (SM_120) GPU-t!\n\nA telepített PyTorch cu126 indexről van → max sm_90 (Ada Lovelace).\nBlackwell SM_120-hoz cu128 PyTorch wheel szükséges.\n\nHiba: CUDA error: no kernel image for device\n\nMit szeretnél tenni?" \
+      20 76 3 \
+      "1" "PyTorch Blackwell fix futtatása (cu128 reinstall, ~10 perc)" \
+      "2" "Folytatás mindenképpen (vLLM valószínűleg crashel)" \
+      "0" "Mégse" \
+      3>&1 1>&2 2>&3) || return 1
+    case "$fix_choice" in
+      1) _vllm_fix_pytorch_blackwell; return 1 ;;  # fix után újra kell indítani
+      2) log "WARN" "Felhasználó döntése: inkompatibilis PyTorch-csal folytatja" ;;
+      0) return 1 ;;
+    esac
+  fi
+
   # FONTOS: vLLM először LETÖLTI a modellt (~GB-ok), majd BETÖLTI VRAM-ba.
   # Qwen2.5-7B: ~14GB letöltés + ~8GB VRAM → 2-10 perc lehet az első indításnál.
   # A script HÁTTÉRBEN indítja — ne várakozzon a felhasználó.
@@ -583,6 +605,116 @@ _vllm_start() {
   log "INFO" "Ellenőrzés: tail -f $VLLM_LOG_FILE"
   log "INFO" "Port megnyílás után API: http://localhost:${VLLM_PORT}/v1"
   return 0
+}
+
+# _vllm_check_pytorch_blackwell: ellenőrzi hogy a venv PyTorch-ja ismeri-e sm_120-t
+# Gyökérok: cu126 PyTorch csak sm_90-ig van fordítva (Ada Lovelace)
+# RTX 5090 Blackwell SM_120-hoz cu128+ PyTorch szükséges
+# Forrás: https://pytorch.org/get-started/locally/ (official)
+# Visszatér: 0=kompatibilis, 1=inkompatibilis (cu128 reinstall szükséges)
+_vllm_check_pytorch_blackwell() {
+  # Csak Blackwell GPU esetén releváns
+  [ "${HW_CUDA_ARCH:-0}" -lt 120 ] 2>/dev/null && return 0
+  [ "${HW_GPU_ARCH:-}" != "blackwell" ] && return 0
+
+  if [ ! -x "$VENV_PYTHON" ]; then
+    log "WARN" "venv python nem elérhető: $VENV_PYTHON"
+    return 1
+  fi
+
+  local compat
+  compat=$(sudo -u "$_REAL_USER" "$VENV_PYTHON" -c "
+import sys
+try:
+  import torch
+  if not torch.cuda.is_available():
+    print('no_cuda')
+    sys.exit(0)
+  # get_arch_list(): sm_50, sm_60, ..., sm_90 — ha sm_12x hiányzik → inkompatibilis
+  caps = torch.cuda.get_arch_list()
+  has_blackwell = any(
+    c.replace('sm_','').isdigit() and int(c.replace('sm_','')) >= 120
+    for c in caps if c.startswith('sm_')
+  )
+  print('ok' if has_blackwell else 'incompatible')
+  # Torch verziót és CUDA index-et is logoljuk
+  import sys
+  print(f'torch={torch.__version__}', file=sys.stderr)
+  print(f'cuda={torch.version.cuda}', file=sys.stderr)
+  print(f'caps={caps}', file=sys.stderr)
+except ImportError:
+  print('no_torch')
+except Exception as e:
+  print(f'error:{e}')
+" 2>> "$LOGFILE")
+
+  log "INFO" "PyTorch Blackwell compat check: $compat"
+  [ "$compat" = "ok" ]
+}
+
+# _vllm_fix_pytorch_blackwell: PyTorch újratelepítése cu128 index-ről
+# Forrás: https://pytorch.org/get-started/locally/ (official)
+#   RTX 5090 SM_120 → cu128 vagy nightly szükséges
+# FIGYELEM: ~2-4 GB letöltés, 5-15 perc
+_vllm_fix_pytorch_blackwell() {
+  log "INFO" "PyTorch Blackwell fix indítás: cu128 wheel reinstall"
+
+  # cu128 PyTorch index — Blackwell sm_120 kernelekkel
+  local torch_index="https://download.pytorch.org/whl/cu128"
+  local fix_log="${SCRIPT_DIR}/wrapper_pytorch_fix_$(date +%H%M%S).log"
+
+  whiptail --msgbox "PyTorch Blackwell (SM_120) fix indítása\n\nA jelenlegi PyTorch csak sm_90-ig (Ada Lovelace) támogatott.\nRTX 5090 SM_120-hoz cu128 wheel kell.\n\nIndex: ${torch_index}\nLetöltés: ~2-4 GB\nIdő:  5-15 perc\n\nLog: ${fix_log}\n\nOK = indítás" 18 72
+
+  # Reinstall PyTorch cu128-cal — venv-ben, user kontextusban
+  # pip --force-reinstall: meglévő cu126 csomagok felülírása
+  sudo -u "$_REAL_USER" bash -c "
+    source '${AI_VENV_DIR}/bin/activate'
+    pip install torch torchvision torchaudio \
+      --index-url '${torch_index}' \
+      --force-reinstall \
+      2>&1 | tee '${fix_log}'
+  " &
+  local fix_pid=$!
+
+  # Progress gauge — pip output figyelés
+  (
+    local elapsed=0
+    while kill -0 "$fix_pid" 2>/dev/null; do
+      local pct last_line
+      last_line=$(tail -1 "$fix_log" 2>/dev/null | cut -c1-65)
+      # pip download progress: "  X%" formátum
+      pct=$(tail -5 "$fix_log" 2>/dev/null | grep -oP '\d+(?=%)' | tail -1)
+      [ -z "$pct" ] && pct=$(( elapsed * 60 / 600 ))
+      [ "$pct" -gt 95 ] && pct=95
+      printf 'XXX\n%d\n%dm%02ds  |  %s\nXXX\n' \
+        "$pct" "$(( elapsed/60 ))" "$(( elapsed%60 ))" \
+        "${last_line:-(várakozás...)}"
+      sleep 5; elapsed=$(( elapsed + 5 ))
+    done
+    echo 100
+  ) | whiptail --title "PyTorch Blackwell fix — cu128 reinstall" \
+      --gauge "$(printf 'torch + torchvision + torchaudio\nIndex: %s\nLog: %s\n\nESC = háttérbe' \
+        "$torch_index" "$fix_log")" \
+      12 76 0
+
+  wait "$fix_pid"
+  local exit_code=$?
+  cat "$fix_log" >> "$LOGFILE" 2>/dev/null
+
+  if [ $exit_code -eq 0 ]; then
+    # Ellenőrzés: most már ismeri-e sm_120-t?
+    if _vllm_check_pytorch_blackwell; then
+      log "INFO" "PyTorch Blackwell fix SIKERES — sm_120 most támogatott"
+      whiptail --msgbox "✓ PyTorch Blackwell fix kész!\n\nAz RTX 5090 (SM_120) mostantól kompatibilis.\nvLLM most már indítható." 12 60
+      infra_state_set "PYTORCH_INDEX" "cu128" 2>/dev/null || true
+    else
+      log "WARN" "PyTorch Blackwell fix: telepítés kész, de sm_120 még mindig nem látható"
+      whiptail --msgbox "⚠ PyTorch reinstall kész, de sm_120 ellenőrzés sikertelen.\nEllenőrizd a logot:\n  $fix_log\n\nPróbáld: source ~/venvs/ai/bin/activate && python -c \"import torch; print(torch.cuda.get_arch_list())\"" 14 72
+    fi
+  else
+    log "ERR" "PyTorch Blackwell fix SIKERTELEN (exit: $exit_code). Log: $fix_log"
+    whiptail --msgbox "✗ PyTorch reinstall sikertelen!\n\nLog: $fix_log\n\nManuálisan:\n  source ~/venvs/ai/bin/activate\n  pip install torch --index-url https://download.pytorch.org/whl/cu128 --force-reinstall" 16 72
+  fi
 }
 
 # _vllm_stop: vLLM szerver leállítása
@@ -1652,12 +1784,13 @@ _menu_vllm_control() {
     local choice
     choice=$(whiptail --title "vLLM szerver — RTX 5090 Blackwell" \
       --menu "Állapot: ${vllm_running_label}\ndtype: ${VLLM_DTYPE}  gpu-mem: ${VLLM_GPU_MEM_UTIL}  max-len: ${VLLM_MAX_MODEL_LEN}" \
-      18 76 6 \
+      20 76 7 \
       "1" "vLLM indítás (model megadással)" \
       "2" "vLLM leállítás" \
       "3" "vLLM állapot + logok megtekintése" \
       "4" "systemd service engedélyezés/tiltás" \
       "5" "Konfigurált paraméterek" \
+      "6" "⚠ PyTorch Blackwell fix (SM_120, cu128 reinstall)" \
       "0" "← Vissza" \
       3>&1 1>&2 2>&3) || return
 
@@ -1742,16 +1875,23 @@ _menu_vllm_control() {
   dtype:             ${VLLM_DTYPE}      (Blackwell SM_120 optimális)
   GPU mem utiliz.:   ${VLLM_GPU_MEM_UTIL}   (RTX 5090: ~28.8 GB)
   Max model len:     ${VLLM_MAX_MODEL_LEN} token
-  CPU swap:          ${VLLM_SWAP_SPACE} GiB
   Prefix caching:    $([ "$VLLM_ENABLE_PREFIX_CACHE" = "1" ] && echo ON || echo OFF)
 
   PID fájl:   ${VLLM_PID_FILE}
   Log fájl:   ${VLLM_LOG_FILE}
   vLLM bin:   ${VENV_VLLM}
 
+  PyTorch SM_120 compat: $(
+    _vllm_check_pytorch_blackwell 2>/dev/null && echo "✓ OK" || echo "✗ INKOMPATIBILIS — cu128 fix szükséges!")
+
   API: http://localhost:${VLLM_PORT}/v1/chat/completions
        http://localhost:${VLLM_PORT}/v1/models
-" 26 72
+" 28 72
+        ;;
+      6)
+        # PyTorch Blackwell fix — önálló menüponként is elérhető
+        # Ugyanaz mint amit _vllm_start() is felajánl inkompatibilitás esetén
+        _vllm_fix_pytorch_blackwell
         ;;
       0) return ;;
     esac
