@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# 02_local_ai_stack.sh — Lokális AI Stack v6.5
+# 02_local_ai_stack.sh — Lokális AI Stack v6.5.1
 #                        Ollama + vLLM + TurboQuant llama.cpp fork
 #
 # Szerepe az INFRA rendszerben
@@ -54,6 +54,25 @@
 #         a script VÉGÉN fut teljes re-check (show_result előtt),
 #         hogy a state mindig a TELEPÍTÉS UTÁNI valódi állapotot tükrözze
 #         (nem a pre-install állapotot, ami "missing"-nek mutatná az épp telepítettet)
+#
+# SZINKRONIZÁCIÓ v6.5.1 (2026-04-12 — CORE, 01a, 01b, 03 szálak alapján)
+# ─────────────────────────────────────────────────────────────────────────
+#   [NEW] infra_state_group_ts "INST_02" hívás SZEKCIÓ 12-ben:
+#         A 00_lib_state.sh v6.5 bevezette az infra_state_group_ts() függvényt.
+#         A 01a, 01b, 03 szálak mind hívják (→ INST_01A_TS, INST_01B_TS, INST_03_TS).
+#         A 02 NEM hívta → [02 — AI Stack] szekció NEM jelent meg időbélyeggel
+#         az infra_state_show() csoportos megjelenítésben. Most pótolva.
+#   [NEW] HW_VLLM_OK state fallback (SZEKCIÓ 3):
+#         Ha 02 közvetlenül fut (nem masterből), hw_detect() lehet hogy nem futott.
+#         HW_VLLM_OK változó hiányában ${HW_VLLM_OK} string expansion üreset ad.
+#         Fallback: infra_state_get "HW_VLLM_OK" → bash változóba → if parancs OK.
+#   [INFO] FEAT_VLLM kizárólagos felelőssége a 02-nek:
+#         A 01a v6.11 már NEM írja a FEAT_VLLM kulcsot (korábban írta).
+#         A 02 már eleve saját maga írja FEAT_VLLM-et — ez most a kanonikus viselkedés.
+#   [INFO] MOD_03_DONE megbízhatóbb (03 v6.5 BUG 3 FIX alapján):
+#         03 v6.5: MOD_03_DONE=true CSAK FAIL==0 esetén kerül beírásra.
+#         Korábban FAIL>0 esetén is true lehetett → infra_require("03") téves bypass.
+#         A 02-ben lévő infra_require("03") hívás most pontosabb eredményt kap.
 #
 # ELŐFELTÉTELEK
 # ─────────────
@@ -233,7 +252,14 @@ if ! $_hw_nvidia_ok; then
 fi
 log "HW" "NVIDIA GPU OK: profil=${HW_PROFILE} / arch=${HW_GPU_ARCH}"
 
-# ── 03-as modul függőség ellenőrzés ───────────────────────────────────────────
+# ── HW_VLLM_OK state fallback ─────────────────────────────────────────────────
+# [SYNC v6.5.1] Ha 02 közvetlenül fut (nem masterből: sudo bash 02_local_ai_stack.sh),
+# a hw_detect() lefut a lib betöltésekor, de ha a VLLM_OK nem lett exportálva
+# (pl. régebbi lib verzió), infra_state_get biztosítja a fallback értéket.
+# Az if ${HW_VLLM_OK} szintaxis bash true/false parancsot hajt végre → működik
+# ha a változó "true" vagy "false" string — infra_state_get ezt garantálja.
+HW_VLLM_OK="${HW_VLLM_OK:-$(infra_state_get "HW_VLLM_OK" "false")}"
+log "STATE" "HW_VLLM_OK=${HW_VLLM_OK} (vLLM GPU mód döntés)"
 # A 02-es script a 03-as által telepített pyenv + uv + venv-t IGÉNYLI.
 # infra_require() ellenőrzi a MOD_03_DONE=true flag-et az infra state-ben.
 # Ha nem kész: dialóg + log + exit 1.
@@ -1223,6 +1249,7 @@ fi
 infra_state_set "MOD_02_DONE" "true"
 
 # FEAT_VLLM frissítése az aktuális állapot alapján
+# [SYNC v6.5.1] A 01a v6.11 már NEM írja a FEAT_VLLM kulcsot — a 02 kizárólagos felelőssége.
 "${VENV_PY}" -c "import vllm" 2>/dev/null \
   && infra_state_set "FEAT_VLLM" "true" \
   || infra_state_set "FEAT_VLLM" "false"
@@ -1233,6 +1260,14 @@ if [ -z "$(infra_state_get "INST_OLLAMA_VER" "")" ] && command -v ollama &>/dev/
   [ -z "$_ov" ] && _ov=$(ollama --version 2>/dev/null | grep -oP '\d+\.\d+\.\d+' | head -1)
   infra_state_set "INST_OLLAMA_VER" "${_ov:-telepítve}"
 fi
+
+# [SYNC v6.5.1] infra_state_group_ts "INST_02" — 01a/01b/03 konzisztencia
+# A 00_lib_state.sh v6.5 infra_state_show() "── [02 — AI Stack] ──" szekciója
+# csak akkor mutat timestampot, ha INST_02_TS jelen van (00_lib_state.sh séma).
+# A 01a INST_01A_TS-t, a 01b INST_01B_TS-t, a 03 INST_03_TS-t ír (v6.5).
+# A 02 eddig NEM hívta → az AI Stack szekció timestamp nélkül jelent meg.
+infra_state_group_ts "INST_02"
+log "STATE" "INST_02_TS írva — state szekció timestamp (01a/01b/03 konzisztencia)"
 
 # State konzisztencia validáció
 infra_state_validate
