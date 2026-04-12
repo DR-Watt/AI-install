@@ -538,6 +538,119 @@ _vllm_stop() {
   log "INFO" "vLLM leállítva"
 }
 
+# _vllm_wait_progress: vLLM betöltés figyelő — whiptail gauge-zal
+# Háttérben futó vLLM process logját olvasva mutat progress bar-t.
+# A vLLM tqdm kimenetéből parse-olja a %-ot (letöltés + VRAM betöltés).
+# ESC = gauge bezárása, vLLM fut tovább háttérben.
+#
+# Forrás: vLLM tqdm formátum:
+#   "Downloading shards: 45%|████..."  → letöltési fázis
+#   "Loading weights: 78%|████..."     → VRAM betöltési fázis
+#   Port :8000 megnyílt → API kész
+#
+# Paraméterek: $1=modell neve, $2=process PID, $3=timeout mp (default: 720)
+# Visszatér: 0 ha port megnyílt (API kész), 1 ha timeout/kilép/hiba
+_vllm_wait_progress() {
+  local model="$1"
+  local pid="$2"
+  local max_wait="${3:-720}"  # 12 perc default (nagy modelleknél hosszabb)
+
+  # Monitoring subshell → whiptail gauge stdin-re ír
+  # Formátum: "XXX\nN\nszöveg\nXXX\n" → % + szöveg frissítés
+  (
+    local elapsed=0
+    local display_pct=0
+    local phase="inicializálás"
+
+    while [ "$elapsed" -lt "$max_wait" ]; do
+
+      # ── 1. Port megnyílt → API kész ──────────────────────────────────────
+      if ss -tlnp 2>/dev/null | grep -q ":${VLLM_PORT}\b"; then
+        printf 'XXX\n100\n✓ API kész! http://localhost:%d/v1\nXXX\n' "$VLLM_PORT"
+        sleep 1
+        echo 100
+        return 0
+      fi
+
+      # ── 2. Process meghalt → hiba ─────────────────────────────────────────
+      if ! kill -0 "$pid" 2>/dev/null; then
+        printf 'XXX\n100\n✗ vLLM process leállt — ellenőrizd a logot!\nXXX\n'
+        sleep 2
+        echo 100
+        return 1
+      fi
+
+      # ── 3. tqdm % kinyerése a log fájlból ─────────────────────────────────
+      # vLLM ANSI escape kódokat ír (\r visszaírással frissíti a sort)
+      # sed: ANSI escape + CR eltávolítása, majd % keresés
+      local raw_log last_log_line tqdm_pct
+      raw_log=$(tail -40 "$VLLM_LOG_FILE" 2>/dev/null)
+      last_log_line=$(echo "$raw_log" | \
+        sed 's/\x1B\[[0-9;]*[mK]//g; s/\r/\n/g' | \
+        grep -v '^$' | tail -1 | cut -c1-65)
+
+      # % keresés: "45%|" vagy "45%" formátum
+      tqdm_pct=$(echo "$raw_log" | \
+        sed 's/\x1B\[[0-9;]*[mK]//g; s/\r/\n/g' | \
+        grep -oP '\b\d{1,3}(?=%)' | \
+        awk '$1+0 >= 0 && $1+0 <= 100' | \
+        tail -1)
+
+      # Fázis meghatározás a log alapján
+      if echo "$raw_log" | grep -qi "downloading"; then
+        phase="letöltés"
+      elif echo "$raw_log" | grep -qi "loading weights\|loading model"; then
+        phase="VRAM betöltés"
+      elif echo "$raw_log" | grep -qi "warming up\|initializ"; then
+        phase="inicializálás"
+      fi
+
+      # Progress % számítás
+      if [ -n "$tqdm_pct" ] && [[ "$tqdm_pct" =~ ^[0-9]+$ ]]; then
+        display_pct="$tqdm_pct"
+        # Ha VRAM betöltés fázisban vagyunk, 50%+tqdm/2 skálázás
+        # (letöltés 0-50%, betöltés 50-99%)
+        if echo "$raw_log" | grep -qi "loading weights"; then
+          display_pct=$(( 50 + tqdm_pct / 2 ))
+        fi
+      else
+        # Fake lineáris progress: 0→45% az első 240s-ban (letöltési fázis)
+        display_pct=$(( elapsed * 45 / 240 ))
+        [ "$display_pct" -gt 45 ] && display_pct=45
+      fi
+
+      # Elapsed idő formázás
+      local elapsed_min elapsed_sec
+      elapsed_min=$(( elapsed / 60 ))
+      elapsed_sec=$(( elapsed % 60 ))
+
+      # Gauge frissítés
+      printf 'XXX\n%d\n[%s] %dm%02ds  |  %s\nXXX\n' \
+        "$display_pct" \
+        "$phase" \
+        "$elapsed_min" "$elapsed_sec" \
+        "${last_log_line:-(log üres, várakozás...)}"
+
+      sleep 5
+      elapsed=$(( elapsed + 5 ))
+    done
+
+    # Timeout elérve — process valószínűleg még fut, de nagyon lassú
+    printf 'XXX\n90\nTimeout (%ds) — vLLM process él, port még nem nyílt meg.\nXXX\n' \
+      "$max_wait"
+    sleep 2
+    echo 100
+    return 1
+  ) | whiptail \
+      --title "vLLM betöltés — RTX 5090 Blackwell SM_120" \
+      --gauge "$(printf 'Modell: %s\nLog:    %s\n\nESC = háttérbe küldés (vLLM fut tovább)\n' \
+        "$model" "$VLLM_LOG_FILE")" \
+      14 76 0
+
+  # ESC vagy gauge vége → ellenőrzés: nyílt-e meg a port?
+  ss -tlnp 2>/dev/null | grep -q ":${VLLM_PORT}\b"
+}
+
 # _vllm_status_text: vLLM szerver állapot szöveges összefoglaló
 _vllm_status_text() {
   if _is_vllm_running; then
@@ -1388,7 +1501,18 @@ _menu_vllm_control() {
         esac
         [ -z "$model" ] && continue
         if _vllm_start "$model"; then
-          whiptail --msgbox "vLLM process elindult háttérben!\n\nModell: $model\n\n⚠ FONTOS: Ha a modell még nem volt letöltve,\na vLLM most tölti le (~GB). Ez 2-15 percig tarthat.\nKözben NE indíts más nagy alkalmazást!\n\nEllenőrzés:\n  tail -f ${VLLM_LOG_FILE}\n\nAmikor kész → Backend váltó menüben\nállítsd be a CLINE/Continue-t." 22 68
+          # vLLM process elindult → progress gauge megjelenítése
+          # A gauge a log fájlból olvassa a tqdm %-ot és frissíti magát
+          # ESC megnyomásával a gauge bezárul, vLLM fut tovább háttérben
+          local vllm_pid
+          vllm_pid=$(cat "$VLLM_PID_FILE" 2>/dev/null)
+          if _vllm_wait_progress "$model" "$vllm_pid" 720; then
+            # Port megnyílt → API kész
+            whiptail --msgbox "✓ vLLM API kész!\n\nModell: $model\nEndpoint: http://localhost:${VLLM_PORT}/v1\n\nBackend váltó menüben állítsd be a CLINE/Continue-t." 14 68
+          else
+            # ESC vagy timeout — process él, API még nem elérhető
+            whiptail --msgbox "vLLM process fut, API még nem elérhető.\n\nFolytatódik háttérben. Ellenőrzés:\n  tail -f ${VLLM_LOG_FILE}\n\nvLLM állapot menüpontban látod ha kész." 14 70
+          fi
         else
           whiptail --msgbox "vLLM indítás SIKERTELEN!\n\nLog: ${VLLM_LOG_FILE}\n\n$(tail -8 "$VLLM_LOG_FILE" 2>/dev/null)" 20 74
         fi
