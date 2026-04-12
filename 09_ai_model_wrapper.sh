@@ -887,6 +887,180 @@ for line in sys.stdin:
 }
 
 # =============================================================================
+# MODELL BÖNGÉSZŐ SEGÉDFÜGGVÉNYEK
+# =============================================================================
+
+# _ollama_model_radiolist: telepített Ollama modellek radiolist-je MÉRETEKKEL
+# A betöltés és VRAM ürítés menükben használja — a felhasználó látja a GB-okat
+# Kimenet: stdout-ra írja a kiválasztott modell NEVÉT (méret nélkül)
+# Paraméterek: $1=title, $2=prompt
+_ollama_model_radiolist() {
+  local title="${1:-Modell választás}"
+  local prompt="${2:-Válaszd a modellt (SPACE = jelöl, ENTER = OK):}"
+
+  # Modellek lekérése mérettel együtt — GET /api/tags
+  # Forrás: https://ollama.readthedocs.io/en/api/ (official)
+  local raw_json
+  raw_json=$(_ollama_api GET "/api/tags")
+  if [ -z "$raw_json" ]; then
+    whiptail --msgbox "Ollama API nem elérhető!\n(Fut-e az ollama service?)" 10 50
+    echo ""; return 1
+  fi
+
+  # Két párhuzamos tömb: clean_names (csak név) + label_names (név + méret)
+  local clean_names=() label_names=()
+  while IFS=$'\t' read -r name label; do
+    clean_names+=("$name")
+    label_names+=("$label")
+  done < <(echo "$raw_json" | python3 -c "
+import json, sys
+try:
+  data = json.load(sys.stdin)
+  for m in data.get('models', []):
+    sz_gb = m.get('size', 0) / 1e9
+    # Tab-elválasztott: tiszta_név\tcimke
+    print(f\"{m['name']}\t{m['name']}  ({sz_gb:.1f} GB)\")
+except: pass
+" 2>/dev/null)
+
+  if [ ${#clean_names[@]} -eq 0 ]; then
+    whiptail --msgbox "Nincs telepített Ollama modell!\nHasználd a 'Letöltés' opciót." 10 50
+    echo ""; return 1
+  fi
+
+  # Radiolist összeállítás: index "név  (X.X GB)" OFF
+  local menu_items=()
+  for ((i=0; i<${#clean_names[@]}; i++)); do
+    menu_items+=("$((i+1))" "${label_names[$i]}" "OFF")
+  done
+
+  local sel_idx
+  sel_idx=$(whiptail --title "$title" \
+    --radiolist "$prompt" \
+    22 72 "${#clean_names[@]}" \
+    "${menu_items[@]}" \
+    3>&1 1>&2 2>&3) || { echo ""; return 1; }
+
+  # Csak a tiszta nevet adjuk vissza (méret nélkül)
+  echo "${clean_names[$((sel_idx-1))]}"
+}
+
+# _popular_model_browse: népszerű modellek katalógusa letöltéshez
+# Kategóriák: code (kódgenerálás), chat (általános), embed (RAG), reason (érvelés)
+# A lista tartalmazza a 2025-2026-ban legelterjedtebb Ollama-kompatibilis modelleket
+# Paraméter: $1=szűrő kategória (all|code|chat|embed|reason), alapért.: all
+# Kimenet: stdout-ra írja a kiválasztott modell nevét, vagy "" ha cancel/egyedi
+_popular_model_browse() {
+  local filter="${1:-all}"
+
+  # Kuráló lista: "ollama_name" "leírás" "kategória"
+  # Forrás: ollama.com/library (official modell katalógus)
+  local -a _cat _name _desc
+  _name+=("qwen2.5-coder:1.5b");      _desc+=("[KÓD]   Qwen2.5 Coder 1.5B  — tab-autocomplete, gyors (1.0 GB)");  _cat+=("code")
+  _name+=("qwen2.5-coder:7b");        _desc+=("[KÓD]   Qwen2.5 Coder 7B    — ajánlott kódassistens (4.7 GB)");     _cat+=("code")
+  _name+=("qwen2.5-coder:14b");       _desc+=("[KÓD]   Qwen2.5 Coder 14B   — erős kódgenerálás (9.0 GB)");         _cat+=("code")
+  _name+=("qwen2.5-coder:32b");       _desc+=("[KÓD]   Qwen2.5 Coder 32B   — SOTA kód, RTX 5090 (19 GB)");         _cat+=("code")
+  _name+=("deepseek-coder-v2:16b");   _desc+=("[KÓD]   DeepSeek Coder V2 16B — MoE, gyors (8.9 GB)");              _cat+=("code")
+  _name+=("codestral:22b");           _desc+=("[KÓD]   Codestral 22B        — Mistral kódmodell (13 GB)");          _cat+=("code")
+  _name+=("qwen2.5:7b");              _desc+=("[CHAT]  Qwen2.5 7B            — általános chat (4.7 GB)");            _cat+=("chat")
+  _name+=("qwen2.5:14b");             _desc+=("[CHAT]  Qwen2.5 14B           — erős általános (9.0 GB)");            _cat+=("chat")
+  _name+=("qwen2.5:32b");             _desc+=("[CHAT]  Qwen2.5 32B           — nagy általános (19 GB)");             _cat+=("chat")
+  _name+=("llama3.3:70b");            _desc+=("[CHAT]  Llama 3.3 70B         — Meta flagship (42 GB)");              _cat+=("chat")
+  _name+=("mistral:7b");              _desc+=("[CHAT]  Mistral 7B             — gyors, megbízható (4.1 GB)");        _cat+=("chat")
+  _name+=("gemma3:12b");              _desc+=("[CHAT]  Gemma 3 12B            — Google, hatékony (8.1 GB)");         _cat+=("chat")
+  _name+=("deepseek-r1:7b");          _desc+=("[REASON] DeepSeek R1 7B       — chain-of-thought (4.7 GB)");          _cat+=("reason")
+  _name+=("deepseek-r1:14b");         _desc+=("[REASON] DeepSeek R1 14B      — erős érvelő (9.0 GB)");               _cat+=("reason")
+  _name+=("deepseek-r1:32b");         _desc+=("[REASON] DeepSeek R1 32B      — SOTA reasoning (19 GB)");             _cat+=("reason")
+  _name+=("nomic-embed-text");        _desc+=("[EMBED] Nomic Embed Text       — RAG, Continue.dev (0.3 GB)");        _cat+=("embed")
+  _name+=("mxbai-embed-large");       _desc+=("[EMBED] MxBAI Embed Large      — RAG, nagy dimenzió (0.7 GB)");      _cat+=("embed")
+  _name+=("bge-m3");                  _desc+=("[EMBED] BGE-M3                 — multilingual RAG (1.2 GB)");        _cat+=("embed")
+
+  # Szűrés kategória szerint
+  local menu_items=() filtered_names=()
+  local idx=1
+  for ((i=0; i<${#_name[@]}; i++)); do
+    [ "$filter" != "all" ] && [ "${_cat[$i]}" != "$filter" ] && continue
+    menu_items+=("$idx" "${_desc[$i]}" "OFF")
+    filtered_names+=("${_name[$i]}")
+    ((idx++))
+  done
+
+  # Kategória szűrő menü elején
+  local cat_choice
+  cat_choice=$(whiptail --title "Modell katalógus" \
+    --menu "Modell kategória szűrő:" 14 65 5 \
+    "1" "Összes modell megjelenítése" \
+    "2" "Csak kódgenerálás [KÓD]" \
+    "3" "Csak chat modellek [CHAT]" \
+    "4" "Csak érvelő modellek [REASON]" \
+    "5" "Csak embedding modellek [EMBED]" \
+    3>&1 1>&2 2>&3) || { echo "CANCEL"; return 1; }
+
+  case "$cat_choice" in
+    1) _popular_model_browse "all"; return $? ;;
+    2) [ "$filter" != "code"   ] && { _popular_model_browse "code";   return $?; } ;;
+    3) [ "$filter" != "chat"   ] && { _popular_model_browse "chat";   return $?; } ;;
+    4) [ "$filter" != "reason" ] && { _popular_model_browse "reason"; return $?; } ;;
+    5) [ "$filter" != "embed"  ] && { _popular_model_browse "embed";  return $?; } ;;
+  esac
+
+  # Tényleges modell választó lista
+  local sel_idx
+  sel_idx=$(whiptail --title "Modell katalógus — ${filter}" \
+    --radiolist "Válassz modellt (SPACE=jelöl, ENTER=OK):" \
+    24 80 "${#filtered_names[@]}" \
+    "${menu_items[@]}" \
+    3>&1 1>&2 2>&3) || { echo "CANCEL"; return 1; }
+
+  echo "${filtered_names[$((sel_idx-1))]}"
+}
+
+# _vllm_model_browse: vLLM-hez ajánlott HuggingFace modellek katalógusa
+# vLLM HuggingFace formátumot vár — ezek az Ollama nevektől eltérhetnek
+# A lista a HF Hub model ID-kat tartalmazza (vllm serve MODEL_ID)
+_vllm_model_browse() {
+  # HuggingFace model ID-k vLLM-hez optimalizált modellek
+  # Forrás: docs.vllm.ai supported models lista (official)
+  local menu_items=(
+    "1"  "[KÓD-7B]   Qwen/Qwen2.5-Coder-7B-Instruct     (4.7 GB, VRAM~8GB)"    "OFF"
+    "2"  "[KÓD-14B]  Qwen/Qwen2.5-Coder-14B-Instruct     (9 GB, VRAM~14GB)"     "OFF"
+    "3"  "[KÓD-32B]  Qwen/Qwen2.5-Coder-32B-Instruct     (19 GB, VRAM~25GB)"    "OFF"
+    "4"  "[CHAT-7B]  Qwen/Qwen2.5-7B-Instruct            (4.7 GB, VRAM~8GB)"    "OFF"
+    "5"  "[CHAT-14B] Qwen/Qwen2.5-14B-Instruct           (9 GB, VRAM~14GB)"     "OFF"
+    "6"  "[CHAT-32B] Qwen/Qwen2.5-32B-Instruct           (19 GB, VRAM~25GB)"    "OFF"
+    "7"  "[REASON]   deepseek-ai/DeepSeek-R1-Distill-Qwen-7B  (4.7 GB)"         "OFF"
+    "8"  "[REASON]   deepseek-ai/DeepSeek-R1-Distill-Qwen-14B (9 GB)"           "OFF"
+    "9"  "[CODE]     deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct (8.9 GB)"      "OFF"
+    "10" "[CHAT]     mistralai/Mistral-7B-Instruct-v0.3  (4.1 GB, VRAM~6GB)"    "OFF"
+    "11" "[CHAT]     google/gemma-3-12b-it                (8.1 GB, VRAM~12GB)"   "OFF"
+    "12" "[CHAT-70B] meta-llama/Llama-3.3-70B-Instruct   (42 GB — RTX 5090!)"   "OFF"
+  )
+  local hf_ids=(
+    "Qwen/Qwen2.5-Coder-7B-Instruct"
+    "Qwen/Qwen2.5-Coder-14B-Instruct"
+    "Qwen/Qwen2.5-Coder-32B-Instruct"
+    "Qwen/Qwen2.5-7B-Instruct"
+    "Qwen/Qwen2.5-14B-Instruct"
+    "Qwen/Qwen2.5-32B-Instruct"
+    "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
+    "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B"
+    "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct"
+    "mistralai/Mistral-7B-Instruct-v0.3"
+    "google/gemma-3-12b-it"
+    "meta-llama/Llama-3.3-70B-Instruct"
+  )
+
+  local sel_idx
+  sel_idx=$(whiptail --title "vLLM modell katalógus (HuggingFace)" \
+    --radiolist "vLLM HuggingFace modellek — RTX 5090 optimalizált:" \
+    24 82 "${#hf_ids[@]}" \
+    "${menu_items[@]}" \
+    3>&1 1>&2 2>&3) || { echo "CANCEL"; return 1; }
+
+  echo "${hf_ids[$((sel_idx-1))]}"
+}
+
+# =============================================================================
 # MENÜ RENDSZER
 # =============================================================================
 
@@ -902,42 +1076,29 @@ _menu_model_manager() {
     local choice
     choice=$(whiptail --title "AI Model Manager — Ollama modellek" \
       --menu "Telepített modellek:\n${installed_list}\n\nBetöltve (VRAM):\n${running_list}" \
-      22 76 7 \
-      "1" "Modell betöltés VRAM-ba" \
+      22 76 5 \
+      "1" "Modell betöltés VRAM-ba (méretekkel)" \
       "2" "Modell kiürítés VRAM-ból" \
-      "3" "Új modell letöltése (ollama pull)" \
-      "4" "Modellek részletes listája" \
+      "3" "Új modell letöltése (katalógus / kézi)" \
+      "4" "Letöltött modellek listája (ollama list)" \
       "0" "← Vissza" \
       3>&1 1>&2 2>&3) || return
 
     case "$choice" in
       1)
-        # Betöltendő modell választás
-        local model_list
-        mapfile -t model_list < <(_ollama_list_installed 2>/dev/null | awk '{print $1}')
-        if [ ${#model_list[@]} -eq 0 ]; then
-          whiptail --msgbox "Nincs telepített modell!\nHasználd a 'Letöltés' opciót." 10 50
-          continue
-        fi
-        # Whiptail radiolist a modellek közül
-        local menu_items=()
-        local i=1
-        for m in "${model_list[@]}"; do
-          menu_items+=("$i" "$m" "OFF")
-          ((i++))
-        done
-        local sel_idx
-        sel_idx=$(whiptail --title "Modell betöltés" \
-          --radiolist "Válaszd a betöltendő modellt (SPACE = jelöl, ENTER = OK):" \
-          20 70 "${#model_list[@]}" \
-          "${menu_items[@]}" \
-          3>&1 1>&2 2>&3) || continue
-        local sel_model="${model_list[$((sel_idx-1))]}"
+        # Betöltendő modell választás méretekkel — _ollama_model_radiolist segédfüggvény
+        # A függvény GET /api/tags alapján lista + méret GB-ban, csak nevet ad vissza
+        local sel_model
+        sel_model=$(_ollama_model_radiolist \
+          "Modell betöltés VRAM-ba" \
+          "Válaszd a betöltendő modellt (SPACE = jelöl, ENTER = OK):")
+        [ -z "$sel_model" ] && continue
         _ollama_load_model "$sel_model"
         whiptail --msgbox "Betöltve: ${sel_model}\n\nA modell a VRAM-ban marad (keep_alive=-1)." 10 60
         ;;
       2)
-        local running_models
+        # VRAM-ban lévő modellek listája méretekkel
+        local running_models running_vrams
         mapfile -t running_models < <(
           _ollama_api GET "/api/ps" | python3 -c "
 import json,sys
@@ -946,20 +1107,26 @@ try:
   for m in d.get('models',[]): print(m['name'])
 except: pass
 " 2>/dev/null)
+        mapfile -t running_vrams < <(
+          _ollama_api GET "/api/ps" | python3 -c "
+import json,sys
+try:
+  d=json.load(sys.stdin)
+  for m in d.get('models',[]): print(f\"{m['name']}  VRAM: {m.get('size_vram',0)/1e9:.1f} GB\")
+except: pass
+" 2>/dev/null)
         if [ ${#running_models[@]} -eq 0 ]; then
           whiptail --msgbox "Nincs VRAM-ban lévő modell." 8 50
           continue
         fi
         local menu_items=()
-        local i=1
-        for m in "${running_models[@]}"; do
-          menu_items+=("$i" "$m" "OFF")
-          ((i++))
+        for ((i=0; i<${#running_models[@]}; i++)); do
+          menu_items+=("$((i+1))" "${running_vrams[$i]:-${running_models[$i]}}" "OFF")
         done
         local sel_idx
         sel_idx=$(whiptail --title "VRAM ürítés" \
           --radiolist "Válaszd az eltávolítandó modellt:" \
-          16 70 "${#running_models[@]}" \
+          18 76 "${#running_models[@]}" \
           "${menu_items[@]}" \
           3>&1 1>&2 2>&3) || continue
         local sel_model="${running_models[$((sel_idx-1))]}"
@@ -967,18 +1134,44 @@ except: pass
         whiptail --msgbox "VRAM-ból eltávolítva: ${sel_model}" 8 60
         ;;
       3)
-        local model_name
-        model_name=$(whiptail --title "Ollama pull" \
-          --inputbox "Modell neve (pl. qwen2.5-coder:7b, llama3.3:70b):" \
-          10 60 "" 3>&1 1>&2 2>&3) || continue
+        # Modell letöltése: katalógusból böngészés VAGY kézi bevitel
+        local pull_choice
+        pull_choice=$(whiptail --title "Modell letöltés" \
+          --menu "Hogyan választasz modellt?" 12 65 3 \
+          "1" "Katalógusból böngészés (ajánlott modellek)" \
+          "2" "Kézi bevitel (ollama modell neve)" \
+          "0" "← Vissza" \
+          3>&1 1>&2 2>&3) || continue
+
+        local model_name=""
+        case "$pull_choice" in
+          1)
+            # Népszerű modellek katalógusa kategória szűrővel
+            # _popular_model_browse: ollama.com/library alapján kuráló lista
+            model_name=$(_popular_model_browse "all")
+            # Ha katalógusból cancel → kézi bevitelre kínáljuk
+            if [ "$model_name" = "CANCEL" ] || [ -z "$model_name" ]; then
+              model_name=$(whiptail --title "Ollama pull — kézi bevitel" \
+                --inputbox "Modell neve (pl. qwen2.5-coder:7b, llama3.3:70b):" \
+                10 65 "" 3>&1 1>&2 2>&3) || continue
+            fi
+            ;;
+          2)
+            model_name=$(whiptail --title "Ollama pull — kézi bevitel" \
+              --inputbox "Modell neve (pl. qwen2.5-coder:7b, llama3.3:70b):" \
+              10 65 "" 3>&1 1>&2 2>&3) || continue
+            ;;
+          0) continue ;;
+        esac
         [ -z "$model_name" ] && continue
         _ollama_pull_model "$model_name"
         ;;
       4)
+        # Letöltött modellek részletes listája — 'ollama list' kimenet
         local full_list
-        full_list=$(sudo -u "$_REAL_USER" ollama list 2>/dev/null || echo "Hiba")
-        whiptail --title "Ollama modellek" \
-          --scrolltext --msgbox "$full_list" 20 76
+        full_list=$(sudo -u "$_REAL_USER" ollama list 2>/dev/null || echo "Hiba: ollama list futtatása sikertelen")
+        whiptail --title "Letöltött modellek (ollama list)" \
+          --scrolltext --msgbox "$full_list" 22 80
         ;;
       0) return ;;
     esac
@@ -1017,10 +1210,25 @@ except: print('?')
 
     case "$choice" in
       1)
+        # Ollama backend: telepített modellek radiolistából VAGY katalógusból
         local model
-        model=$(whiptail --title "Ollama modell" \
-          --inputbox "Ollama modell neve:" 10 60 \
-          "$OLLAMA_DEFAULT_CODE_MODEL" 3>&1 1>&2 2>&3) || continue
+        local src_choice
+        src_choice=$(whiptail --title "Ollama modell kiválasztás" \
+          --menu "Honnan választasz modellt?" 12 65 3 \
+          "1" "Telepített modellek listájából (méretekkel)" \
+          "2" "Katalógusból böngészés (ajánlott modellek)" \
+          "3" "Kézi bevitel" \
+          3>&1 1>&2 2>&3) || continue
+        case "$src_choice" in
+          1) model=$(_ollama_model_radiolist "Ollama backend modell" \
+               "CLINE/Continue modell kiválasztása:") ;;
+          2) model=$(_popular_model_browse "code")
+             [ "$model" = "CANCEL" ] && model="" ;;
+          3) model=$(whiptail --title "Ollama modell" \
+               --inputbox "Ollama modell neve:" 10 60 \
+               "$OLLAMA_DEFAULT_CODE_MODEL" 3>&1 1>&2 2>&3) || continue ;;
+        esac
+        [ -z "$model" ] && continue
         _ide_switch_backend "ollama" "$model"
         whiptail --msgbox "CLINE + Continue.dev → Ollama backend\nModell: $model\n\nIndítsd újra a VS Code-ot!" 12 60
         ;;
@@ -1029,27 +1237,71 @@ except: print('?')
           whiptail --msgbox "vLLM nem fut!\nIndítsd el előbb a vLLM szerver almenüből." 10 55
           continue
         fi
+        # vLLM backend: futó modellek lekérdezése VAGY manuális megadás
         local model
-        model=$(whiptail --title "vLLM modell" \
-          --inputbox "vLLM szerver model ID-ja:" 10 60 "" 3>&1 1>&2 2>&3) || continue
+        local vllm_served
+        vllm_served=$(curl -s --connect-timeout 3 \
+          "http://localhost:${VLLM_PORT}/v1/models" 2>/dev/null | \
+          python3 -c "
+import json,sys
+try:
+  d=json.load(sys.stdin)
+  for m in d.get('data',[]): print(m['id'])
+except: pass
+" 2>/dev/null)
+        if [ -n "$vllm_served" ]; then
+          # vLLM fut és van betöltött modell → automatikusan vesszük
+          model=$(echo "$vllm_served" | head -1)
+          whiptail --msgbox "vLLM futó modell automatikusan detektálva:\n${model}" 10 65
+        else
+          # Nincs futó modell → browse
+          model=$(_vllm_model_browse)
+          [ "$model" = "CANCEL" ] || [ -z "$model" ] && \
+            model=$(whiptail --title "vLLM modell ID" \
+              --inputbox "HuggingFace model ID:" 10 65 "" 3>&1 1>&2 2>&3) || continue
+        fi
+        [ -z "$model" ] && continue
         _ide_switch_backend "vllm" "$model"
-        whiptail --msgbox "CLINE + Continue.dev → vLLM backend\nEndpoint: http://localhost:${VLLM_PORT}/v1\n\nIndítsd újra a VS Code-ot!" 12 60
+        whiptail --msgbox "CLINE + Continue.dev → vLLM backend\nEndpoint: http://localhost:${VLLM_PORT}/v1\nModell: $model\n\nIndítsd újra a VS Code-ot!" 14 65
         ;;
       3)
-        # Gyors Ollama model váltás (csak CLINE)
+        # Gyors CLINE Ollama model frissítés — radiolist + katalógus opció
         local model
-        model=$(whiptail --title "CLINE Ollama modell" \
-          --inputbox "Új Ollama kód modell:" 10 60 \
-          "$OLLAMA_DEFAULT_CODE_MODEL" 3>&1 1>&2 2>&3) || continue
+        local src_choice
+        src_choice=$(whiptail --title "CLINE modell" \
+          --menu "Honnan választasz?" 11 60 3 \
+          "1" "Telepített modellek (méretekkel)" \
+          "2" "Katalógusból" \
+          "3" "Kézi bevitel" \
+          3>&1 1>&2 2>&3) || continue
+        case "$src_choice" in
+          1) model=$(_ollama_model_radiolist "CLINE kód modell" "Válaszd a CLINE modellt:") ;;
+          2) model=$(_popular_model_browse "code"); [ "$model" = "CANCEL" ] && model="" ;;
+          3) model=$(whiptail --title "CLINE modell" --inputbox "Ollama modell neve:" \
+               10 60 "$OLLAMA_DEFAULT_CODE_MODEL" 3>&1 1>&2 2>&3) || continue ;;
+        esac
+        [ -z "$model" ] && continue
         _ide_config_cline_ollama "$model"
-        whiptail --msgbox "CLINE modell frissítve: $model\n(VS Code újraindítás szükséges)" 10 55
+        whiptail --msgbox "CLINE modell frissítve: $model\n(VS Code újraindítás szükséges)" 10 60
         ;;
       4)
+        # vLLM CLINE modell — browse vagy kézi
         local model
-        model=$(whiptail --title "vLLM modell" \
-          --inputbox "vLLM model ID (HF formátum):" 10 60 "" 3>&1 1>&2 2>&3) || continue
+        local src_choice
+        src_choice=$(whiptail --title "vLLM modell" \
+          --menu "Honnan választasz?" 10 60 2 \
+          "1" "vLLM modell katalógus (HuggingFace)" \
+          "2" "Kézi HF model ID bevitel" \
+          3>&1 1>&2 2>&3) || continue
+        case "$src_choice" in
+          1) model=$(_vllm_model_browse); [ "$model" = "CANCEL" ] && model="" ;;
+          2) model=$(whiptail --title "vLLM modell ID" \
+               --inputbox "HuggingFace model ID (pl. Qwen/Qwen2.5-Coder-7B-Instruct):" \
+               10 72 "" 3>&1 1>&2 2>&3) || continue ;;
+        esac
+        [ -z "$model" ] && continue
         _ide_config_cline_vllm "$model"
-        whiptail --msgbox "CLINE → vLLM backend, modell: $model\n(VS Code újraindítás szükséges)" 10 55
+        whiptail --msgbox "CLINE → vLLM backend\nModell: $model\n(VS Code újraindítás szükséges)" 11 65
         ;;
       0) return ;;
     esac
@@ -1076,13 +1328,34 @@ _menu_vllm_control() {
 
     case "$choice" in
       1)
-        local model
-        model=$(whiptail --title "vLLM modell" \
-          --inputbox "HuggingFace model ID vagy lokális útvonal:\n(pl. Qwen/Qwen2.5-Coder-7B-Instruct)" \
-          12 72 "" 3>&1 1>&2 2>&3) || continue
+        # vLLM indítás: katalógusból browse VAGY kézi HF ID megadás
+        local model src_choice
+        src_choice=$(whiptail --title "vLLM modell kiválasztás" \
+          --menu "Honnan választasz modellt?" 12 70 3 \
+          "1" "vLLM modell katalógus (HuggingFace, ajánlott)" \
+          "2" "Kézi HuggingFace model ID bevitel" \
+          "0" "← Vissza" \
+          3>&1 1>&2 2>&3) || continue
+        case "$src_choice" in
+          1)
+            model=$(_vllm_model_browse)
+            # Ha katalógusból cancel → kézi bevitelre felajánlás
+            if [ "$model" = "CANCEL" ] || [ -z "$model" ]; then
+              model=$(whiptail --title "vLLM modell — kézi bevitel" \
+                --inputbox "HuggingFace model ID:\n(pl. Qwen/Qwen2.5-Coder-7B-Instruct)" \
+                12 72 "" 3>&1 1>&2 2>&3) || continue
+            fi
+            ;;
+          2)
+            model=$(whiptail --title "vLLM modell — kézi bevitel" \
+              --inputbox "HuggingFace model ID:\n(pl. Qwen/Qwen2.5-Coder-7B-Instruct)" \
+              12 72 "" 3>&1 1>&2 2>&3) || continue
+            ;;
+          0) continue ;;
+        esac
         [ -z "$model" ] && continue
         if _vllm_start "$model"; then
-          whiptail --msgbox "vLLM elindult!\nAPI: http://localhost:${VLLM_PORT}/v1\n\nCLINE/Continue konfig frissítéséhez\nhasználd a 'Backend váltó' menüt!" 14 60
+          whiptail --msgbox "vLLM elindult!\nModell: $model\nAPI: http://localhost:${VLLM_PORT}/v1\n\nCLINE/Continue konfig frissítéséhez\nhasználd a 'Backend váltó' menüt!" 16 65
         else
           whiptail --msgbox "vLLM indítás SIKERTELEN\nLog: ${VLLM_LOG_FILE}\n\n$(tail -5 "$VLLM_LOG_FILE" 2>/dev/null)" 16 72
         fi
