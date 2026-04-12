@@ -109,7 +109,7 @@ readonly VLLM_PORT=8000
 readonly VLLM_DTYPE="bfloat16"         # Blackwell SM_120 optimális
 readonly VLLM_GPU_MEM_UTIL="0.90"      # 90% VRAM → RTX 5090 32GB-ból ~28.8GB
 readonly VLLM_MAX_MODEL_LEN=16384      # context length (csökkentsd ha OOM)
-readonly VLLM_SWAP_SPACE=4             # CPU swap GiB vLLM preemption-hoz
+# NOTA: --swap-space eltávolítva — vLLM 0.19.0-ban nem létezik ez a flag
 readonly VLLM_ENABLE_PREFIX_CACHE=1    # --enable-prefix-caching flag
 # PID fájl: ki/bekapcsoláshoz
 readonly VLLM_PID_FILE="/tmp/vllm-rtx5090.pid"
@@ -155,8 +155,9 @@ readonly VENV_PYTHON="${AI_VENV_DIR}/bin/python3"
 readonly VENV_VLLM="${AI_VENV_DIR}/bin/vllm"
 
 # ── Logfájl ───────────────────────────────────────────────────────────────────
-readonly LOG_PREFIX="09_ai_wrapper"
-LOGFILE="${_REAL_HOME}/.infra-logs/${LOG_PREFIX}_$(date +%Y%m%d_%H%M%S).log"
+# INFRA konvenció: log a script indítási könyvtárba kerül, prefix: "wrapper_"
+# Így minden futás naplója ott marad ahol a scriptet futtatják
+LOGFILE="${SCRIPT_DIR}/wrapper_$(date +%Y%m%d_%H%M%S).log"
 
 # =============================================================================
 # BELSŐ SEGÉDFÜGGVÉNYEK
@@ -416,17 +417,88 @@ _ollama_unload_model() {
   log "INFO" "VRAM-ból eltávolítva: $model"
 }
 
-# _ollama_pull_model: model letöltése az Ollama registry-ből
-# Forrás: POST /api/pull — https://ollama.readthedocs.io/en/api/ (official)
+# _ollama_pull_model: model letöltése az Ollama REST API-n keresztül, progress gauge-zal
+# Forrás: POST /api/pull stream=true — https://ollama.readthedocs.io/en/api/ (official)
+# A streaming JSON sorok: {"status":"pulling","total":N,"completed":M}
+# curl háttérben letölt → log fájlba → Python parse → whiptail gauge frissítés
 # Paraméter: $1=model neve (pl. "llama3.3:70b")
 _ollama_pull_model() {
   local model="$1"
   [ -z "$model" ] && return 1
-  log "INFO" "Ollama pull: $model"
-  # Streaming=false → egy JSON válasz jön vissza (könnyebb parse-olni)
-  sudo -u "$_REAL_USER" ollama pull "$model" 2>&1 | \
-    tee -a "$LOGFILE" | \
-    dialog_progress "Ollama letöltés" "Model letöltése: $model" 20
+  log "INFO" "Ollama pull indítás: $model"
+
+  # Pull log a script könyvtárba (wrapper_ prefix, INFRA konvenció)
+  local pull_log="${SCRIPT_DIR}/wrapper_pull_${model//[:\/]/_}_$(date +%H%M%S).log"
+
+  # REST API streaming pull — curl háttérben
+  # Streaming JSON sorok: {"status":"pulling","digest":"...","total":N,"completed":M}
+  curl -s -N -X POST "${OLLAMA_HOST}/api/pull" \
+    -H "Content-Type: application/json" \
+    -d "{\"model\":\"${model}\",\"stream\":true}" \
+    > "$pull_log" 2>&1 &
+  local pull_pid=$!
+
+  # whiptail gauge feeder: 2 másodpercenként frissíti a progress-t
+  (
+    local prev_pct=0
+    while kill -0 "$pull_pid" 2>/dev/null; do
+
+      # "success" sor → letöltés kész
+      if grep -q '"success"' "$pull_log" 2>/dev/null; then
+        printf 'XXX\n100\n✓ Letöltés kész: %s\nXXX\n' "$model"
+        sleep 1; echo 100; break
+      fi
+
+      # JSON sorok parse: completed/total → %
+      local parsed
+      parsed=$(python3 - "$pull_log" 2>/dev/null << 'PYEOF'
+import json, sys, os
+path = sys.argv[1]
+pct, txt = 0, "csatlakozás Ollama-hoz..."
+try:
+  lines = open(path).readlines()
+  for line in reversed(lines):
+    line = line.strip()
+    if not line: continue
+    try:
+      d = json.loads(line)
+      total  = d.get("total", 0)
+      done   = d.get("completed", 0)
+      status = d.get("status", "")
+      if total and total > 0:
+        pct = int(done * 100 / total)
+        txt = f"{status}  {done/1e9:.2f} / {total/1e9:.2f} GB"
+        break
+      elif status:
+        txt = status
+        break
+    except:
+      continue
+except:
+  pass
+print(f"{pct}|{txt}")
+PYEOF
+)
+      local pct="${parsed%%|*}"
+      local txt="${parsed#*|}"
+      [[ ! "$pct" =~ ^[0-9]+$ ]] && pct="$prev_pct"
+      [ "$pct" -gt 99 ] && pct=99  # 100% csak "success" után
+      prev_pct="$pct"
+
+      printf 'XXX\n%d\n%s\nXXX\n' "$pct" "${txt:-(várakozás...)}"
+      sleep 2
+    done
+    echo 100
+  ) | whiptail --title "Ollama pull — ${model}" \
+      --gauge "$(printf 'Modell: %s\nLog:    %s\n\nESC = háttérbe küldés (letöltés folytatódik)' \
+        "$model" "$pull_log")" \
+      12 76 0
+
+  # Megvárjuk a curl befejezését (gauge ESC esetén is fut tovább)
+  wait "$pull_pid" 2>/dev/null
+  # Log mentése a fő logba
+  cat "$pull_log" >> "$LOGFILE" 2>/dev/null
+  log "INFO" "Ollama pull befejezve: $model (log: $pull_log)"
 }
 
 # =============================================================================
@@ -446,8 +518,8 @@ _vllm_build_args() {
     "--dtype"                   "$VLLM_DTYPE"          # bfloat16 → Blackwell SM_120 optimális
     "--gpu-memory-utilization"  "$VLLM_GPU_MEM_UTIL"  # 0.90 → 90% VRAM
     "--max-model-len"           "$VLLM_MAX_MODEL_LEN" # 16384 token context
-    "--swap-space"              "$VLLM_SWAP_SPACE"    # 4 GiB CPU swap
     "--trust-remote-code"                             # HuggingFace modelleknél szükséges
+    # --swap-space ELTÁVOLÍTVA: vLLM 0.19.0-ban nem létező flag → "unrecognized arguments" hiba
   )
   # Prefix caching: KV cache újrahasználat → gyorsabb CLINE/Continue válaszok
   [ "$VLLM_ENABLE_PREFIX_CACHE" = "1" ] && args+=("--enable-prefix-caching")
@@ -649,6 +721,83 @@ _vllm_wait_progress() {
 
   # ESC vagy gauge vége → ellenőrzés: nyílt-e meg a port?
   ss -tlnp 2>/dev/null | grep -q ":${VLLM_PORT}\b"
+}
+
+# _log_system_info: HW/Ollama/vLLM/TurboQuant/CUDA részletes info logolása
+# Manage módban az első futáskor hívódik — teljes kontextus a log fájlban
+_log_system_info() {
+  log "INFO" "══════════════════════════════════════════════════════"
+  log "INFO" "  AI Model Manager v${MOD_VERSION} — Rendszer info"
+  log "INFO" "══════════════════════════════════════════════════════"
+
+  # ── Hardver ────────────────────────────────────────────────────────────────
+  log "HW" "GPU:    ${HW_GPU_NAME:-ismeretlen}"
+  log "HW" "Profil: ${HW_PROFILE:-?}  |  CUDA arch: ${HW_CUDA_ARCH:-?}"
+  log "HW" "Driver: ${INST_DRIVER_VER:-?}  |  CUDA ver: ${INST_CUDA_VER:-?}"
+  log "HW" "vLLM kompatibilis: ${HW_VLLM_OK:-false}"
+  log "HW" "TurboQuant mód: ${TURBOQUANT_BUILD_MODE:-?}"
+
+  # ── nvidia-smi GPU állapot ─────────────────────────────────────────────────
+  local nvsmi
+  nvsmi=$(nvidia-smi --query-gpu=name,memory.used,memory.free,memory.total,temperature.gpu \
+    --format=csv,noheader,nounits 2>/dev/null | head -1)
+  if [ -n "$nvsmi" ]; then
+    log "HW" "nvidia-smi: $nvsmi"
+  else
+    log "HW" "nvidia-smi: nem elérhető"
+  fi
+
+  # ── CUDA ───────────────────────────────────────────────────────────────────
+  local nvcc_ver
+  nvcc_ver=$(nvcc --version 2>/dev/null | grep -oP 'release \K[\d.]+' | head -1)
+  log "CUDA" "nvcc verzió: ${nvcc_ver:-(nem elérhető)}"
+  local cuda_runtime
+  cuda_runtime=$(python3 -c "import torch; print(torch.version.cuda)" 2>/dev/null)
+  log "CUDA" "PyTorch CUDA runtime: ${cuda_runtime:-(nem elérhető)}"
+
+  # ── Ollama ─────────────────────────────────────────────────────────────────
+  local ollama_ver
+  ollama_ver=$(ollama version 2>/dev/null | grep -oP '[\d.]+' | head -1)
+  log "OLLAMA" "Verzió: ${ollama_ver:-?}"
+  local ollama_svc
+  ollama_svc=$(systemctl is-active ollama 2>/dev/null)
+  log "OLLAMA" "Service: ${ollama_svc:-?}"
+  # Telepített modellek
+  local model_count
+  model_count=$(_ollama_api GET "/api/tags" | python3 -c "
+import json,sys
+try: print(len(json.load(sys.stdin).get('models',[])))
+except: print('?')
+" 2>/dev/null)
+  log "OLLAMA" "Telepített modellek: ${model_count:-?} db"
+
+  # ── vLLM ───────────────────────────────────────────────────────────────────
+  local vllm_ver
+  vllm_ver=$([ -x "$VENV_VLLM" ] && "$VENV_VLLM" --version 2>/dev/null | head -1 || echo "?")
+  log "VLLM" "Verzió: ${vllm_ver:-?}"
+  log "VLLM" "Venv: $AI_VENV_DIR"
+  log "VLLM" "Port: ${VLLM_PORT}  dtype: ${VLLM_DTYPE}  gpu-mem: ${VLLM_GPU_MEM_UTIL}"
+  if _is_vllm_running; then
+    local vllm_pid
+    vllm_pid=$(cat "$VLLM_PID_FILE" 2>/dev/null)
+    log "VLLM" "Állapot: FUT (PID: ${vllm_pid:-?})"
+  else
+    log "VLLM" "Állapot: leállított"
+  fi
+
+  # ── TurboQuant ─────────────────────────────────────────────────────────────
+  if [ -d "$TQ_DIR" ]; then
+    local tq_commit
+    tq_commit=$(git -C "$TQ_DIR" rev-parse --short HEAD 2>/dev/null)
+    log "TQ" "Könyvtár: $TQ_DIR  (commit: ${tq_commit:-?})"
+    log "TQ" "Build mód: ${TURBOQUANT_BUILD_MODE:-?}"
+    log "TQ" "Kvantált modellek: $(find "$TQ_QUANTIZED_DIR" -name '*.gguf' 2>/dev/null | wc -l) db"
+  else
+    log "TQ" "TurboQuant könyvtár hiányzik: $TQ_DIR"
+  fi
+
+  log "INFO" "Log fájl: $LOGFILE"
+  log "INFO" "══════════════════════════════════════════════════════"
 }
 
 # _vllm_status_text: vLLM szerver állapot szöveges összefoglaló
@@ -1131,12 +1280,32 @@ _popular_model_browse() {
     esac
   fi
 
+  # Telepített Ollama modellek lekérése ✓ jelöléshez
+  # GET /api/tags → name mező → set-be rakjuk a gyors lookup-hoz
+  local installed_set=""
+  if _is_ollama_running; then
+    installed_set=$(_ollama_api GET "/api/tags" | python3 -c "
+import json,sys
+try:
+  data=json.load(sys.stdin)
+  for m in data.get('models',[]): print(m['name'])
+except: pass
+" 2>/dev/null | tr '\n' '|')
+  fi
+
   # Szűrés kategória szerint — a fentebb beállított filter alapján
+  # ✓ jelölés: ha a modell neve szerepel a telepítettlista-ban
   local menu_items=() filtered_names=()
   local idx=1
   for ((i=0; i<${#_name[@]}; i++)); do
     [ "$filter" != "all" ] && [ "${_cat[$i]}" != "$filter" ] && continue
-    menu_items+=("$idx" "${_desc[$i]}" "OFF")
+    # ✓ marker ha már le van töltve
+    local marker=""
+    if [[ "$installed_set" == *"|${_name[$i]}|"* ]] || \
+       [[ "$installed_set" == "${_name[$i]}|"* ]]; then
+      marker=" ✓"
+    fi
+    menu_items+=("$idx" "${_desc[$i]}${marker}" "OFF")
     filtered_names+=("${_name[$i]}")
     ((idx++))
   done
@@ -1161,22 +1330,17 @@ _popular_model_browse() {
 # vLLM HuggingFace formátumot vár — ezek az Ollama nevektől eltérhetnek
 # A lista a HF Hub model ID-kat tartalmazza (vllm serve MODEL_ID)
 _vllm_model_browse() {
-  # HuggingFace model ID-k vLLM-hez optimalizált modellek
-  # Forrás: docs.vllm.ai supported models lista (official)
-  local menu_items=(
-    "1"  "[KÓD-7B]   Qwen/Qwen2.5-Coder-7B-Instruct     (4.7 GB, VRAM~8GB)"    "OFF"
-    "2"  "[KÓD-14B]  Qwen/Qwen2.5-Coder-14B-Instruct     (9 GB, VRAM~14GB)"     "OFF"
-    "3"  "[KÓD-32B]  Qwen/Qwen2.5-Coder-32B-Instruct     (19 GB, VRAM~25GB)"    "OFF"
-    "4"  "[CHAT-7B]  Qwen/Qwen2.5-7B-Instruct            (4.7 GB, VRAM~8GB)"    "OFF"
-    "5"  "[CHAT-14B] Qwen/Qwen2.5-14B-Instruct           (9 GB, VRAM~14GB)"     "OFF"
-    "6"  "[CHAT-32B] Qwen/Qwen2.5-32B-Instruct           (19 GB, VRAM~25GB)"    "OFF"
-    "7"  "[REASON]   deepseek-ai/DeepSeek-R1-Distill-Qwen-7B  (4.7 GB)"         "OFF"
-    "8"  "[REASON]   deepseek-ai/DeepSeek-R1-Distill-Qwen-14B (9 GB)"           "OFF"
-    "9"  "[CODE]     deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct (8.9 GB)"      "OFF"
-    "10" "[CHAT]     mistralai/Mistral-7B-Instruct-v0.3  (4.1 GB, VRAM~6GB)"    "OFF"
-    "11" "[CHAT]     google/gemma-3-12b-it                (8.1 GB, VRAM~12GB)"   "OFF"
-    "12" "[CHAT-70B] meta-llama/Llama-3.3-70B-Instruct   (42 GB — RTX 5090!)"   "OFF"
-  )
+  # HuggingFace lokális cache ellenőrzés — letöltött modellek ✓ jelölése
+  # HF cache: ~/.cache/huggingface/hub/models--<owner>--<repo>/
+  local hf_cache_dir="${_REAL_HOME}/.cache/huggingface/hub"
+  _hf_is_cached() {
+    local hf_id="$1"
+    # Konverzió: "Qwen/Qwen2.5-7B" → "models--Qwen--Qwen2.5-7B"
+    local cache_name="models--${hf_id//\//-}"
+    [ -d "${hf_cache_dir}/${cache_name}" ]
+  }
+
+  # HuggingFace model ID-k és leírások
   local hf_ids=(
     "Qwen/Qwen2.5-Coder-7B-Instruct"
     "Qwen/Qwen2.5-Coder-14B-Instruct"
@@ -1191,6 +1355,31 @@ _vllm_model_browse() {
     "google/gemma-3-12b-it"
     "meta-llama/Llama-3.3-70B-Instruct"
   )
+  local hf_descs=(
+    "[KÓD-7B]   Qwen/Qwen2.5-Coder-7B-Instruct     (4.7 GB, VRAM~8GB)"
+    "[KÓD-14B]  Qwen/Qwen2.5-Coder-14B-Instruct     (9 GB, VRAM~14GB)"
+    "[KÓD-32B]  Qwen/Qwen2.5-Coder-32B-Instruct     (19 GB, VRAM~25GB)"
+    "[CHAT-7B]  Qwen/Qwen2.5-7B-Instruct            (4.7 GB, VRAM~8GB)"
+    "[CHAT-14B] Qwen/Qwen2.5-14B-Instruct           (9 GB, VRAM~14GB)"
+    "[CHAT-32B] Qwen/Qwen2.5-32B-Instruct           (19 GB, VRAM~25GB)"
+    "[REASON]   deepseek-ai/DeepSeek-R1-Distill-Qwen-7B  (4.7 GB)"
+    "[REASON]   deepseek-ai/DeepSeek-R1-Distill-Qwen-14B (9 GB)"
+    "[CODE]     deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct (8.9 GB)"
+    "[CHAT]     mistralai/Mistral-7B-Instruct-v0.3  (4.1 GB, VRAM~6GB)"
+    "[CHAT]     google/gemma-3-12b-it                (8.1 GB, VRAM~12GB)"
+    "[CHAT-70B] meta-llama/Llama-3.3-70B-Instruct   (42 GB — RTX 5090!)"
+  )
+
+  # Dinamikus menu_items: HF cache-ben lévő modellek ✓ jelölése
+  # HF cache útvonal: ~/.cache/huggingface/hub/models--<owner>--<repo>/
+  local menu_items=()
+  for ((i=0; i<${#hf_ids[@]}; i++)); do
+    local hf_id="${hf_ids[$i]}"
+    local cache_name="models--${hf_id//\//-}"
+    local marker=""
+    [ -d "${hf_cache_dir}/${cache_name}" ] && marker=" ✓"
+    menu_items+=("$((i+1))" "${hf_descs[$i]}${marker}" "OFF")
+  done
 
   local sel_idx
   sel_idx=$(whiptail --title "vLLM modell katalógus (HuggingFace)" \
@@ -1827,7 +2016,6 @@ ExecStart=${AI_VENV_DIR}/bin/vllm serve \${MODEL_ID} \
     --dtype ${VLLM_DTYPE} \
     --gpu-memory-utilization ${VLLM_GPU_MEM_UTIL} \
     --max-model-len ${VLLM_MAX_MODEL_LEN} \
-    --swap-space ${VLLM_SWAP_SPACE} \
     --trust-remote-code \
     --enable-prefix-caching
 Restart=on-failure
@@ -1974,6 +2162,8 @@ main() {
         echo "HIBA: sudo szükséges. Használd: sudo ai-model-ctl"
         exit 1
       fi
+      # Rendszer info logolása induláskor (HW/Ollama/vLLM/TQ/CUDA)
+      _log_system_info
       _manage_main_menu
       ;;
 
