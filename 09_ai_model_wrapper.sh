@@ -59,7 +59,7 @@
 #   CLINE: https://github.com/cline/cline (extension settings.json kulcsok)
 #     - cline.apiProvider / cline.ollamaBaseUrl / cline.openAiBaseUrl stb.
 #
-# VERZIÓ: v1.0 (lib v6.5 kompatibilis)
+# VERZIÓ: v1.0 (lib v6.4+ kompatibilis)
 # =============================================================================
 
 # =============================================================================
@@ -87,7 +87,7 @@ readonly MOD_ID="09"
 readonly MOD_NAME="AI Model Manager"
 readonly MOD_VERSION="1.0"
 # Lib minimum verzió (00_lib.sh LIB_VERSION) — compat check
-readonly MOD_LIB_MIN="6.5"
+readonly MOD_LIB_MIN="6.4"
 
 # ── Ollama konfiguráció ───────────────────────────────────────────────────────
 # Forrás: https://ollama.readthedocs.io/en/api/ (official)
