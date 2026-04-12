@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# 01a_system_foundation.sh — System Foundation v6.10
+# 01a_system_foundation.sh — System Foundation v6.11
 #                            Ubuntu 24/26 LTS | NVIDIA | CUDA | Docker
 #
 # Dokumentáció
@@ -10,6 +10,30 @@
 #   Docker: https://docs.docker.com/engine/install/ubuntu/
 #   CTK:    https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/
 #   Compat: NVIDIA CUDA Compatibility r595 (2026-03-31)
+#
+# Változtatások v6.11 (2026-04-12 10:41 log analízis — 4 fix):
+#
+#   BUG 1 FIX — Broken dpkg state detektálása:
+#     Tünet: hw_detect "apt-cache, max sorozat"-ot használ (dpkg nem talál
+#     telepített csomagot), de nvidia-smi 590.48.01-et ad (kernel modul töltve)
+#     → comp_check_nvidia_driver=ok → driver step skip → CTK install fail
+#     Fix: dpkg --audit + dpkg -l iF/iU kód keresése → _DPKG_BROKEN flag
+#
+#   BUG 2 FIX — Driver step futtatása _DPKG_BROKEN esetén:
+#     Ha _DPKG_BROKEN=true, a driver step akkor is fut ha _DRV_STATUS=ok
+#     → nvidia_driver_purge + tiszta újratelepítés javítja a broken state-et
+#
+#   BUG 3 FIX — apt update + fix_broken CTK telepítés ELŐTT:
+#     Tünet: "libnvidia-egl-wayland1 but it is not installable"
+#     ("not installable" ≠ "not going to be installed" — APT cache-ben sincs!)
+#     Fix: apt_mirror_check_fallback → apt-get update → apt_fix_broken
+#     a CTK install ask_proceed ELŐTT futtatva (nem csak failsafe előtt)
+#
+#   BUG 4 FIX — MOD_01A_DONE csak FAIL==0 esetén:
+#     Tünet: FAIL=2 session után MOD_01A_DONE=true → következő futás
+#     nem futtatja újra a sikertelen lépéseket (pl. CTK)
+#     Fix: MOD_01A_DONE=true csak ha FAIL==0
+#          FAIL>0 esetén: MOD_01A_DONE="" (törlés)
 #
 # Változtatások v6.10 (2026-04-12 logok — mirror fallback + fix-broken):
 #
@@ -107,7 +131,7 @@ declare -A URLS=(
   [nvidia_ctk_list]="https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list"
 )
 
-APT_PIN_NVIDIA='# 01a_system_foundation v6.10
+APT_PIN_NVIDIA='# 01a_system_foundation v6.11
 Package: nvidia-* libnvidia-* xserver-xorg-video-nvidia-*
 Pin: release o=Ubuntu
 Pin-Priority: 1001'
@@ -254,6 +278,31 @@ else
 
   [ "$RUN_MODE" = "check" ] && { comp_save_state "$INFRA_NUM"; log "COMP" "Check mód: COMP state mentve"; }
 fi
+
+# dpkg broken state detektálás — az nvidia-smi "ok"-ot adhat miközben
+# libnvidia-* csomagok féltelepített állapotban vannak (dpkg iF/iU kód).
+# Tünet: hw_detect "apt-cache, max sorozat" ágat használ (dpkg nem talál
+# telepített drivercsomagot) de nvidia-smi mégis visszaadja a verziót
+# (kernel modul az előző reboot óta be van töltve).
+_DPKG_BROKEN=false
+_dpkg_broken_pkgs=""
+
+# dpkg --audit: felsorolja a broken/half-installed csomagokat
+if dpkg --audit 2>/dev/null | grep -qi "nvidia\|libnvidia"; then
+  _DPKG_BROKEN=true
+  _dpkg_broken_pkgs=$(dpkg --audit 2>/dev/null | head -5)
+  log "WARN" "dpkg audit: broken NVIDIA csomagok detektálva"
+  log "WARN" "  $(printf '%s' "$_dpkg_broken_pkgs" | head -2 | tr '
+' ' ')"
+fi
+
+# dpkg -l: iF=halfinstalled, iU=halfconfigured kódok keresése
+if ! $_DPKG_BROKEN && dpkg -l 2>/dev/null     | awk '{print $1, $2}'     | grep -qE '^(iF|iU)\s+(libnvidia|nvidia)'; then
+  _DPKG_BROKEN=true
+  log "WARN" "dpkg iF/iU: libnvidia-* féltelepített csomag detektálva"
+fi
+
+$_DPKG_BROKEN && log "WARN" "Broken dpkg state → driver step fut, apt --fix-broken szükséges"
 
 _DRV_STATUS="${COMP_STATUS[nvidia_driver]:-missing}"
 
@@ -588,7 +637,7 @@ fi
 log "STEP" "━━━ 2/7: NVIDIA open driver ($_DRIVER_PKG) ━━━"
 
 if [ "$_DRV_STATUS" = "missing" ] || [ "$_DRV_STATUS" = "old" ] || \
-   [ "$RUN_MODE" = "reinstall" ]; then
+   [ "$RUN_MODE" = "reinstall" ] || $_DPKG_BROKEN; then
 
   if ask_proceed "NVIDIA ${_DRIVER_PKG} telepítése?"; then
 
@@ -899,7 +948,7 @@ _write_gpu_config() {
   local mode="${1:-hybrid}"
 
   cat > /etc/modprobe.d/99-blacklist-nouveau.conf << 'BEOF'
-# 01a_system_foundation v6.10 — Nouveau blacklist
+# 01a_system_foundation v6.11 — Nouveau blacklist
 blacklist nouveau
 blacklist lbm-nouveau
 options nouveau modeset=0
@@ -908,7 +957,7 @@ alias lbm-nouveau off
 BEOF
 
   cat > /etc/modprobe.d/99-nvidia-options.conf << 'MEOF'
-# 01a_system_foundation v6.10 — NVIDIA kernel modul opciók
+# 01a_system_foundation v6.11 — NVIDIA kernel modul opciók
 options nvidia-drm modeset=1 fbdev=1
 options nvidia NVreg_PreserveVideoMemoryAllocations=1
 MEOF
@@ -922,7 +971,7 @@ MEOF
     intel_busid="${intel_busid:-PCI:0:2:0}"
     log "CFG" "Intel iGPU Bus ID: $intel_busid"
     cat > /etc/X11/xorg.conf << XEOF
-# 01a_system_foundation v6.10 — Hibrid GPU mód
+# 01a_system_foundation v6.11 — Hibrid GPU mód
 Section "ServerLayout"
     Identifier "hybrid-layout"
     Screen 0 "iGPU-Screen"
@@ -953,12 +1002,12 @@ XEOF
   else
     prime-select nvidia 2>/dev/null || true
     cat > /etc/modprobe.d/99-blacklist-igpu.conf << 'BEOF'
-# 01a_system_foundation v6.10 — Intel iGPU blacklist
+# 01a_system_foundation v6.11 — Intel iGPU blacklist
 blacklist i915
 blacklist intel_agp
 BEOF
     cat > /etc/X11/xorg.conf << 'XEOF'
-# 01a_system_foundation v6.10 — Dedikált GPU mód
+# 01a_system_foundation v6.11 — Dedikált GPU mód
 Section "ServerLayout"
     Identifier "dedicated-layout"
     Screen 0 "nvidia-screen"
@@ -1030,6 +1079,21 @@ fi
 log "STEP" "━━━ NVIDIA Container Toolkit ━━━"
 
 if [ "${COMP_STATUS[nvidia_ctk]:-missing}" != "ok" ] || [ "$RUN_MODE" = "reinstall" ]; then
+  # CTK telepítés előtt: dpkg broken state javítás
+  # Eset: libnvidia-gl-590 unconfigured (libnvidia-egl-wayland1 nem volt letölthető)
+  # → minden apt hívás "Unmet dependencies" hibával bukik amíg javítva nincs
+  # "not installable" = APT cache-ben sincs a csomag → apt update + fix-broken kell
+  if $_DPKG_BROKEN || dpkg --audit 2>/dev/null | grep -qi "nvidia\|libnvidia"; then
+    log "INFO" "CTK előkészítés: dpkg broken state javítása..."
+    apt_mirror_check_fallback "$LOGFILE_AI"
+    log "APT" "apt-get update (CTK broken state fix előtt)..."
+    DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::http::Timeout=20       update -qq >> "$LOGFILE_AI" 2>&1 || true
+    apt_fix_broken "$LOGFILE_AI"
+    apt_mirror_restore
+    _DPKG_BROKEN=false  # javítás után reset
+    log "INFO" "CTK előkészítés kész — dpkg state javítva"
+  fi
+
   if ask_proceed "NVIDIA Container Toolkit telepítése?"; then
     curl -fsSL "${URLS[nvidia_ctk_gpg]}" \
       | gpg --batch --yes --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
@@ -1088,6 +1152,20 @@ if [ "${OK:-0}" -gt 0 ] && \
   infra_state_set "REBOOT_REASON"   "NVIDIA ${_DRIVER_SERIES:-?}-open driver + initramfs"
   infra_state_set "REBOOT_BY_INFRA" "$INFRA_NUM"
   log "STATE" "REBOOT_NEEDED=true (OK=$OK lépés végrehajtva)"
+
+  # MOD_01A_DONE: csak ha nincs FAIL — biztosítja hogy 01b csak sikeres
+  # install után fut le. Ha FAIL>0 (pl. CTK hiányzik), a flag nem kerül
+  # beállításra → a következő 01a futás újra megpróbálja a hiányzó lépéseket.
+  # MOD_01A_REBOOTED-t a 01b script indulása állítja be.
+  if [ "${FAIL:-0}" -eq 0 ]; then
+    infra_state_set "MOD_01A_DONE" "true"
+    log "STATE" "MOD_01A_DONE=true → 01b_post_reboot.sh futtatható REBOOT után"
+  else
+    log "WARN" "FAIL=$FAIL → MOD_01A_DONE NEM kerül beállításra (hibás lépések)"
+    log "WARN" "Következő 01a futás javítja a hiányzó komponenseket"
+    # Ha volt korábban MOD_01A_DONE (pl. előző futásból), töröljük
+    infra_state_set "MOD_01A_DONE" ""
+  fi
 fi
 infra_state_show
 
