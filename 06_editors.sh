@@ -175,7 +175,7 @@ VSCODE_SETTINGS='{
   "editor.lineHeight": 1.6,
   "editor.formatOnSave": true,
   "editor.bracketPairColorization.enabled": true,
-  "editor.minimap.enabled": false,
+  "editor.minimap.enabled": true,
   "editor.rulers": [100],
   "workbench.colorTheme": "Default Dark Modern",
   "terminal.integrated.fontFamily": "'\''JetBrains Mono'\''",
@@ -183,7 +183,9 @@ VSCODE_SETTINGS='{
   "files.autoSave": "onFocusChange",
   "files.trimTrailingWhitespace": true,
   "telemetry.telemetryLevel": "off",
-  "python.defaultInterpreterPath": "${env:HOME}/venvs/ai/bin/python"
+  "python.defaultInterpreterPath": "${env:HOME}/venvs/ai/bin/python",
+  "java.runtime": "/usr/lib/jvm/default-java/bin/java",
+  "kickassembler.javaRuntime": "/usr/lib/jvm/default-java/bin/java"
 }'
 
 # ── Komponens ellenőrző specifikációk ────────────────────────────────────────
@@ -639,6 +641,31 @@ if [ "${COMP_STATUS[continue_dev]:-missing}" != "ok" ] || \
     ((SKIP++))
     log "SKIP" "Continue.dev telepítés kihagyva"
   fi
+fi
+
+
+# =============================================================================
+# JAVA RUNTIME — KickAssembler és más Java-alapú eszközök
+# =============================================================================
+# Szükséges: Kick Assembler 8-Bit Retro Studio VS Code extension
+# Forrás: https://packages.ubuntu.com/noble/default-jre
+#   Ubuntu 24.04 noble-ban a default-jre → OpenJDK 21 (LTS)
+#   Telepítési útvonal: /usr/lib/jvm/default-java (szimlink a tényleges JVM-re)
+# A java.runtime és kickassembler.javaRuntime VS Code settings már beállítva fent.
+
+if ! cmd_exists java && ! dpkg -l default-jre 2>/dev/null | grep -q "^ii"; then
+  if ask_proceed "Java Runtime (OpenJDK 21) telepítése? — KickAssembler extensionhoz szükséges"; then
+    apt_install_progress "Java Runtime" "OpenJDK 21 telepítése..."       default-jre && {
+      ((++OK))
+      log "OK" "Java telepítve: $(java -version 2>&1 | head -1)"
+      log "OK" "JVM path: /usr/lib/jvm/default-java → $(readlink -f /usr/lib/jvm/default-java 2>/dev/null || echo '?')"
+    } || ((FAIL++))
+  else
+    ((SKIP++))
+    log "SKIP" "Java telepítés kihagyva"
+  fi
+else
+  log "INFO" "Java már telepítve: $(java -version 2>&1 | head -1)"
 fi
 
 # =============================================================================
