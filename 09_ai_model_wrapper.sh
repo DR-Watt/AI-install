@@ -471,27 +471,46 @@ _vllm_start() {
     return 1
   fi
 
+  # FONTOS: vLLM először LETÖLTI a modellt (~GB-ok), majd BETÖLTI VRAM-ba.
+  # Qwen2.5-7B: ~14GB letöltés + ~8GB VRAM → 2-10 perc lehet az első indításnál.
+  # A script HÁTTÉRBEN indítja — ne várakozzon a felhasználó.
+  # Ellenőrzés: 'vLLM állapot' menü vagy tail -f /tmp/vllm-rtx5090.log
   log "INFO" "vLLM indítás: model=$model, port=$VLLM_PORT, dtype=$VLLM_DTYPE"
   log "INFO" "GPU mem util: ${VLLM_GPU_MEM_UTIL}, max_len: ${VLLM_MAX_MODEL_LEN}"
 
-  # vLLM indítás: a felhasználó kontextusában, venv-ből, háttérben
-  # Forrás: GPU install guide — Blackwell SM_120 = CUDA 12.8+ szükséges
+  # vLLM indítás háttérben — felhasználó kontextusában, venv-ből
+  # Forrás: docs.vllm.ai/en/stable/cli/serve/ (official)
+  # NOTA: a process PID-jét mentsük EL A SUBSHELL-BEN, ne a szülőben
   sudo -u "$_REAL_USER" bash -c "
     source '${AI_VENV_DIR}/bin/activate'
     nohup ${VENV_VLLM} $(IFS=' '; echo "$(_vllm_build_args "$model")") \
       >> '${VLLM_LOG_FILE}' 2>&1 &
     echo \$! > '${VLLM_PID_FILE}'
-  "
-  sleep 3  # Rövid várakozás: szerver inicializálás kezdete
+    echo \"vLLM PID: \$!\" >&2
+  " 2>> "$LOGFILE"
 
-  if _is_vllm_running; then
-    log "INFO" "vLLM szerver elindult (PID: $(cat "$VLLM_PID_FILE" 2>/dev/null))"
-    log "INFO" "API endpoint: http://localhost:${VLLM_PORT}/v1"
-    return 0
-  else
-    log "ERR" "vLLM indítás sikertelen — log: $VLLM_LOG_FILE"
+  # Rövid várakozás: ellenőrizzük hogy a process tényleg elindult-e (nem crashelt azonnal)
+  # NEM várjuk a port megnyílását — az 1-10 percig is tarthat modell letöltéssel
+  sleep 2
+
+  local pid
+  pid=$(cat "$VLLM_PID_FILE" 2>/dev/null)
+  if [ -z "$pid" ]; then
+    log "ERR" "vLLM PID fájl üres — indítás sikertelen. Log: $VLLM_LOG_FILE"
     return 1
   fi
+
+  if ! kill -0 "$pid" 2>/dev/null; then
+    log "ERR" "vLLM process (PID $pid) azonnal kilépett. Log: $VLLM_LOG_FILE"
+    log "ERR" "Utolsó logsorok: $(tail -5 "$VLLM_LOG_FILE" 2>/dev/null)"
+    return 1
+  fi
+
+  # Process él → sikeres háttérindítás (port még nem nyílt meg, modell tölt)
+  log "INFO" "vLLM process elindult (PID: $pid) — modell betöltés folyamatban..."
+  log "INFO" "Ellenőrzés: tail -f $VLLM_LOG_FILE"
+  log "INFO" "Port megnyílás után API: http://localhost:${VLLM_PORT}/v1"
+  return 0
 }
 
 # _vllm_stop: vLLM szerver leállítása
@@ -975,7 +994,31 @@ _popular_model_browse() {
   _name+=("mxbai-embed-large");       _desc+=("[EMBED] MxBAI Embed Large      — RAG, nagy dimenzió (0.7 GB)");      _cat+=("embed")
   _name+=("bge-m3");                  _desc+=("[EMBED] BGE-M3                 — multilingual RAG (1.2 GB)");        _cat+=("embed")
 
-  # Szűrés kategória szerint
+  # BUGFIX: kategória szűrő menü CSAK akkor jelenik meg, ha filter="all"
+  # Korábban: mindig megjelent → rekurzív hívás esetén kétszer mutatta a szűrőt
+  # Most: _popular_model_browse "code" hívás esetén AZONNAL a code listát mutatja
+  if [ "$filter" = "all" ]; then
+    local cat_choice
+    cat_choice=$(whiptail --title "Modell katalógus" \
+      --menu "Modell kategória szűrő:" 14 65 5 \
+      "1" "Összes modell megjelenítése" \
+      "2" "Csak kódgenerálás [KÓD]" \
+      "3" "Csak chat modellek [CHAT]" \
+      "4" "Csak érvelő modellek [REASON]" \
+      "5" "Csak embedding modellek [EMBED]" \
+      3>&1 1>&2 2>&3) || { echo "CANCEL"; return 1; }
+
+    # Szűrő paraméter beállítása a választás alapján (nem rekurzív hívás!)
+    case "$cat_choice" in
+      2) filter="code" ;;
+      3) filter="chat" ;;
+      4) filter="reason" ;;
+      5) filter="embed" ;;
+      # 1 = összes → filter marad "all"
+    esac
+  fi
+
+  # Szűrés kategória szerint — a fentebb beállított filter alapján
   local menu_items=() filtered_names=()
   local idx=1
   for ((i=0; i<${#_name[@]}; i++)); do
@@ -985,24 +1028,10 @@ _popular_model_browse() {
     ((idx++))
   done
 
-  # Kategória szűrő menü elején
-  local cat_choice
-  cat_choice=$(whiptail --title "Modell katalógus" \
-    --menu "Modell kategória szűrő:" 14 65 5 \
-    "1" "Összes modell megjelenítése" \
-    "2" "Csak kódgenerálás [KÓD]" \
-    "3" "Csak chat modellek [CHAT]" \
-    "4" "Csak érvelő modellek [REASON]" \
-    "5" "Csak embedding modellek [EMBED]" \
-    3>&1 1>&2 2>&3) || { echo "CANCEL"; return 1; }
-
-  case "$cat_choice" in
-    1) _popular_model_browse "all"; return $? ;;
-    2) [ "$filter" != "code"   ] && { _popular_model_browse "code";   return $?; } ;;
-    3) [ "$filter" != "chat"   ] && { _popular_model_browse "chat";   return $?; } ;;
-    4) [ "$filter" != "reason" ] && { _popular_model_browse "reason"; return $?; } ;;
-    5) [ "$filter" != "embed"  ] && { _popular_model_browse "embed";  return $?; } ;;
-  esac
+  if [ ${#filtered_names[@]} -eq 0 ]; then
+    whiptail --msgbox "Nincs modell ebben a kategóriában: ${filter}" 8 55
+    echo "CANCEL"; return 1
+  fi
 
   # Tényleges modell választó lista
   local sel_idx
@@ -1149,11 +1178,9 @@ except: pass
             # Népszerű modellek katalógusa kategória szűrővel
             # _popular_model_browse: ollama.com/library alapján kuráló lista
             model_name=$(_popular_model_browse "all")
-            # Ha katalógusból cancel → kézi bevitelre kínáljuk
+            # ESC / Cancel → vissza a menübe, NEM kézi bevitel (volt a bug)
             if [ "$model_name" = "CANCEL" ] || [ -z "$model_name" ]; then
-              model_name=$(whiptail --title "Ollama pull — kézi bevitel" \
-                --inputbox "Modell neve (pl. qwen2.5-coder:7b, llama3.3:70b):" \
-                10 65 "" 3>&1 1>&2 2>&3) || continue
+              continue
             fi
             ;;
           2)
@@ -1223,7 +1250,9 @@ except: print('?')
           1) model=$(_ollama_model_radiolist "Ollama backend modell" \
                "CLINE/Continue modell kiválasztása:") ;;
           2) model=$(_popular_model_browse "code")
-             [ "$model" = "CANCEL" ] && model="" ;;
+             # CANCEL → vissza a menübe
+             [ "$model" = "CANCEL" ] && continue
+             [ -z "$model" ] && continue ;;
           3) model=$(whiptail --title "Ollama modell" \
                --inputbox "Ollama modell neve:" 10 60 \
                "$OLLAMA_DEFAULT_CODE_MODEL" 3>&1 1>&2 2>&3) || continue ;;
@@ -1276,7 +1305,9 @@ except: pass
           3>&1 1>&2 2>&3) || continue
         case "$src_choice" in
           1) model=$(_ollama_model_radiolist "CLINE kód modell" "Válaszd a CLINE modellt:") ;;
-          2) model=$(_popular_model_browse "code"); [ "$model" = "CANCEL" ] && model="" ;;
+          2) model=$(_popular_model_browse "code")
+             [ "$model" = "CANCEL" ] && continue
+             [ -z "$model" ] && continue ;;
           3) model=$(whiptail --title "CLINE modell" --inputbox "Ollama modell neve:" \
                10 60 "$OLLAMA_DEFAULT_CODE_MODEL" 3>&1 1>&2 2>&3) || continue ;;
         esac
@@ -1294,7 +1325,9 @@ except: pass
           "2" "Kézi HF model ID bevitel" \
           3>&1 1>&2 2>&3) || continue
         case "$src_choice" in
-          1) model=$(_vllm_model_browse); [ "$model" = "CANCEL" ] && model="" ;;
+          1) model=$(_vllm_model_browse)
+             [ "$model" = "CANCEL" ] && continue
+             [ -z "$model" ] && continue ;;
           2) model=$(whiptail --title "vLLM modell ID" \
                --inputbox "HuggingFace model ID (pl. Qwen/Qwen2.5-Coder-7B-Instruct):" \
                10 72 "" 3>&1 1>&2 2>&3) || continue ;;
@@ -1355,9 +1388,9 @@ _menu_vllm_control() {
         esac
         [ -z "$model" ] && continue
         if _vllm_start "$model"; then
-          whiptail --msgbox "vLLM elindult!\nModell: $model\nAPI: http://localhost:${VLLM_PORT}/v1\n\nCLINE/Continue konfig frissítéséhez\nhasználd a 'Backend váltó' menüt!" 16 65
+          whiptail --msgbox "vLLM process elindult háttérben!\n\nModell: $model\n\n⚠ FONTOS: Ha a modell még nem volt letöltve,\na vLLM most tölti le (~GB). Ez 2-15 percig tarthat.\nKözben NE indíts más nagy alkalmazást!\n\nEllenőrzés:\n  tail -f ${VLLM_LOG_FILE}\n\nAmikor kész → Backend váltó menüben\nállítsd be a CLINE/Continue-t." 22 68
         else
-          whiptail --msgbox "vLLM indítás SIKERTELEN\nLog: ${VLLM_LOG_FILE}\n\n$(tail -5 "$VLLM_LOG_FILE" 2>/dev/null)" 16 72
+          whiptail --msgbox "vLLM indítás SIKERTELEN!\n\nLog: ${VLLM_LOG_FILE}\n\n$(tail -8 "$VLLM_LOG_FILE" 2>/dev/null)" 20 74
         fi
         ;;
       2)
