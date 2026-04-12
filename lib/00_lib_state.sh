@@ -400,7 +400,7 @@ detect_run_mode() {
   if [ "$missing" -eq 0 ] && [ "$old" -eq 0 ]; then
     # Minden OK és naprakész — felajánljuk a lehetőségeket
     local choice
-    choice=$(dialog_menu "Minden komponens megvan" \
+    choice=$(dialog_menu "${MODE_TITLE:+[$MODE_TITLE] }Minden komponens megvan [${RUN_MODE}]" \
       "\n  Minden komponens telepítve és naprakész.\n\n  Mit tegyünk?" \
       14 3 \
       "skip"      "Kihagyás — semmi sem változik" \
@@ -410,7 +410,7 @@ detect_run_mode() {
   elif [ "$missing" -eq 0 ] && [ "$old" -gt 0 ]; then
     # Elavult verzió — frissítés ajánlott
     local choice
-    choice=$(dialog_menu "Elavult verziók találhatók" \
+    choice=$(dialog_menu "${MODE_TITLE:+[$MODE_TITLE] }Elavult verziók találhatók [${RUN_MODE}]" \
       "\n  $old komponens frissítésre szorul.\n\n  Mit tegyünk?" \
       14 3 \
       "update"    "Frissítés — elavult verziók frissítése" \
