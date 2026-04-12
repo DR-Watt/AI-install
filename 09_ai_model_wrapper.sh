@@ -596,7 +596,14 @@ _vllm_start() {
 
   if ! kill -0 "$pid" 2>/dev/null; then
     log "ERR" "vLLM process (PID $pid) azonnal kilépett. Log: $VLLM_LOG_FILE"
-    log "ERR" "Utolsó logsorok: $(tail -5 "$VLLM_LOG_FILE" 2>/dev/null)"
+    # Log olvasása — a fájl ellenőrzése kvótás path esetén is
+    local tail_lines=""
+    if [ -f "$VLLM_LOG_FILE" ]; then
+      tail_lines=$(tail -10 "$VLLM_LOG_FILE" 2>/dev/null \
+        | sed 's/\x1B\[[0-9;]*[mK]//g' \
+        | grep -v "^$" | tail -6)
+    fi
+    log "ERR" "Utolsó logsorok: ${tail_lines:-(log üres)}"
     return 1
   fi
 
@@ -657,32 +664,51 @@ except Exception as e:
 #   RTX 5090 SM_120 → cu128 vagy nightly szükséges
 # FIGYELEM: ~2-4 GB letöltés, 5-15 perc
 _vllm_fix_pytorch_blackwell() {
-  log "INFO" "PyTorch Blackwell fix indítás: cu128 wheel reinstall"
+  log "INFO" "PyTorch Blackwell fix indítás: cu128 wheel reinstall (uv)"
 
   # cu128 PyTorch index — Blackwell sm_120 kernelekkel
+  # Forrás: https://pytorch.org/get-started/locally/ (official)
   local torch_index="https://download.pytorch.org/whl/cu128"
   local fix_log="${SCRIPT_DIR}/wrapper_pytorch_fix_$(date +%H%M%S).log"
 
-  whiptail --msgbox "PyTorch Blackwell (SM_120) fix indítása\n\nA jelenlegi PyTorch csak sm_90-ig (Ada Lovelace) támogatott.\nRTX 5090 SM_120-hoz cu128 wheel kell.\n\nIndex: ${torch_index}\nLetöltés: ~2-4 GB\nIdő:  5-15 perc\n\nLog: ${fix_log}\n\nOK = indítás" 18 72
+  # uv elérési útja — CORE rendszer uv-t használ pip helyett!
+  # 01b_post_reboot.sh telepíti: ~/.local/bin/uv
+  # sudo -u kontextusban a PATH nem tartalmazza ~/.local/bin-t → explicit útvonal kell
+  local uv_bin="${_REAL_HOME}/.local/bin/uv"
+  if [ ! -x "$uv_bin" ]; then
+    # Fallback: keressük a PATH-on (ha pl. /usr/local/bin/uv-ből van)
+    uv_bin=$(sudo -u "$_REAL_USER" bash -c \
+      "PATH=\"\$HOME/.local/bin:\$HOME/.cargo/bin:\$PATH\" command -v uv" 2>/dev/null)
+  fi
+  if [ -z "$uv_bin" ] || [ ! -x "$uv_bin" ]; then
+    log "ERR" "uv nem található: $uv_bin"
+    whiptail --msgbox "HIBA: uv nem található!\n\nuv elvárt helye: ${_REAL_HOME}/.local/bin/uv\n\nEllenőrizd hogy a 01b modul telepítve van-e:\n  which uv" 12 65
+    return 1
+  fi
+  log "INFO" "uv elérési útja: $uv_bin"
 
-  # Reinstall PyTorch cu128-cal — venv-ben, user kontextusban
-  # pip --force-reinstall: meglévő cu126 csomagok felülírása
+  whiptail --msgbox "PyTorch Blackwell (SM_120) fix indítása\n\nA jelenlegi PyTorch csak sm_90-ig (Ada Lovelace) támogatott.\nRTX 5090 SM_120-hoz cu128 wheel kell.\n\nEszköz: uv pip install (CORE konvenció)\nIndex:  ${torch_index}\nLetöltés: ~2-4 GB\nIdő:  5-15 perc\n\nLog: ${fix_log}\n\nOK = indítás" 20 72
+
+  # Reinstall PyTorch cu128-cal — uv pip install (INFRA konvenció, nem pip!)
+  # NOTA: uv flag: --reinstall (nem --force-reinstall — az pip-specifikus)
+  # Forrás: https://docs.astral.sh/uv/ (official uv dokumentáció)
   sudo -u "$_REAL_USER" bash -c "
+    export PATH='${_REAL_HOME}/.local/bin:${_REAL_HOME}/.cargo/bin:/usr/local/bin:/usr/bin:/bin'
     source '${AI_VENV_DIR}/bin/activate'
-    pip install torch torchvision torchaudio \
+    '${uv_bin}' pip install torch torchvision torchaudio \
       --index-url '${torch_index}' \
-      --force-reinstall \
+      --reinstall \
       2>&1 | tee '${fix_log}'
   " &
   local fix_pid=$!
 
-  # Progress gauge — pip output figyelés
+  # Progress gauge — uv pip output figyelés
   (
     local elapsed=0
     while kill -0 "$fix_pid" 2>/dev/null; do
       local pct last_line
       last_line=$(tail -1 "$fix_log" 2>/dev/null | cut -c1-65)
-      # pip download progress: "  X%" formátum
+      # uv download progress: különböző formátumok (byte vagy %)
       pct=$(tail -5 "$fix_log" 2>/dev/null | grep -oP '\d+(?=%)' | tail -1)
       [ -z "$pct" ] && pct=$(( elapsed * 60 / 600 ))
       [ "$pct" -gt 95 ] && pct=95
@@ -692,10 +718,10 @@ _vllm_fix_pytorch_blackwell() {
       sleep 5; elapsed=$(( elapsed + 5 ))
     done
     echo 100
-  ) | whiptail --title "PyTorch Blackwell fix — cu128 reinstall" \
-      --gauge "$(printf 'torch + torchvision + torchaudio\nIndex: %s\nLog: %s\n\nESC = háttérbe' \
+  ) | whiptail --title "PyTorch Blackwell fix — cu128 reinstall (uv)" \
+      --gauge "$(printf 'torch + torchvision + torchaudio\nEszköz: uv pip install\nIndex:  %s\nLog:    %s\n\nESC = háttérbe' \
         "$torch_index" "$fix_log")" \
-      12 76 0
+      14 76 0
 
   wait "$fix_pid"
   local exit_code=$?
@@ -705,15 +731,15 @@ _vllm_fix_pytorch_blackwell() {
     # Ellenőrzés: most már ismeri-e sm_120-t?
     if _vllm_check_pytorch_blackwell; then
       log "INFO" "PyTorch Blackwell fix SIKERES — sm_120 most támogatott"
-      whiptail --msgbox "✓ PyTorch Blackwell fix kész!\n\nAz RTX 5090 (SM_120) mostantól kompatibilis.\nvLLM most már indítható." 12 60
+      whiptail --msgbox "✓ PyTorch Blackwell fix kész!\n\nAz RTX 5090 (SM_120) mostantól kompatibilis.\nvLLM most már indítható!" 12 60
       infra_state_set "PYTORCH_INDEX" "cu128" 2>/dev/null || true
     else
       log "WARN" "PyTorch Blackwell fix: telepítés kész, de sm_120 még mindig nem látható"
-      whiptail --msgbox "⚠ PyTorch reinstall kész, de sm_120 ellenőrzés sikertelen.\nEllenőrizd a logot:\n  $fix_log\n\nPróbáld: source ~/venvs/ai/bin/activate && python -c \"import torch; print(torch.cuda.get_arch_list())\"" 14 72
+      whiptail --msgbox "⚠ uv pip reinstall kész, de sm_120 ellenőrzés sikertelen.\nLog: $fix_log\n\nManuálisan ellenőrzés:\n  source ~/venvs/ai/bin/activate\n  python -c \"import torch; print(torch.cuda.get_arch_list())\"" 14 72
     fi
   else
     log "ERR" "PyTorch Blackwell fix SIKERTELEN (exit: $exit_code). Log: $fix_log"
-    whiptail --msgbox "✗ PyTorch reinstall sikertelen!\n\nLog: $fix_log\n\nManuálisan:\n  source ~/venvs/ai/bin/activate\n  pip install torch --index-url https://download.pytorch.org/whl/cu128 --force-reinstall" 16 72
+    whiptail --msgbox "✗ PyTorch reinstall sikertelen!\n\nLog: $fix_log\n\nManuálisan (uv):\n  source ~/venvs/ai/bin/activate\n  uv pip install torch torchvision torchaudio \\\n    --index-url https://download.pytorch.org/whl/cu128 \\\n    --reinstall" 18 72
   fi
 }
 
