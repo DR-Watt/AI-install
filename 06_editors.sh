@@ -189,10 +189,10 @@ VSCODE_SETTINGS='{
   "telemetry.telemetryLevel": "off",
   "python.defaultInterpreterPath": "${env:HOME}/venvs/ai/bin/python",
   "java.runtime": "/usr/lib/jvm/default-java/bin/java",
-  "kickassembler.java": "/usr/lib/jvm/default-java/bin/java",
+  "kickassembler.java.runtime": "/usr/lib/jvm/default-java/bin/java",
   "kickassembler.outputDirectory": ".build",
-  "kickassembler.emulatorRuntime": "/usr/bin/x64sc",
-  "kickassembler.emulatorArgs": ["-autostartprgmode", "1", "-autostart"]
+  "kickassembler.emulator.runtime": "/usr/bin/x64sc",
+  "kickassembler.emulator.args": ["-autostartprgmode", "1", "-autostart"]
 }'
 
 # ── Komponens ellenőrző specifikációk ────────────────────────────────────────
@@ -428,9 +428,9 @@ real_home = "$_REAL_HOME"
 try:
     with open(f) as fp: s = json.load(fp)
 except: s = {}
-s["kickassembler.kickAssemblerJar"] = real_home + "/tools/kickassembler/KickAss.jar"
+s["kickassembler.assembler.jar"] = real_home + "/tools/kickassembler/KickAss.jar"
 with open(f, "w") as fp: json.dump(s, fp, indent=2, ensure_ascii=False)
-print("kickassembler.kickAssemblerJar OK:", s["kickassembler.kickAssemblerJar"])
+print("kickassembler.assembler.jar OK:", s["kickassembler.assembler.jar"])
 PYEOF2
 
   else
@@ -714,17 +714,20 @@ if [ ! -f "$KICKASS_DIR/KickAss.jar" ]; then
     run_with_progress "KickAssembler" "KickAssembler.zip letöltése..."       wget -q -O "$_kickass_zip" "${URLS[kickass_jar]}"
 
     if [ -f "$_kickass_zip" ]; then
-      # unzip: a zip-ben KickAss.jar van (Mads Nielsen csomagja)
-      if command -v unzip &>/dev/null; then
-        unzip -o -j "$_kickass_zip" "KickAss.jar"           -d "$KICKASS_DIR" >> "$LOGFILE_AI" 2>&1
-      else
-        # unzip nincs → apt install
-        apt_install_log "unzip" unzip
-        unzip -o -j "$_kickass_zip" "KickAss.jar"           -d "$KICKASS_DIR" >> "$LOGFILE_AI" 2>&1
-      fi
+      # *.jar wildcard: a zip tartalma verziónként eltérhet
+      # (KickAss.jar, kickass.jar, KickAssembler.jar stb.)
+      command -v unzip &>/dev/null || apt_install_log "unzip" unzip
+
+      # -j: könyvtárszerkezet nélkül (junk paths) — minden .jar kijön
+      unzip -o -j "$_kickass_zip" "*.jar"         -d "$KICKASS_DIR" >> "$LOGFILE_AI" 2>&1
       rm -f "$_kickass_zip"
 
-      if [ -f "$KICKASS_DIR/KickAss.jar" ]; then
+      # Az első .jar fájl megkeresése (névtől függetlenül)
+      _found_jar=$(find "$KICKASS_DIR" -maxdepth 1 -name "*.jar" | sort | head -1)
+
+      if [ -n "$_found_jar" ]; then
+        # Normalizálás: mindig KickAss.jar névvel használjuk
+        [ "$_found_jar" != "$KICKASS_DIR/KickAss.jar" ] &&           mv "$_found_jar" "$KICKASS_DIR/KickAss.jar" &&           log "INFO" "Jar átnevezve: $(basename "$_found_jar") → KickAss.jar"
         chown -R "$_REAL_UID:$_REAL_GID" "$KICKASS_DIR"
         ((++OK))
         log "OK" "KickAss.jar telepítve: $KICKASS_DIR/KickAss.jar"
