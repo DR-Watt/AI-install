@@ -69,6 +69,9 @@ declare -A URLS=(
   [ms_gpg]="https://packages.microsoft.com/keys/microsoft.asc"
   # Microsoft VS Code APT repo
   [vscode_repo]="https://packages.microsoft.com/repos/vscode"
+  # KickAssembler — Java-alapú C64 assembler, Kick Assembler VS Code extension igényli
+  # Forrás: http://theweb.dk/KickAssembler/ — Mads Nielsen hivatalos oldala
+  [kickass_jar]="https://theweb.dk/KickAssembler/KickAssembler.zip"
 )
 
 # ── VS Code extension-ök csoportonként ────────────────────────────────────────
@@ -111,10 +114,11 @@ declare -A VSCODE_EXT=(
             christian-kohler.path-intellisense
             ms-vscode.vscode-typescript-next"
 
-  # C64 / Demoscene assembly — CASL65, KickAssembler, ACME
-  [c64]="tlgkccampbell.code-casl65
-         paulhocker.kick-assembler-vscode-ext
-         bgold-cosmos.vscode-acme-cross-asm"
+  # C64 / Demoscene assembly — KickAssembler (Kick Assembler 8-Bit Retro Studio)
+  # Forrás: https://marketplace.visualstudio.com/items?itemName=paulhocker.kick-assembler-vscode-ext
+  # ELTÁVOLÍTVA: tlgkccampbell.code-casl65 és bgold-cosmos.vscode-acme-cross-asm
+  #   — nem léteznek a VS Code Marketplace-en (Failed Installing Extensions hibaüzenet)
+  [c64]="paulhocker.kick-assembler-vscode-ext"
 
   # Sysadmin — shellcheck, ansible, YAML, PowerShell
   [sysadmin]="ms-vscode.powershell
@@ -185,7 +189,11 @@ VSCODE_SETTINGS='{
   "telemetry.telemetryLevel": "off",
   "python.defaultInterpreterPath": "${env:HOME}/venvs/ai/bin/python",
   "java.runtime": "/usr/lib/jvm/default-java/bin/java",
-  "kickassembler.javaRuntime": "/usr/lib/jvm/default-java/bin/java"
+  "kickassembler.javaRuntime": "/usr/lib/jvm/default-java/bin/java",
+  "kickassembler.kickAssemblerJar": "${env:HOME}/tools/kickassembler/KickAssembler.jar",
+  "kickassembler.outputDirectory": ".build",
+  "kickassembler.emulatorRuntime": "/usr/bin/x64sc",
+  "kickassembler.emulatorArgs": ["-autostartprgmode", "1", "-autostart"]
 }'
 
 # ── Komponens ellenőrző specifikációk ────────────────────────────────────────
@@ -666,6 +674,75 @@ if ! cmd_exists java && ! dpkg -l default-jre 2>/dev/null | grep -q "^ii"; then
   fi
 else
   log "INFO" "Java már telepítve: $(java -version 2>&1 | head -1)"
+fi
+
+
+# =============================================================================
+# KICK ASSEMBLER + VICE EMULATOR — C64 fejlesztői eszközök
+# =============================================================================
+# KickAssembler.jar: Java-alapú C64/C128 assembler
+#   Forrás: http://theweb.dk/KickAssembler/ — Mads Nielsen (hivatalos)
+#   A Kick Assembler VS Code extension ezt igényli a kód fordításához.
+#
+# VICE emulator: Versatile Commodore Emulator
+#   Ubuntu 24.04 noble repóban: vice csomag → /usr/bin/x64sc
+#   Forrás: https://packages.ubuntu.com/noble/vice
+
+KICKASS_DIR="$_REAL_HOME/tools/kickassembler"
+
+# ── KickAssembler.jar letöltése ───────────────────────────────────────────────
+if [ ! -f "$KICKASS_DIR/KickAssembler.jar" ]; then
+  if ask_proceed "KickAssembler.jar letöltése? (C64 assembler, VS Code extension igényli)"; then
+    mkdir -p "$KICKASS_DIR"
+    _kickass_zip="/tmp/KickAssembler.zip"
+
+    run_with_progress "KickAssembler" "KickAssembler.zip letöltése..."       wget -q -O "$_kickass_zip" "${URLS[kickass_jar]}"
+
+    if [ -f "$_kickass_zip" ]; then
+      # unzip: a zip-ben KickAssembler.jar van közvetlenül
+      if command -v unzip &>/dev/null; then
+        unzip -o -j "$_kickass_zip" "KickAssembler.jar"           -d "$KICKASS_DIR" >> "$LOGFILE_AI" 2>&1
+      else
+        # unzip nincs → apt install
+        apt_install_log "unzip" unzip
+        unzip -o -j "$_kickass_zip" "KickAssembler.jar"           -d "$KICKASS_DIR" >> "$LOGFILE_AI" 2>&1
+      fi
+      rm -f "$_kickass_zip"
+
+      if [ -f "$KICKASS_DIR/KickAssembler.jar" ]; then
+        chown -R "$_REAL_UID:$_REAL_GID" "$KICKASS_DIR"
+        ((++OK))
+        log "OK" "KickAssembler.jar telepítve: $KICKASS_DIR/KickAssembler.jar"
+      else
+        ((FAIL++))
+        log "FAIL" "KickAssembler.jar kicsomagolás sikertelen"
+        dialog_warn "KickAssembler — Hiba"           "
+  A .jar kicsomagolása sikertelen.
+  Manuálisan: http://theweb.dk/KickAssembler/" 10
+      fi
+    else
+      ((FAIL++))
+      log "FAIL" "KickAssembler.zip letöltés sikertelen: ${URLS[kickass_jar]}"
+    fi
+  else
+    ((SKIP++))
+    log "SKIP" "KickAssembler letöltés kihagyva"
+  fi
+else
+  log "INFO" "KickAssembler.jar már megvan: $KICKASS_DIR/KickAssembler.jar"
+fi
+
+# ── VICE emulator telepítése ──────────────────────────────────────────────────
+# x64sc = VICE C64 emulator (Super CPU változat, ajánlott)
+if ! command -v x64sc &>/dev/null && ! dpkg -l vice 2>/dev/null | grep -q "^ii"; then
+  if ask_proceed "VICE C64 emulator telepítése? (x64sc — VS Code C64 futtatáshoz)"; then
+    apt_install_progress "VICE emulator" "VICE telepítése..." vice       && { ((++OK)); log "OK" "VICE telepítve: $(x64sc --version 2>/dev/null | head -1)"; }       || ((FAIL++))
+  else
+    ((SKIP++))
+    log "SKIP" "VICE emulator telepítés kihagyva"
+  fi
+else
+  log "INFO" "VICE emulator már telepítve: $(x64sc --version 2>/dev/null | head -1 || echo 'x64sc elérhető')"
 fi
 
 # =============================================================================
