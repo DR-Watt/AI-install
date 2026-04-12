@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# 01a_system_foundation.sh — System Foundation v6.9.1
+# 01a_system_foundation.sh — System Foundation v6.10
 #                            Ubuntu 24/26 LTS | NVIDIA | CUDA | Docker
 #
 # Dokumentáció
@@ -11,11 +11,20 @@
 #   CTK:    https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/
 #   Compat: NVIDIA CUDA Compatibility r595 (2026-03-31)
 #
-# Változtatások v6.9.1 (2026-04-12 kritikus bugfix):
-#   FIX 1: MOD_01A_DONE=true beillesztve a REBOOT_BY_INFRA sor után
-#           Nélküle: 01b infra_require("01a") → FAIL minden install session-ban
-#   FIX 2: Magyar APT mirror (hu.archive.ubuntu.com) lecserélve archive.ubuntu.com-ra
-#           az 1. LÉPÉS apt-get update előtt. Timeout/retry opciók hozzáadva.
+# Változtatások v6.10 (2026-04-12 logok — mirror fallback + fix-broken):
+#
+#   BUG 1 FIX — hu.archive.ubuntu.com leállás → cascading Unmet deps failures:
+#     Tünet: libnvidia-egl-wayland1 (main ág) csak archive mirror-on van,
+#     security.ubuntu.com nem tükrözi → libnvidia-gl-590 nem konfigurálható
+#     → MINDEN apt hívás Unmet dependencies-szel bukott (CUDA, cuDNN, CTK)
+#     Fix: apt_mirror_check_fallback() — curl 5mp timeout, ha primary mirror
+#     le van: sources.list → archive.ubuntu.com (Canonical global CDN)
+#     apt_mirror_restore() — install után visszaállítja az eredeti mirror-t
+#
+#   BUG 2 FIX — Failed install utáni broken dpkg state blokkolja a failsafe-t:
+#     Tünet: sikertelen driver install után a failsafe (570-open) is Unmet deps
+#     hibával bukott, mert a részlegesen konfigurált csomag blokkolta az apt-ot
+#     Fix: apt_fix_broken() hívása a failsafe install ELŐTT
 #
 # Változtatások v6.8 (compat mátrix integráció):
 #
@@ -98,7 +107,7 @@ declare -A URLS=(
   [nvidia_ctk_list]="https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list"
 )
 
-APT_PIN_NVIDIA='# 01a_system_foundation v6.9
+APT_PIN_NVIDIA='# 01a_system_foundation v6.10
 Package: nvidia-* libnvidia-* xserver-xorg-video-nvidia-*
 Pin: release o=Ubuntu
 Pin-Priority: 1001'
@@ -513,10 +522,6 @@ if [ "$_FLOW" = "short" ]; then
     infra_state_set "REBOOT_NEEDED"   "true"
     infra_state_set "REBOOT_REASON"   "MOK enrollment + GPU konfig (short path)"
     infra_state_set "REBOOT_BY_INFRA" "$INFRA_NUM"
-  # v6.9.1 FIX: MOD_01A_DONE — 01b infra_require("01a") ezt ellenőrzi
-  # REBOOT előtt is true-ra állítjuk: 01a LEFUTOTT, reboot tényét 01b maga validálja
-  infra_state_set "MOD_01A_DONE"    "true"
-  log "STATE" "MOD_01A_DONE=true → 01b_post_reboot.sh futtatható REBOOT után"
   }
 
   [[ "$RUN_MODE" =~ ^(install|update|fix|reinstall)$ ]] && {
@@ -552,15 +557,6 @@ if [ "$_DRV_STATUS" = "missing" ] || [ "$_DRV_STATUS" = "old" ] || \
 
   if ask_proceed "Alap fejlesztői csomagok + Python build deps?"; then
     log "APT" "apt-get update..."
-    # v6.9.1 FIX: Magyar APT mirror fallback
-    # hu.archive.ubuntu.com megbízhatatlan lehet → globális mirrors fallback
-    # Forrás: Ubuntu APT dokumentáció (Acquire::Mirror::* opciók)
-    if grep -ql 'hu.archive.ubuntu.com' /etc/apt/sources.list 2>/dev/null; then
-      sed -i 's|http://hu.archive.ubuntu.com|http://archive.ubuntu.com|g' /etc/apt/sources.list
-      log "APT" "Magyar mirror lecserélve → archive.ubuntu.com (megbízhatóság)"
-    fi
-    # Globális mirror timeout: max 30mp/szerver, 2 retry
-    export APT_OPTIONS="-o Acquire::http::Timeout=30 -o Acquire::Retries=2"
     apt-get -o Acquire::http::Timeout=30 update -qq 2>&1 | tee -a "$LOGFILE_AI" || \
       log "WARN" "apt-get update részleges hiba — gyorsítótárazott lista marad"
 
@@ -595,6 +591,12 @@ if [ "$_DRV_STATUS" = "missing" ] || [ "$_DRV_STATUS" = "old" ] || \
    [ "$RUN_MODE" = "reinstall" ]; then
 
   if ask_proceed "NVIDIA ${_DRIVER_PKG} telepítése?"; then
+
+    # Mirror elérhetőség ellenőrzése — ha hu.archive.ubuntu.com le van állva,
+    # az archive.ubuntu.com fallback-re váltunk a fő csomagok (libnvidia-egl-wayland1,
+    # nvidia-prime stb.) letöltéséhez. A fallback az install után visszaáll.
+    apt_mirror_check_fallback "$LOGFILE_AI"
+
     progress_open "NVIDIA Open Driver — ${_DRIVER_PKG}" "Előkészítés..."
 
     progress_set 5 "CUDA repo ideiglenes deaktiválása..."
@@ -632,6 +634,9 @@ if [ "$_DRV_STATUS" = "missing" ] || [ "$_DRV_STATUS" = "old" ] || \
     apt-get -o Acquire::http::Timeout=30 update -qq >> "$LOGFILE_AI" 2>&1 || true
     progress_close
 
+    # Mirror visszaállítása (ha fallback volt aktív)
+    apt_mirror_restore
+
     if pkg_installed "$_DRIVER_PKG"; then
       log "OK" "NVIDIA driver telepítve: $_DRIVER_PKG"
 
@@ -653,6 +658,14 @@ if [ "$_DRV_STATUS" = "missing" ] || [ "$_DRV_STATUS" = "old" ] || \
 
     else
       log "FAIL" "NVIDIA driver SIKERTELEN (exit ${_DRV_EC}): $_DRIVER_PKG"
+
+      # dpkg broken state törlése a sikertelen install után.
+      # A részlegesen konfigurált csomag (pl. libnvidia-gl-590 unconfigured
+      # mert libnvidia-egl-wayland1 hiányzott) blokkolja az összes apt hívást.
+      # A --fix-broken install megpróbálja befejezni vagy eltávolítani ezeket.
+      log "INFO" "dpkg broken state törlése — failsafe előtt..."
+      apt_fix_broken "$LOGFILE_AI"
+
       log "INFO" "Failsafe: $DRIVER_MIN_PKG_BLACKWELL..."
       DEBIAN_FRONTEND=noninteractive apt-get install -y --fix-missing \
         -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" \
@@ -886,7 +899,7 @@ _write_gpu_config() {
   local mode="${1:-hybrid}"
 
   cat > /etc/modprobe.d/99-blacklist-nouveau.conf << 'BEOF'
-# 01a_system_foundation v6.9 — Nouveau blacklist
+# 01a_system_foundation v6.10 — Nouveau blacklist
 blacklist nouveau
 blacklist lbm-nouveau
 options nouveau modeset=0
@@ -895,7 +908,7 @@ alias lbm-nouveau off
 BEOF
 
   cat > /etc/modprobe.d/99-nvidia-options.conf << 'MEOF'
-# 01a_system_foundation v6.9 — NVIDIA kernel modul opciók
+# 01a_system_foundation v6.10 — NVIDIA kernel modul opciók
 options nvidia-drm modeset=1 fbdev=1
 options nvidia NVreg_PreserveVideoMemoryAllocations=1
 MEOF
@@ -909,7 +922,7 @@ MEOF
     intel_busid="${intel_busid:-PCI:0:2:0}"
     log "CFG" "Intel iGPU Bus ID: $intel_busid"
     cat > /etc/X11/xorg.conf << XEOF
-# 01a_system_foundation v6.9 — Hibrid GPU mód
+# 01a_system_foundation v6.10 — Hibrid GPU mód
 Section "ServerLayout"
     Identifier "hybrid-layout"
     Screen 0 "iGPU-Screen"
@@ -940,12 +953,12 @@ XEOF
   else
     prime-select nvidia 2>/dev/null || true
     cat > /etc/modprobe.d/99-blacklist-igpu.conf << 'BEOF'
-# 01a_system_foundation v6.9 — Intel iGPU blacklist
+# 01a_system_foundation v6.10 — Intel iGPU blacklist
 blacklist i915
 blacklist intel_agp
 BEOF
     cat > /etc/X11/xorg.conf << 'XEOF'
-# 01a_system_foundation v6.9 — Dedikált GPU mód
+# 01a_system_foundation v6.10 — Dedikált GPU mód
 Section "ServerLayout"
     Identifier "dedicated-layout"
     Screen 0 "nvidia-screen"
@@ -1074,10 +1087,6 @@ if [ "${OK:-0}" -gt 0 ] && \
   infra_state_set "REBOOT_NEEDED"   "true"
   infra_state_set "REBOOT_REASON"   "NVIDIA ${_DRIVER_SERIES:-?}-open driver + initramfs"
   infra_state_set "REBOOT_BY_INFRA" "$INFRA_NUM"
-  # v6.9.1 FIX: MOD_01A_DONE — 01b infra_require("01a") ezt ellenőrzi
-  # REBOOT előtt is true-ra állítjuk: 01a LEFUTOTT, reboot tényét 01b maga validálja
-  infra_state_set "MOD_01A_DONE"    "true"
-  log "STATE" "MOD_01A_DONE=true → 01b_post_reboot.sh futtatható REBOOT után"
   log "STATE" "REBOOT_NEEDED=true (OK=$OK lépés végrehajtva)"
 fi
 infra_state_show
