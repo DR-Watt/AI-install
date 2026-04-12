@@ -27,13 +27,13 @@
 #   RUN_MODE=update bash 06_editors.sh — frissítő mód
 #   00_master.sh hívja RUN_MODE exportálással
 #
-# VERZIÓ: v6.4 (LIB split kompatibilis)
+# VERZIÓ: v6.5 (LIB split + compat mátrix + COMP STATE mód-tudatos)
 # =============================================================================
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # 00_lib.sh: master loader — betölti az összes lib/ komponenst
-# Betöltési sorrend: core → hw → ui → state → comp → apt (függőségi sorrend)
+# Betöltési sorrend: core → compat → hw → ui → state → comp → apt (függőségi sorrend)
 LIB="$SCRIPT_DIR/00_lib.sh"
 [ -f "$LIB" ] && source "$LIB" || { echo "HIBA: 00_lib.sh hiányzik: $LIB"; exit 1; }
 
