@@ -393,8 +393,11 @@ if [ "${COMP_STATUS[vscode]:-missing}" != "ok" ] || [ "$RUN_MODE" = "reinstall" 
     fi
 
     # Telepítés progress ablakkal (apt_install_progress: 00_lib_apt.sh)
-    apt_install_progress "VS Code" "VS Code telepítése..." code \
-      && ((OK++)) || ((FAIL++))
+    if apt_install_progress "VS Code" "VS Code telepítése..." code; then
+      ((OK++))
+    else
+      ((FAIL++))
+    fi
 
     # Globális VS Code settings.json létrehozása
     # _REAL_HOME: 00_lib_core.sh — sudo-safe valós user home
