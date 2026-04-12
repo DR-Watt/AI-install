@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# 02_local_ai_stack.sh — Lokális AI Stack v6.5.1
+# 02_local_ai_stack.sh — Lokális AI Stack v6.5.2
 #                        Ollama + vLLM + TurboQuant llama.cpp fork
 #
 # Szerepe az INFRA rendszerben
@@ -73,6 +73,28 @@
 #         03 v6.5: MOD_03_DONE=true CSAK FAIL==0 esetén kerül beírásra.
 #         Korábban FAIL>0 esetén is true lehetett → infra_require("03") téves bypass.
 #         A 02-ben lévő infra_require("03") hívás most pontosabb eredményt kap.
+#
+# JAVÍTÁSOK v6.5.2 (2026-04-12 install log analízis alapján)
+# ────────────────────────────────────────────────────────────
+#   Bizonyíték: install_02_20260412_172834.log
+#
+#   [FIX] FEAT_VLLM=false hamis override — SZEKCIÓ 6d:
+#         Tünet: vLLM 0.19.0 sikeresen települ, FEAT_VLLM=true beírva,
+#         majd infra_state_validate() FEAT_VLLM=false-ra írja vissza.
+#         Gyökérok: validate() infra_state_get("FEAT_GPU_ACCEL","false") →
+#           01a v6.11 nem írja FEAT_GPU_ACCEL-t → hiányzó = "false" = false positive.
+#           → validate() thinks FEAT_VLLM=true + FEAT_GPU_ACCEL=false = inkonzisztencia
+#         Megoldás 1 (lib fix): lib/00_lib_state.sh validate() default "" + HW_VLLM_OK check
+#         Megoldás 2 (02 fix): vLLM install után FEAT_GPU_ACCEL=true beírása
+#           → validate() már nem triggeri a false positive-t
+#
+#   [FIX] PYTORCH_INDEX stale vLLM install után — SZEKCIÓ 6d:
+#         Tünet: PYTORCH_INDEX=cu126 state de vLLM 0.19.0 saját torch-ot installált
+#           (torch==2.10.0+cu128, GPU test: CUDA 12.8)
+#         Gyökérok: vLLM --no-build-isolation saját CUDA-függőségeket hoz
+#           (pl. cu128) ami eltérhet a PYTORCH_INDEX=cu126 state értéktől.
+#         Következmény: következő update módban cu126 force-reinstall downgrade-elne!
+#         Megoldás: vLLM install után torch.version.cuda lekérése és PYTORCH_INDEX frissítése
 #
 # ELŐFELTÉTELEK
 # ─────────────
@@ -656,7 +678,31 @@ if ${HW_VLLM_OK}; then
         ((OK++))
         infra_state_set "INST_VLLM_VER"  "$VLLM_VER"
         infra_state_set "FEAT_VLLM"      "true"
+        infra_state_set "FEAT_GPU_ACCEL" "true"   # validate() hamis pozitív megelőzése
         log "OK" "vLLM telepítve: v${VLLM_VER}"
+
+        # [FIX v6.5.2] PYTORCH_INDEX szinkronizáció vLLM install után
+        # PROBLÉMA: a vLLM 0.19.0 --no-build-isolation alatt saját torch-ot installál
+        # (pl. 2.10.0+cu128), ami eltérhet a PYTORCH_INDEX=cu126 state értéktől.
+        # Következmény: következő 02 update módban cu126 force-reinstall downgrade-elne!
+        # Gyökérok: install_02_20260412_172834.log:
+        #   vLLM installed torch==2.10.0+cu128 (GPU test: CUDA verzió: 12.8)
+        #   de PYTORCH_INDEX=cu126 maradt → state/valóság inkonzisztencia
+        # Megoldás: telepítés után lekérjük a valódi torch CUDA verziót és szinkronizáljuk.
+        _vllm_torch_cuda=$("$VENV_PY" -c \
+          "import torch; v=getattr(torch.version,'cuda',''); print(v if v else '')" \
+          2>/dev/null | grep -oP '\d+\.\d+' | head -1)
+        if [ -n "$_vllm_torch_cuda" ]; then
+          # cuda_pytorch_index(): pl. "12.8" → "cu128", "12.6" → "cu126"
+          _actual_py_idx=$(cuda_pytorch_index "$_vllm_torch_cuda" 2>/dev/null \
+                           || echo "cu$(echo "$_vllm_torch_cuda" | tr -d .)")
+          if [ -n "$_actual_py_idx" ] && [ "$_actual_py_idx" != "$PYTORCH_INDEX" ]; then
+            log "VLLM" "PyTorch CUDA szinkronizáció: ${PYTORCH_INDEX} → ${_actual_py_idx}"
+            log "VLLM" "  (vLLM telepítette: torch ${VLLM_VER:-?} CUDA ${_vllm_torch_cuda})"
+            PYTORCH_INDEX="$_actual_py_idx"
+            infra_state_set "PYTORCH_INDEX" "$_actual_py_idx"
+          fi
+        fi
       else
         ((FAIL++))
         infra_state_set "FEAT_VLLM" "false"
