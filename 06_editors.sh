@@ -189,8 +189,7 @@ VSCODE_SETTINGS='{
   "telemetry.telemetryLevel": "off",
   "python.defaultInterpreterPath": "${env:HOME}/venvs/ai/bin/python",
   "java.runtime": "/usr/lib/jvm/default-java/bin/java",
-  "kickassembler.javaRuntime": "/usr/lib/jvm/default-java/bin/java",
-  "kickassembler.kickAssemblerJar": "${env:HOME}/tools/kickassembler/KickAssembler.jar",
+  "kickassembler.java": "/usr/lib/jvm/default-java/bin/java",
   "kickassembler.outputDirectory": ".build",
   "kickassembler.emulatorRuntime": "/usr/bin/x64sc",
   "kickassembler.emulatorArgs": ["-autostartprgmode", "1", "-autostart"]
@@ -417,6 +416,22 @@ if [ "${COMP_STATUS[vscode]:-missing}" != "ok" ] || [ "$RUN_MODE" = "reinstall" 
     chown "$_REAL_UID:$_REAL_GID" \
       "$_REAL_HOME/.config/Code/User/settings.json"
     log "OK" "VS Code settings.json írva: $_REAL_HOME/.config/Code/User/settings.json"
+
+    # KickAssembler jar abszolút útvonal beírása a settings.json-ba
+    # FONTOS: ${env:HOME} a statikus VSCODE_SETTINGS-ben NEM bővül ki
+    # az extension olvasásakor → abszolút útként kell megadni
+    _kickass_settings_file="$_REAL_HOME/.config/Code/User/settings.json"
+    python3 - << PYEOF2 >> "$LOGFILE_AI" 2>&1
+import json, sys
+f = "$_kickass_settings_file"
+real_home = "$_REAL_HOME"
+try:
+    with open(f) as fp: s = json.load(fp)
+except: s = {}
+s["kickassembler.kickAssemblerJar"] = real_home + "/tools/kickassembler/KickAss.jar"
+with open(f, "w") as fp: json.dump(s, fp, indent=2, ensure_ascii=False)
+print("kickassembler.kickAssemblerJar OK:", s["kickassembler.kickAssemblerJar"])
+PYEOF2
 
   else
     ((SKIP++))
@@ -691,31 +706,31 @@ fi
 KICKASS_DIR="$_REAL_HOME/tools/kickassembler"
 
 # ── KickAssembler.jar letöltése ───────────────────────────────────────────────
-if [ ! -f "$KICKASS_DIR/KickAssembler.jar" ]; then
-  if ask_proceed "KickAssembler.jar letöltése? (C64 assembler, VS Code extension igényli)"; then
+if [ ! -f "$KICKASS_DIR/KickAss.jar" ]; then
+  if ask_proceed "KickAss.jar letöltése? (C64 assembler, VS Code extension igényli)"; then
     mkdir -p "$KICKASS_DIR"
     _kickass_zip="/tmp/KickAssembler.zip"
 
     run_with_progress "KickAssembler" "KickAssembler.zip letöltése..."       wget -q -O "$_kickass_zip" "${URLS[kickass_jar]}"
 
     if [ -f "$_kickass_zip" ]; then
-      # unzip: a zip-ben KickAssembler.jar van közvetlenül
+      # unzip: a zip-ben KickAss.jar van (Mads Nielsen csomagja)
       if command -v unzip &>/dev/null; then
-        unzip -o -j "$_kickass_zip" "KickAssembler.jar"           -d "$KICKASS_DIR" >> "$LOGFILE_AI" 2>&1
+        unzip -o -j "$_kickass_zip" "KickAss.jar"           -d "$KICKASS_DIR" >> "$LOGFILE_AI" 2>&1
       else
         # unzip nincs → apt install
         apt_install_log "unzip" unzip
-        unzip -o -j "$_kickass_zip" "KickAssembler.jar"           -d "$KICKASS_DIR" >> "$LOGFILE_AI" 2>&1
+        unzip -o -j "$_kickass_zip" "KickAss.jar"           -d "$KICKASS_DIR" >> "$LOGFILE_AI" 2>&1
       fi
       rm -f "$_kickass_zip"
 
-      if [ -f "$KICKASS_DIR/KickAssembler.jar" ]; then
+      if [ -f "$KICKASS_DIR/KickAss.jar" ]; then
         chown -R "$_REAL_UID:$_REAL_GID" "$KICKASS_DIR"
         ((++OK))
-        log "OK" "KickAssembler.jar telepítve: $KICKASS_DIR/KickAssembler.jar"
+        log "OK" "KickAss.jar telepítve: $KICKASS_DIR/KickAss.jar"
       else
         ((FAIL++))
-        log "FAIL" "KickAssembler.jar kicsomagolás sikertelen"
+        log "FAIL" "KickAss.jar kicsomagolás sikertelen"
         dialog_warn "KickAssembler — Hiba"           "
   A .jar kicsomagolása sikertelen.
   Manuálisan: http://theweb.dk/KickAssembler/" 10
@@ -729,7 +744,7 @@ if [ ! -f "$KICKASS_DIR/KickAssembler.jar" ]; then
     log "SKIP" "KickAssembler letöltés kihagyva"
   fi
 else
-  log "INFO" "KickAssembler.jar már megvan: $KICKASS_DIR/KickAssembler.jar"
+  log "INFO" "KickAss.jar már megvan: $KICKASS_DIR/KickAss.jar"
 fi
 
 # ── VICE emulator telepítése ──────────────────────────────────────────────────
