@@ -1,6 +1,14 @@
 #!/bin/bash
 # =============================================================================
-# 00_registry.sh — INFRA Registry v2.4
+# 00_registry.sh — INFRA Registry v2.5
+#
+# Változtatások v2.5 (09 AI Model Manager integráció):
+#   - 09 AI Model Manager modul hozzáadva
+#     HW_REQ="vllm": SM_70+ NVIDIA szükséges (HW_VLLM_OK=true)
+#     RTX 5090 Blackwell SM_120: minden funkció elérhető
+#     Függőség: 02 (Ollama+vLLM+TQ) + 06 (VSCode+CLINE+Continue) — scripten belül
+#     Script: 09_ai_model_wrapper.sh
+#   - FÜGGŐSÉGEK komment frissítve: 09 → infra_require("02") + infra_require("06")
 #
 # Változtatások v2.4 (split lib v6.4 integráció):
 #   - LIB_VERSION minimum: 6.4 kell (split lib, infra_require case fix)
@@ -52,10 +60,12 @@
 #   "desktop" → nem notebook-igpu profil szükséges
 #
 # FÜGGŐSÉGEK — tájékoztató (a tényleges ellenőrzés infra_require()-rel történik):
-#   01b → infra_require("01a")   belül
-#   03  → infra_require("01b")   belül (vagy manuálisan skip-elhető)
-#   02  → infra_require("03")    belül
-#   06  → infra_require("03")    belül
+#   01b → infra_require("01a")         belül
+#   03  → infra_require("01b")         belül (vagy manuálisan skip-elhető)
+#   02  → infra_require("03")          belül
+#   06  → infra_require("03")          belül
+#   09  → infra_require("02")          belül (Ollama+vLLM+TQ)
+#   09  → infra_require("06")          belül (VSCode+CLINE+Continue.dev)
 #
 # A registry sorrendje = telepítési sorrend (INFRA_IDS tömb)
 # =============================================================================
@@ -195,6 +205,37 @@ infra_register "08" \
   "08_nas_synology.sh" \
   "OFF"
 
+# ── 09: AI Model Manager ──────────────────────────────────────────────────────
+# Ollama/vLLM model kezelő wrapper — RTX 5090 Blackwell SM_120 optimalizált.
+# Kettős üzemmód:
+#   INFRA mód (RUN_MODE=install|check|update):
+#     Telepíti az ai-model-ctl tool-t, inicial CLINE/Continue konfig,
+#     vLLM systemd user service fájl generálás.
+#   Manage mód (RUN_MODE=manage vagy önállóan):
+#     Interaktív whiptail menü: modell kezelés, backend váltás, TurboQuant, GPU monitor.
+#
+# HW_REQ="vllm": SM_70+ NVIDIA szükséges (HW_VLLM_OK=true).
+#   RTX 5090 Blackwell SM_120: teljes funkcionalitás (vLLM + TQ + Ollama-GPU).
+#   SM_70..SM_89: vLLM fut, TurboQuant GPU89 build.
+#   CPU-only: kihagyott (Ollama CPU-only az a 02-es modulnál van).
+#
+# Függőség (scriptben infra_require()-rel):
+#   02 → Ollama + vLLM + TurboQuant telepítve (MOD_02_DONE=true)
+#   06 → VS Code + CLINE + Continue.dev telepítve (MOD_06_DONE=true)
+#
+# Parancssori alias (install után): ai-model-ctl
+#   Elérhető módok: ai-model-ctl [manage|status|start-vllm MODEL|stop-vllm]
+#
+# Forrás: https://ollama.readthedocs.io/en/api/  (Ollama REST API)
+#         https://docs.vllm.ai/en/stable/cli/serve/  (vLLM CLI)
+#         https://github.com/0xSero/turboquant  (TurboQuant)
+infra_register "09" \
+  "AI Model Manager" \
+  "Ollama/vLLM kezelés, TurboQuant, CLINE+Continue konfig, RTX 5090" \
+  "vllm" \
+  "09_ai_model_wrapper.sh" \
+  "OFF"
+
 # =============================================================================
 # REGISTRY FÜGGVÉNYEK
 # =============================================================================
@@ -247,6 +288,7 @@ infra_run() {
   # Hardver kompatibilitás ellenőrzés a registry HW_REQ alapján
   # Ha HW_REQ="" → infra_compatible() mindig 0-t ad → fut
   # Ha HW_REQ="nvidia" → csak NVIDIA GPU-s profilokon fut
+  # Ha HW_REQ="vllm"   → csak HW_VLLM_OK=true profilokon fut (SM_70+)
   if ! infra_compatible "${INFRA_HW_REQ[$id]}"; then
     dialog_warn "Hardver inkompatibilis" \
       "\n  '${INFRA_NAME[$id]}' modul:\n  Hw. követelmény: ${INFRA_HW_REQ[$id]}\n  Jelenlegi profil: $HW_PROFILE\n\n  Ez a modul kihagyva." 14
