@@ -1,6 +1,11 @@
 #!/bin/bash
 # =============================================================================
-# 00_master.sh — Vibe Coding Workspace Installer v6.4.4
+# 00_master.sh — Vibe Coding Workspace Installer v6.4.5
+#
+# Változtatások v6.4.5 (2026-04-12 kritikus bugfix):
+#   FIX: REBOOT_NEEDED=true esetén a loop most megáll (break)
+#        Korábban: 01a után azonnal 01b is elindult → infra_require("01a") FAIL
+#        Most: 01a befejeztével leáll, user manuálisan indítja 01b-t reboot után
 #
 # Változtatások v6.4.4 (módnév dialógokban + COMP STATE részletes log):
 #   - dialog fejlécek: [$MODE_TITLE] prefix minden módválasztás utáni ablakban
@@ -299,6 +304,11 @@ for id in $(printf '%s' "$SELECTED" | tr -d '"' | tr ' ' '\n' | sort); do
           else
             REBOOT_NEEDED=true
             log "MASTER" "INFRA $id: OK — REBOOT_NEEDED flag aktív"
+          # v6.4.5 FIX: REBOOT_NEEDED=true → loop megállítása
+          # 01b (és más modulok) REBOOT ELŐTT NEM futtathatók.
+          # A felhasználó a reboot után indítja újra a mastert és választja 01b-t.
+          log "MASTER" "REBOOT_NEEDED=true — loop leállítva, további modulok kihagyva"
+          break
           fi
         else
           log "MASTER" "INFRA $id: OK"

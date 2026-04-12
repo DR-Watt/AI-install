@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# 01b_post_reboot.sh — User Environment v6.6
+# 01b_post_reboot.sh — User Environment v6.7
 #                       Zsh · Oh My Zsh · Shell konfiguráció · PATH
 #
 # Szerepe a INFRA rendszerben
@@ -31,6 +31,14 @@
 #   • 01a_system_foundation.sh sikeresen lefutott (MOD_01A_DONE=true)
 #   • Rendszer újraindult (az NVIDIA driver betöltve: nvidia-smi válaszol)
 #   • sudo jogosultság (chsh, apt)
+#
+# Változtatások v6.7 (01a/CORE szál 2026-04-12 fejlesztések alapján):
+#   - APT mirror fallback: hu.archive.ubuntu.com → archive.ubuntu.com
+#     Hely: 2. lépés (modern_cli apt_install_progress) előtt
+#     Azonos logika mint az 01a v6.9.1 FIX 2
+#   - HW_OS_CODENAME + HW_OS_VERSION betöltése a state-ből
+#     (01a v6.8 óta írja: HW_OS_CODENAME=noble, HW_OS_VERSION=24.04)
+#   - INFRA_NAME és üdvözlő dialog: OS verziót is megmutatja
 #
 # Változtatások v6.6 (idempotency fix — fix mód javítás):
 #   - 2. lépés (modern_cli): fix módban pkg_installed ellenőrzés minden csomagra
@@ -226,6 +234,9 @@ _CUDA_VER="$(infra_state_get "CUDA_VER" "12.6")"
 _HW_PROFILE="$(infra_state_get "HW_PROFILE" "unknown")"
 _HW_GPU_NAME="$(infra_state_get "HW_GPU_NAME" "ismeretlen GPU")"
 _PYTORCH_IDX="$(infra_state_get "PYTORCH_INDEX" "cu126")"
+_HW_OS_CODENAME="$(infra_state_get "HW_OS_CODENAME" "noble")"
+_HW_OS_VERSION="$(infra_state_get "HW_OS_VERSION" "24.04")"
+log "STATE" "Betöltve: OS=Ubuntu ${_HW_OS_VERSION} (${_HW_OS_CODENAME})"
 
 log "STATE" "Betöltve: CUDA=$_CUDA_VER PROFILE=$_HW_PROFILE PyTorch=$_PYTORCH_IDX"
 log "INFO"  "Valódi user: $REAL_USER | Home: $REAL_HOME | GUI: $GUI_BACKEND"
@@ -485,6 +496,14 @@ fi
 #
 # Forrás: Ubuntu 24.04 LTS universe repository
 
+# ── APT mirror fallback — 01a v6.9.1 FIX 2 kompatibilis ─────────────────────
+# A zsh és CLI csomagok Ubuntu repóból jönnek — hu.archive.ubuntu.com
+# lassú vagy megbízhatatlan lehet. Csere globális tükörre ha szükséges.
+# Forrás: Ubuntu APT dokumentáció, Acquire::* opciók
+if grep -ql 'hu.archive.ubuntu.com' /etc/apt/sources.list 2>/dev/null; then
+  sed -i 's|http://hu.archive.ubuntu.com|http://archive.ubuntu.com|g' /etc/apt/sources.list
+  log "APT" "Magyar mirror lecserélve → archive.ubuntu.com (megbízhatóság)"
+fi
 log "STEP" "━━━ 2/6: Modern CLI eszközök ━━━"
 
 if [[ "$RUN_MODE" =~ ^(install|update|reinstall|fix)$ ]]; then

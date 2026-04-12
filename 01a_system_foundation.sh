@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# 01a_system_foundation.sh — System Foundation v6.9
+# 01a_system_foundation.sh — System Foundation v6.9.1
 #                            Ubuntu 24/26 LTS | NVIDIA | CUDA | Docker
 #
 # Dokumentáció
@@ -10,6 +10,12 @@
 #   Docker: https://docs.docker.com/engine/install/ubuntu/
 #   CTK:    https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/
 #   Compat: NVIDIA CUDA Compatibility r595 (2026-03-31)
+#
+# Változtatások v6.9.1 (2026-04-12 kritikus bugfix):
+#   FIX 1: MOD_01A_DONE=true beillesztve a REBOOT_BY_INFRA sor után
+#           Nélküle: 01b infra_require("01a") → FAIL minden install session-ban
+#   FIX 2: Magyar APT mirror (hu.archive.ubuntu.com) lecserélve archive.ubuntu.com-ra
+#           az 1. LÉPÉS apt-get update előtt. Timeout/retry opciók hozzáadva.
 #
 # Változtatások v6.8 (compat mátrix integráció):
 #
@@ -507,6 +513,10 @@ if [ "$_FLOW" = "short" ]; then
     infra_state_set "REBOOT_NEEDED"   "true"
     infra_state_set "REBOOT_REASON"   "MOK enrollment + GPU konfig (short path)"
     infra_state_set "REBOOT_BY_INFRA" "$INFRA_NUM"
+  # v6.9.1 FIX: MOD_01A_DONE — 01b infra_require("01a") ezt ellenőrzi
+  # REBOOT előtt is true-ra állítjuk: 01a LEFUTOTT, reboot tényét 01b maga validálja
+  infra_state_set "MOD_01A_DONE"    "true"
+  log "STATE" "MOD_01A_DONE=true → 01b_post_reboot.sh futtatható REBOOT után"
   }
 
   [[ "$RUN_MODE" =~ ^(install|update|fix|reinstall)$ ]] && {
@@ -542,6 +552,15 @@ if [ "$_DRV_STATUS" = "missing" ] || [ "$_DRV_STATUS" = "old" ] || \
 
   if ask_proceed "Alap fejlesztői csomagok + Python build deps?"; then
     log "APT" "apt-get update..."
+    # v6.9.1 FIX: Magyar APT mirror fallback
+    # hu.archive.ubuntu.com megbízhatatlan lehet → globális mirrors fallback
+    # Forrás: Ubuntu APT dokumentáció (Acquire::Mirror::* opciók)
+    if grep -ql 'hu.archive.ubuntu.com' /etc/apt/sources.list 2>/dev/null; then
+      sed -i 's|http://hu.archive.ubuntu.com|http://archive.ubuntu.com|g' /etc/apt/sources.list
+      log "APT" "Magyar mirror lecserélve → archive.ubuntu.com (megbízhatóság)"
+    fi
+    # Globális mirror timeout: max 30mp/szerver, 2 retry
+    export APT_OPTIONS="-o Acquire::http::Timeout=30 -o Acquire::Retries=2"
     apt-get -o Acquire::http::Timeout=30 update -qq 2>&1 | tee -a "$LOGFILE_AI" || \
       log "WARN" "apt-get update részleges hiba — gyorsítótárazott lista marad"
 
@@ -1055,6 +1074,10 @@ if [ "${OK:-0}" -gt 0 ] && \
   infra_state_set "REBOOT_NEEDED"   "true"
   infra_state_set "REBOOT_REASON"   "NVIDIA ${_DRIVER_SERIES:-?}-open driver + initramfs"
   infra_state_set "REBOOT_BY_INFRA" "$INFRA_NUM"
+  # v6.9.1 FIX: MOD_01A_DONE — 01b infra_require("01a") ezt ellenőrzi
+  # REBOOT előtt is true-ra állítjuk: 01a LEFUTOTT, reboot tényét 01b maga validálja
+  infra_state_set "MOD_01A_DONE"    "true"
+  log "STATE" "MOD_01A_DONE=true → 01b_post_reboot.sh futtatható REBOOT után"
   log "STATE" "REBOOT_NEEDED=true (OK=$OK lépés végrehajtva)"
 fi
 infra_state_show
