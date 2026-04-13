@@ -1,6 +1,6 @@
 #!/bin/bash
 # ============================================================================
-# lib/00_lib_compat.sh — INFRA Kompatibilitási Mátrix v1.1
+# lib/00_lib_compat.sh — INFRA Kompatibilitási Mátrix v1.2
 #
 # CÉL: GPU/OS/Driver/CUDA/PyTorch összefüggések egyetlen kereshető adatszerkezetben.
 #      Megszünteti a szétszórt if/case elágazásokat hw_detect-ből és 01a-ból.
@@ -44,11 +44,15 @@
 #
 # FONTOS — cuda_native vs cuda_recommended különbség:
 #   cuda_native     = nvidia-smi által mutatott max. támogatott CUDA API verzió
-#                     (pl. 13.1 = driver tudna 13.1-et, de a toolkit még nem érhető el)
-#   cuda_recommended = TÉNYLEGESEN ELÉRHETŐ és TELEPÍTENDŐ cuda-toolkit-* csomag
-#                     (noble-on: max 12.6 amíg cuda-toolkit-13-x meg nem jelenik!)
-#   Ha cuda_recommended > cuda_best_available() → a kód helyes fallback-et alkalmaz.
-#   Frissítsd cuda_recommended-et ha új toolkit csomag jelenik meg a repóban.
+#   cuda_recommended = TÉNYLEGESEN ELÉRHETŐ ajánlott cuda-toolkit-* csomag
+#
+# v1.2 (2026-04-13 user teszt alapján):
+#   A 12.8 és 13.x verziók Ubuntu 24.04-en ELÉRHETŐK a direkt NVIDIA CUDA repo-ból
+#   DE CSAK ha a cuda-repository-pin-600 pin fájl be van állítva (priority 600).
+#   Nélküle az Ubuntu repo 12.6-os csomagja "nyeri" a prioritásversenyt.
+#   01a v6.12 biztosítja a pin fájl jelenlétét → 13.1 elérhető lesz a repo-ból.
+#   Forrás: NVIDIA CUDA Installation Guide Linux — Network Repo (apt-get method)
+#   https://docs.nvidia.com/cuda/cuda-installation-guide-linux/
 # ============================================================================
 
 # ─── Kompatibilitási Mátrix ──────────────────────────────────────────────────
@@ -59,20 +63,27 @@ declare -A _COMPAT_MATRIX
 
 # ════════════════════════════════════════════════════════════════════════════
 # Ubuntu 24.04 LTS — noble
+#
+# CUDA helyzet (v1.2 — 2026-04-13 user teszt megerősítette):
+#   Driver: 590.48.01 (noble-updates/restricted, Canonical-signed)
+#   CUDA 12.8, 13.1, 13.2 ELÉRHETŐ a direkt NVIDIA CUDA repo-ból
+#   Feltétel: cuda-repository-pin-600 pin fájl (priority 600) kell!
+#   01a v6.12 biztosítja a pin fájlt → 13.1 az ajánlott (SM_120 natív)
 # ════════════════════════════════════════════════════════════════════════════
 
 # ── Blackwell: RTX 5090/5080/5070 (GB202/GB203/GB205) — SM_120 ──────────────
 # Log bizonyíték (2026-04-11): 590.48.01 noble-updates/restricted-ből
 # Canonical-signed → meglévő MOK elegendő, NEM kell új enrollment
+# CUDA 13.1: SM_120 natív támogatás, cu128 PyTorch index (v1.2 frissítve)
 _COMPAT_MATRIX["blackwell|noble|driver_pkg"]="nvidia-driver-590-open"
 _COMPAT_MATRIX["blackwell|noble|driver_series"]="590"
 _COMPAT_MATRIX["blackwell|noble|driver_repo"]="ubuntu_restricted"
 _COMPAT_MATRIX["blackwell|noble|canonical_signed"]="true"
 _COMPAT_MATRIX["blackwell|noble|cuda_native"]="13.1"
 _COMPAT_MATRIX["blackwell|noble|cuda_min"]="12.8"
-_COMPAT_MATRIX["blackwell|noble|cuda_recommended"]="12.6"
-_COMPAT_MATRIX["blackwell|noble|cuda_pkg"]="cuda-toolkit-12-6"
-_COMPAT_MATRIX["blackwell|noble|pytorch_index"]="cu126"
+_COMPAT_MATRIX["blackwell|noble|cuda_recommended"]="13.1"
+_COMPAT_MATRIX["blackwell|noble|cuda_pkg"]="cuda-toolkit-13-1"
+_COMPAT_MATRIX["blackwell|noble|pytorch_index"]="cu128"
 _COMPAT_MATRIX["blackwell|noble|vllm_support"]="yes"
 _COMPAT_MATRIX["blackwell|noble|turboquant_mode"]="gpu120"
 _COMPAT_MATRIX["blackwell|noble|ollama_gpu"]="true"
@@ -87,9 +98,9 @@ _COMPAT_MATRIX["ada|noble|driver_repo"]="ubuntu_restricted"
 _COMPAT_MATRIX["ada|noble|canonical_signed"]="true"
 _COMPAT_MATRIX["ada|noble|cuda_native"]="13.1"
 _COMPAT_MATRIX["ada|noble|cuda_min"]="12.4"
-_COMPAT_MATRIX["ada|noble|cuda_recommended"]="12.6"
-_COMPAT_MATRIX["ada|noble|cuda_pkg"]="cuda-toolkit-12-6"
-_COMPAT_MATRIX["ada|noble|pytorch_index"]="cu126"
+_COMPAT_MATRIX["ada|noble|cuda_recommended"]="13.1"
+_COMPAT_MATRIX["ada|noble|cuda_pkg"]="cuda-toolkit-13-1"
+_COMPAT_MATRIX["ada|noble|pytorch_index"]="cu128"
 _COMPAT_MATRIX["ada|noble|vllm_support"]="yes"
 _COMPAT_MATRIX["ada|noble|turboquant_mode"]="gpu89"
 _COMPAT_MATRIX["ada|noble|ollama_gpu"]="true"
@@ -104,9 +115,9 @@ _COMPAT_MATRIX["ampere|noble|driver_repo"]="ubuntu_restricted"
 _COMPAT_MATRIX["ampere|noble|canonical_signed"]="true"
 _COMPAT_MATRIX["ampere|noble|cuda_native"]="13.1"
 _COMPAT_MATRIX["ampere|noble|cuda_min"]="12.4"
-_COMPAT_MATRIX["ampere|noble|cuda_recommended"]="12.6"
-_COMPAT_MATRIX["ampere|noble|cuda_pkg"]="cuda-toolkit-12-6"
-_COMPAT_MATRIX["ampere|noble|pytorch_index"]="cu126"
+_COMPAT_MATRIX["ampere|noble|cuda_recommended"]="13.1"
+_COMPAT_MATRIX["ampere|noble|cuda_pkg"]="cuda-toolkit-13-1"
+_COMPAT_MATRIX["ampere|noble|pytorch_index"]="cu128"
 _COMPAT_MATRIX["ampere|noble|vllm_support"]="yes"
 _COMPAT_MATRIX["ampere|noble|turboquant_mode"]="gpu86"
 _COMPAT_MATRIX["ampere|noble|ollama_gpu"]="true"

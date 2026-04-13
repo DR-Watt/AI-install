@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# 01a_system_foundation.sh — System Foundation v6.11
+# 01a_system_foundation.sh — System Foundation v6.12
 #                            Ubuntu 24/26 LTS | NVIDIA | CUDA | Docker
 #
 # Dokumentáció
@@ -10,6 +10,33 @@
 #   Docker: https://docs.docker.com/engine/install/ubuntu/
 #   CTK:    https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/
 #   Compat: NVIDIA CUDA Compatibility r595 (2026-03-31)
+#
+# Változtatások v6.12 (CUDA pin fájl + update-alternatives):
+#
+#   FIX 1: cuda-repository-pin-600 pin fájl explicit letöltése
+#     Probléma: az Ubuntu 24.04 alap CUDA repo-ban csak 12.6 van.
+#     12.8, 13.x CSAK az NVIDIA direkt repo-ból érhetők el, de csak ha
+#     a priority 600-as pin fájl be van állítva. Nélküle az Ubuntu 12.6
+#     "nyeri" a prioritásversenyt → magasabb verziók láthatatlanok!
+#     User teszt (2026-04-13): manuálisan futtatva a Gemini-javasolt lépéseket
+#     (wget cuda-ubuntu2404.pin + add-apt-repository) → 12.8, 13.1, 13.2
+#     mind elérhetővé vált és update-alternatives 4 opciót mutatott.
+#     Fix: pin fájl letöltése wget-tel (fallback: kézi írás) a CUDA keyring
+#     telepítése ELŐTT. A cuda_best_available() ezután megtalálja 13.1-et.
+#     Forrás: https://docs.nvidia.com/cuda/cuda-installation-guide-linux/
+#             Network Repo Installation for Ubuntu (official NVIDIA docs)
+#
+#   FIX 2: update-alternatives regisztrálás CUDA install után
+#     Probléma: több CUDA verzió lehet telepítve egyszerre (12.6, 12.8, 13.1)
+#     de nem volt könnyű váltani köztük.
+#     Fix: minden /usr/local/cuda-X.Y könyvtárra: update-alternatives --install
+#     Prioritás: major*10+minor (13.1→131, 12.8→128, 12.6→126)
+#     Eredmény: sudo update-alternatives --config cuda → interaktív váltás
+#
+#   COMPAT MÁTRIX v1.2 (egyidejűleg):
+#     noble + blackwell/ada/ampere: cuda_recommended 12.6 → 13.1
+#     noble + blackwell/ada/ampere: pytorch_index cu126 → cu128
+#     (turing/pascal marad 12.6)
 #
 # Változtatások v6.11 (2026-04-12 10:41 log analízis — 4 fix):
 #
@@ -131,7 +158,7 @@ declare -A URLS=(
   [nvidia_ctk_list]="https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list"
 )
 
-APT_PIN_NVIDIA='# 01a_system_foundation v6.11
+APT_PIN_NVIDIA='# 01a_system_foundation v6.12
 Package: nvidia-* libnvidia-* xserver-xorg-video-nvidia-*
 Pin: release o=Ubuntu
 Pin-Priority: 1001'
@@ -817,17 +844,47 @@ if [ "${COMP_STATUS[cuda]:-missing}" != "ok" ] || \
   Méret: ~3.5 GB — a folytatáshoz erősítsd meg." 20
   fi
 
-  if ! source_exists "developer.download.nvidia.com/compute/cuda"; then
-    log "INFO" "CUDA repo konfigurálása..."
-    run_with_progress "CUDA Repo" "CUDA keyring letöltése..." \
-      bash -c "wget -q '$CUDA_KEYRING_URL' -O /tmp/cuda-keyring.deb \
-               && DEBIAN_FRONTEND=noninteractive dpkg -i /tmp/cuda-keyring.deb \
-               && rm -f /tmp/cuda-keyring.deb"
-    [ $? -eq 0 ] && \
-      apt-get -o Acquire::http::Timeout=30 update -qq >> "$LOGFILE_AI" 2>&1 \
-      && log "OK" "CUDA repo konfigurálva" \
-      || { log "FAIL" "CUDA keyring sikertelen"; ((FAIL++)); }
+  # ── CUDA repo pin fájl (KRITIKUS lépés!) ──────────────────────────────────────
+  # A cuda-ubuntu2404.pin fájl (priority 600) nélkül az Ubuntu repo 12.6-os
+  # csomagjai "nyerik" a prioritásversenyt → 12.8, 13.x csomagok LÁTHATATLANOK!
+  # Hatás: apt-cache search cuda-toolkit-13-1 → No results (pin nélkül)
+  #         apt-cache search cuda-toolkit-13-1 → Found    (pin fájllal)
+  # Forrás: https://docs.nvidia.com/cuda/cuda-installation-guide-linux/
+  #         Network Repo Installation for Ubuntu (apt-get method, Step 2)
+  _CUDA_PIN="/etc/apt/preferences.d/cuda-repository-pin-600"
+  if [ ! -f "$_CUDA_PIN" ]; then
+    log "INFO" "CUDA pin fájl letöltése (priority 600 — magasabb CUDA verziók láthatóságához)..."
+    wget -q       "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-ubuntu2404.pin"       -O "$_CUDA_PIN" >> "$LOGFILE_AI" 2>&1
+    if [ $? -eq 0 ]; then
+      log "OK" "CUDA pin fájl letöltve (priority 600)"
+    else
+      # Fallback: saját pin fájl írása ha wget nem sikerül
+      log "WARN" "wget sikertelen — fallback pin fájl írása..."
+      cat > "$_CUDA_PIN" << 'PINEOF'
+# INFRA 01a — CUDA repository pin (priority 600)
+# Forrás: https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-ubuntu2404.pin
+Package: *
+Pin: origin developer.download.nvidia.com
+Pin-Priority: 600
+PINEOF
+      log "OK" "Fallback CUDA pin fájl létrehozva: $_CUDA_PIN"
+    fi
+  else
+    log "APT" "CUDA pin fájl már létezik: $_CUDA_PIN"
   fi
+
+  # ── CUDA keyring + repo ────────────────────────────────────────────────────────
+  # cuda-keyring csomag: GPG kulcs + sources.list.d bejegyzés (NVIDIA official módszer)
+  # apt-key adv helyett — az deprecated Ubuntu 22.04+ óta
+  if ! dpkg -l cuda-keyring 2>/dev/null | grep -q "^ii" ||      ! source_exists "developer.download.nvidia.com/compute/cuda"; then
+    log "INFO" "CUDA keyring telepítése..."
+    run_with_progress "CUDA Repo" "CUDA keyring letöltése..."       bash -c "wget -q '${CUDA_KEYRING_URL}' -O /tmp/cuda-keyring.deb                && DEBIAN_FRONTEND=noninteractive dpkg -i /tmp/cuda-keyring.deb                && rm -f /tmp/cuda-keyring.deb"
+    [ $? -eq 0 ]       && log "OK" "CUDA keyring konfigurálva"       || { log "FAIL" "CUDA keyring sikertelen"; ((FAIL++)); }
+  fi
+
+  log "APT" "apt-get update (CUDA repo frissítve)..."
+  apt-get -o Acquire::http::Timeout=30 update -qq >> "$LOGFILE_AI" 2>&1 || true
+  log "OK" "CUDA repo konfigurálva"
 
   _best_cuda="$(cuda_best_available)"
   log "INFO" "Legjobb elérhető CUDA: ${_best_cuda:-nem találat}"
@@ -893,6 +950,40 @@ export LD_LIBRARY_PATH="${CUDA_HOME}/lib64${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}
         infra_state_set "INST_CUDA_VER" "$_INST_VER"
         infra_state_set "PYTORCH_INDEX" "$_CUDA_PY_IDX"
         log "STATE" "CUDA $_INST_VER → PyTorch index: $_CUDA_PY_IDX"
+
+        # ── update-alternatives regisztrálás ─────────────────────────────────
+        # Minden telepített CUDA verzió regisztrálása az update-alternatives
+        # rendszerbe → lehetővé teszi a gyors verzióváltást:
+        #   sudo update-alternatives --config cuda
+        # Forrás: update-alternatives(1) man page
+        # Prioritás: major*10 + minor (pl. 13.1 → 131, 12.8 → 128, 12.6 → 126)
+        log "INFO" "CUDA update-alternatives regisztrálása..."
+        _alts_registered=0
+        for _cuda_alt_dir in /usr/local/cuda-*/; do
+          [ -d "$_cuda_alt_dir" ] || continue
+          _cuda_alt_ver="${_cuda_alt_dir##*/cuda-}"
+          _cuda_alt_ver="${_cuda_alt_ver%/}"
+          _vmaj=$(echo "$_cuda_alt_ver" | cut -d. -f1)
+          _vmin=$(echo "$_cuda_alt_ver" | cut -d. -f2)
+          _vpri=$(( _vmaj * 10 + _vmin ))
+          if update-alternatives --install /usr/local/cuda cuda                "$_cuda_alt_dir" "$_vpri" >> "$LOGFILE_AI" 2>&1; then
+            log "INFO" "  CUDA alt: $_cuda_alt_ver (prioritás: $_vpri)"
+            (( _alts_registered++ ))
+          fi
+        done
+
+        if [ "$_alts_registered" -gt 0 ]; then
+          # Aktív verzió = most telepített (_CUDA_VER / _INST_VER)
+          _set_ver="${_CUDA_VER:-$_INST_VER}"
+          if [ -d "/usr/local/cuda-${_set_ver}" ]; then
+            update-alternatives --set cuda "/usr/local/cuda-${_set_ver}"               >> "$LOGFILE_AI" 2>&1 ||               update-alternatives --auto cuda >> "$LOGFILE_AI" 2>&1 || true
+            log "OK" "Aktív CUDA: ${_set_ver} — váltás: sudo update-alternatives --config cuda"
+          else
+            update-alternatives --auto cuda >> "$LOGFILE_AI" 2>&1 || true
+            log "OK" "CUDA update-alternatives beállítva (auto mód)"
+          fi
+        fi
+
         infra_state_show; ((OK++))
       else
         log "FAIL" "CUDA ${_CUDA_VER} telepítés sikertelen"
@@ -948,7 +1039,7 @@ _write_gpu_config() {
   local mode="${1:-hybrid}"
 
   cat > /etc/modprobe.d/99-blacklist-nouveau.conf << 'BEOF'
-# 01a_system_foundation v6.11 — Nouveau blacklist
+# 01a_system_foundation v6.12 — Nouveau blacklist
 blacklist nouveau
 blacklist lbm-nouveau
 options nouveau modeset=0
@@ -957,7 +1048,7 @@ alias lbm-nouveau off
 BEOF
 
   cat > /etc/modprobe.d/99-nvidia-options.conf << 'MEOF'
-# 01a_system_foundation v6.11 — NVIDIA kernel modul opciók
+# 01a_system_foundation v6.12 — NVIDIA kernel modul opciók
 options nvidia-drm modeset=1 fbdev=1
 options nvidia NVreg_PreserveVideoMemoryAllocations=1
 MEOF
@@ -971,7 +1062,7 @@ MEOF
     intel_busid="${intel_busid:-PCI:0:2:0}"
     log "CFG" "Intel iGPU Bus ID: $intel_busid"
     cat > /etc/X11/xorg.conf << XEOF
-# 01a_system_foundation v6.11 — Hibrid GPU mód
+# 01a_system_foundation v6.12 — Hibrid GPU mód
 Section "ServerLayout"
     Identifier "hybrid-layout"
     Screen 0 "iGPU-Screen"
@@ -1002,12 +1093,12 @@ XEOF
   else
     prime-select nvidia 2>/dev/null || true
     cat > /etc/modprobe.d/99-blacklist-igpu.conf << 'BEOF'
-# 01a_system_foundation v6.11 — Intel iGPU blacklist
+# 01a_system_foundation v6.12 — Intel iGPU blacklist
 blacklist i915
 blacklist intel_agp
 BEOF
     cat > /etc/X11/xorg.conf << 'XEOF'
-# 01a_system_foundation v6.11 — Dedikált GPU mód
+# 01a_system_foundation v6.12 — Dedikált GPU mód
 Section "ServerLayout"
     Identifier "dedicated-layout"
     Screen 0 "nvidia-screen"
