@@ -700,6 +700,17 @@ _vllm_fix_pytorch_blackwell() {
 
   whiptail --msgbox "PyTorch Blackwell (SM_120) fix indítása\n\nA jelenlegi PyTorch csak sm_90-ig (Ada Lovelace) támogatott.\nRTX 5090 SM_120-hoz cu128 wheel kell.\n\nEszköz: uv pip install (CORE konvenció)\nIndex:  ${torch_index}\nLetöltés: ~2-4 GB\nIdő:  5-15 perc\n\nLog: ${fix_log}\n\nOK = indítás" 20 72
 
+  # ── KRITIKUS: venv tulajdonjog visszaállítás ───────────────────────────────
+  # Gyökérok: korábbi 'sudo pip install' vagy 'sudo uv pip' root tulajdonba
+  # tette a site-packages/__pycache__ könyvtárakat.
+  # Ha a user kontextusban futó uv megpróbálja törölni → Permission denied (os error 13)
+  # Megoldás: sudo chown -R (root futtatja a wrapper-t, így ez működik)
+  log "INFO" "venv tulajdonjog visszaállítás: chown -R ${_REAL_USER} ${AI_VENV_DIR}"
+  chown -R "${_REAL_USER}:${_REAL_USER}" "${AI_VENV_DIR}" 2>/dev/null || {
+    log "WARN" "chown részleges hiba (folytatás)"
+  }
+  log "INFO" "chown kész"
+
   # Reinstall PyTorch cu128-cal — uv pip install (INFRA konvenció, nem pip!)
   # NOTA: uv flag: --reinstall (nem --force-reinstall — az pip-specifikus)
   # Forrás: https://docs.astral.sh/uv/ (official uv dokumentáció)
@@ -1586,12 +1597,39 @@ except: pass
     echo "CANCEL"; return 1
   fi
 
-  # Szélesebb ablak a hosszú label-ekhez
+  # Dinamikus ablakméret — terminál aktuális mérete alapján
+  # whiptail nem tud horizontálisan scrollozni → label-ek a szélességhez igazítva
+  local term_cols term_rows win_w win_h list_h
+  term_cols=$(tput cols 2>/dev/null || echo 120)
+  term_rows=$(tput lines 2>/dev/null || echo 40)
+  # Ablak: terminál 95%-a, de min 90, max 200
+  win_w=$(( term_cols * 95 / 100 ))
+  [ "$win_w" -lt 90  ] && win_w=90
+  [ "$win_w" -gt 200 ] && win_w=200
+  # Lista magassága: modellek száma, de max terminál - 10 sor
+  list_h="${#result_ids[@]}"
+  win_h=$(( list_h + 9 ))  # header + border + prompt
+  [ "$win_h" -gt $(( term_rows - 2 )) ] && win_h=$(( term_rows - 2 ))
+  [ "$list_h" -gt $(( win_h - 9 )) ] && list_h=$(( win_h - 9 ))
+  [ "$list_h" -lt 5 ] && list_h=5
+
+  # Label max hossza: ablak szélessége - radiolist prefix (~6 kar) - margó (4)
+  local label_max=$(( win_w - 10 ))
+
+  # Label-ek újragenerálása a tényleges szélességhez igazítva
+  local menu_items_sized=()
+  for ((j=0; j<${#result_ids[@]}; j++)); do
+    local orig_label="${menu_items[$((j*3+1))]}"
+    # Levágás ha túl hosszú (whiptail nem scrolloz horizontálisan)
+    local sized_label="${orig_label:0:$label_max}"
+    menu_items_sized+=("$((j+1))" "$sized_label" "OFF")
+  done
+
   local sel_idx
   sel_idx=$(whiptail --title "Modell katalógus — [${filter^^}] | ${backend}" \
-    --radiolist "SPACE=jelöl, ENTER=OK  |  ✓ = már letöltve" \
-    28 92 "${#result_ids[@]}" \
-    "${menu_items[@]}" \
+    --radiolist "SPACE=jelöl, ENTER=OK  |  ✓ = már letöltve  |  ↑↓ = görgetés" \
+    "$win_h" "$win_w" "$list_h" \
+    "${menu_items_sized[@]}" \
     3>&1 1>&2 2>&3) || { echo "CANCEL"; return 1; }
 
   echo "${result_ids[$((sel_idx-1))]}"
