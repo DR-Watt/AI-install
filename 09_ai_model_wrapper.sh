@@ -607,6 +607,13 @@ _vllm_start() {
   # vLLM indítás háttérben — felhasználó kontextusában, venv-ből
   # Forrás: docs.vllm.ai/en/stable/cli/serve/ (official)
   # NOTA: a process PID-jét mentsük EL A SUBSHELL-BEN, ne a szülőben
+  # Log timestamp: minden indítás időbélyeggel kezdődik a log fájlban
+  echo "" >> "$VLLM_LOG_FILE" 2>/dev/null
+  echo "═══════════════════════════════════════════════════" >> "$VLLM_LOG_FILE" 2>/dev/null
+  echo "$(date '+%Y-%m-%d %H:%M:%S') [START] vLLM indítás" >> "$VLLM_LOG_FILE" 2>/dev/null
+  echo "  Modell:  $model" >> "$VLLM_LOG_FILE" 2>/dev/null
+  echo "  Port:    $VLLM_PORT  dtype: $VLLM_DTYPE  gpu-mem: $VLLM_GPU_MEM_UTIL" >> "$VLLM_LOG_FILE" 2>/dev/null
+  echo "═══════════════════════════════════════════════════" >> "$VLLM_LOG_FILE" 2>/dev/null
   sudo -u "$_REAL_USER" bash -c "
     source '${AI_VENV_DIR}/bin/activate'
     nohup ${VENV_VLLM} $(IFS=' '; echo "$(_vllm_build_args "$model")") \
@@ -805,8 +812,63 @@ _vllm_fix_pytorch_blackwell() {
     # Ellenőrzés: most már ismeri-e sm_120-t?
     if _vllm_check_pytorch_blackwell; then
       log "INFO" "PyTorch Blackwell fix SIKERES — sm_120 most támogatott"
-      whiptail --msgbox "✓ PyTorch Blackwell fix kész!\n\nAz RTX 5090 (SM_120) mostantól kompatibilis.\nvLLM most már indítható!" 12 60
       infra_state_set "PYTORCH_INDEX" "cu128" 2>/dev/null || true
+
+      # ── KRITIKUS: vLLM is újra kell telepíteni a PyTorch ABI változás miatt ──
+      # Gyökérok (wrapper_vllm.log):
+      #   ImportError: vllm/_C.abi3.so: undefined symbol: _ZN3c1013MessageLoggerC1EPKciib
+      # A vLLM C++ kiterjesztések (vllm._C) a régi PyTorch cu126 ABI-hoz voltak linkelve.
+      # Az új cu128 PyTorch más C++ ABI-t használ → a vLLM-et is újra kell telepíteni.
+      # Forrás: vllm docs — PyTorch version must match compiled vLLM extensions
+      if whiptail --yesno \
+        "✓ PyTorch cu128 kész (RTX 5090 SM_120 OK)\n\nvLLM újratelepítés szükséges!\n\nOka: a vLLM C++ kiterjesztések (vllm._C) a\nrégi PyTorch ABI-hoz voltak linkelve.\nAz új cu128 PyTorch más ABI → vLLM-et is újra\nkell telepíteni (forrás: wrapper_vllm.log hiba).\n\nIdő: ~2-5 perc\n\nIgen = vLLM reinstall most   Nem = manuálisan" \
+        18 72; then
+
+        local vllm_log="${SCRIPT_DIR}/wrapper_vllm_reinstall_$(date +%H%M%S).log"
+        log "INFO" "vLLM reinstall indítás cu128 env-ben (log: $vllm_log)"
+
+        # vLLM reinstall — ugyanabban a venvben, cu128 indexről
+        sudo -u "$_REAL_USER" bash -c "
+          export PATH='${_REAL_HOME}/.local/bin:${_REAL_HOME}/.cargo/bin:/usr/local/bin:/usr/bin:/bin'
+          source '${AI_VENV_DIR}/bin/activate'
+          '${uv_bin}' pip install vllm \
+            --reinstall \
+            > '${vllm_log}' 2>&1
+        " > /dev/null 2>&1 &
+        local vllm_reinstall_pid=$!
+
+        # Progress gauge a vLLM reinstall-hoz
+        (
+          local elapsed=0
+          while kill -0 "$vllm_reinstall_pid" 2>/dev/null; do
+            local last_line
+            last_line=$(tail -1 "$vllm_log" 2>/dev/null \
+              | sed 's/\x1B\[[0-9;]*[mK]//g; s/\r//g' | tr -d '\n' | cut -c1-60)
+            printf 'XXX\n%d\n%dm%02ds  |  %s\nXXX\n' \
+              "$(( elapsed * 80 / 300 ))" \
+              "$(( elapsed/60 ))" "$(( elapsed%60 ))" \
+              "${last_line:-(vLLM reinstall fut...)}"
+            sleep 5; elapsed=$(( elapsed + 5 ))
+          done
+          printf 'XXX\n100\n✓ vLLM reinstall befejezve\nXXX\n'
+          sleep 1; echo 100
+        ) | whiptail --title "vLLM reinstall — cu128 ABI" \
+            --gauge "$(printf 'vLLM újratelepítés (ABI sync cu128-cal)\nLog: %s\n\nESC = háttérbe' "$vllm_log")" \
+            12 76 0
+
+        wait "$vllm_reinstall_pid"
+        local vllm_exit=$?
+
+        if [ $vllm_exit -eq 0 ]; then
+          log "INFO" "vLLM reinstall SIKERES"
+          whiptail --msgbox "✓ PyTorch + vLLM mindkettő frissítve!\n\nRTX 5090 SM_120 kompatibilis.\nvLLM most már indítható!" 12 60
+        else
+          log "ERR" "vLLM reinstall SIKERTELEN (exit: $vllm_exit). Log: $vllm_log"
+          whiptail --msgbox "⚠ vLLM reinstall sikertelen!\n\nLog: $vllm_log\n\nManuálisan:\n  source ~/venvs/ai/bin/activate\n  uv pip install vllm --reinstall" 14 68
+        fi
+      else
+        whiptail --msgbox "✓ PyTorch Blackwell fix kész!\n\nAz RTX 5090 (SM_120) mostantól kompatibilis.\n\n⚠ vLLM reinstall szükséges lesz!\nFuttasd a vLLM menüből: 'vLLM/PyTorch környezet' → reinstall" 14 68
+      fi
     else
       log "WARN" "PyTorch Blackwell fix: telepítés kész, de sm_120 még mindig nem látható"
       whiptail --msgbox "⚠ uv pip reinstall kész, de sm_120 ellenőrzés sikertelen.\nLog: $fix_log\n\nManuálisan ellenőrzés:\n  source ~/venvs/ai/bin/activate\n  python -c \"import torch; print(torch.cuda.get_arch_list())\"" 14 72
@@ -1652,69 +1714,195 @@ except: pass
   done
 }
 
-# _menu_vllm_control: vLLM szerver irányítás almenü
-_menu_vllm_control() {
+# _menu_vllm_model: vLLM modell kezelés almenü
+# Modell kiválasztás, HF cache megtekintés, szolgáló modell info
+_menu_vllm_model() {
   while true; do
-    local vllm_running_label="⛔ Leállítva"
-    _is_vllm_running && vllm_running_label="✅ Fut (port: ${VLLM_PORT})"
+    # Jelenleg betöltött modell lekérése a futó vLLM-ből
+    local current_model="(vLLM nem fut)"
+    if _is_vllm_running; then
+      current_model=$(curl -s --connect-timeout 3 \
+        "http://localhost:${VLLM_PORT}/v1/models" 2>/dev/null | \
+        python3 -c "
+import json,sys
+try:
+  d=json.load(sys.stdin)
+  models=[m['id'] for m in d.get('data',[])]
+  print(models[0] if models else '(nincs betöltött modell)')
+except: print('(API hiba)')
+" 2>/dev/null)
+    fi
 
     local choice
-    choice=$(whiptail --title "vLLM szerver — RTX 5090 Blackwell" \
-      --menu "Állapot: ${vllm_running_label}\ndtype: ${VLLM_DTYPE}  gpu-mem: ${VLLM_GPU_MEM_UTIL}  max-len: ${VLLM_MAX_MODEL_LEN}" \
-      20 76 7 \
-      "1" "vLLM indítás (model megadással)" \
-      "2" "vLLM leállítás" \
-      "3" "vLLM állapot + logok megtekintése" \
-      "4" "systemd service engedélyezés/tiltás" \
-      "5" "Konfigurált paraméterek" \
-      "6" "⚠ PyTorch Blackwell fix (SM_120, cu128 reinstall)" \
+    choice=$(whiptail --title "vLLM — Modell kezelés" \
+      --menu "Betöltött modell: ${current_model}\nHF cache: ${_REAL_HOME}/.cache/huggingface/" \
+      16 76 5 \
+      "1" "Modell kiválasztása katalógusból (HuggingFace)" \
+      "2" "Modell megadása kézzel (HF ID)" \
+      "3" "HuggingFace cache megtekintése" \
+      "4" "vLLM service fájl modelljének módosítása" \
       "0" "← Vissza" \
       3>&1 1>&2 2>&3) || return
 
     case "$choice" in
       1)
-        # vLLM indítás: katalógusból browse VAGY kézi HF ID megadás
-        local model src_choice
-        src_choice=$(whiptail --title "vLLM modell kiválasztás" \
-          --menu "Honnan választasz modellt?" 12 70 3 \
-          "1" "vLLM modell katalógus (HuggingFace, ajánlott)" \
-          "2" "Kézi HuggingFace model ID bevitel" \
-          "0" "← Vissza" \
-          3>&1 1>&2 2>&3) || continue
-        case "$src_choice" in
-          1)
-            model=$(_vllm_model_browse)
-            # ESC / CANCEL → vissza a menübe, NEM kézi bevitel fallback
-            [ "$model" = "CANCEL" ] && continue
-            [ -z "$model" ] && continue
-            ;;
-          2)
-            model=$(whiptail --title "vLLM modell — kézi bevitel" \
-              --inputbox "HuggingFace model ID:\n(pl. Qwen/Qwen2.5-Coder-7B-Instruct)" \
-              12 72 "" 3>&1 1>&2 2>&3) || continue
-            ;;
-          0) continue ;;
-        esac
+        local model
+        model=$(_vllm_model_browse)
+        [ "$model" = "CANCEL" ] && continue
         [ -z "$model" ] && continue
-        if _vllm_start "$model"; then
-          # vLLM process elindult → progress gauge megjelenítése
-          # A gauge a log fájlból olvassa a tqdm %-ot és frissíti magát
-          # ESC megnyomásával a gauge bezárul, vLLM fut tovább háttérben
-          local vllm_pid
-          vllm_pid=$(cat "$VLLM_PID_FILE" 2>/dev/null)
-          if _vllm_wait_progress "$model" "$vllm_pid" 720; then
-            # Port megnyílt → API kész
-            whiptail --msgbox "✓ vLLM API kész!\n\nModell: $model\nEndpoint: http://localhost:${VLLM_PORT}/v1\n\nBackend váltó menüben állítsd be a CLINE/Continue-t." 14 68
-          else
-            # ESC vagy timeout — process él, API még nem elérhető
-            whiptail --msgbox "vLLM process fut, API még nem elérhető.\n\nFolytatódik háttérben. Ellenőrzés:\n  tail -f ${VLLM_LOG_FILE}\n\nvLLM állapot menüpontban látod ha kész." 14 70
+        # Ha a vLLM fut, megkérdezzük: indítsuk újra ezzel a modellel?
+        if _is_vllm_running; then
+          if whiptail --yesno \
+            "vLLM jelenleg fut.\n\nLeállítjuk és újraindítjuk ezzel a modellel?\n\nÚj modell: $model" \
+            12 65; then
+            _vllm_stop
+            sleep 2
+            _menu_vllm_start_with_model "$model"
           fi
         else
-          whiptail --msgbox "vLLM indítás SIKERTELEN!\n\nLog: ${VLLM_LOG_FILE}\n\n$(tail -8 "$VLLM_LOG_FILE" 2>/dev/null)" 20 74
+          _menu_vllm_start_with_model "$model"
         fi
         ;;
       2)
+        local model
+        model=$(whiptail --title "vLLM modell — kézi HF ID" \
+          --inputbox "HuggingFace model ID:\n(pl. Qwen/Qwen2.5-Coder-7B-Instruct)" \
+          12 72 "" 3>&1 1>&2 2>&3) || continue
+        [ -z "$model" ] && continue
+        if _is_vllm_running; then
+          whiptail --yesno "vLLM jelenleg fut.\nLeállítjuk és újraindítjuk?\nÚj modell: $model" 10 65 && {
+            _vllm_stop; sleep 2; _menu_vllm_start_with_model "$model"
+          }
+        else
+          _menu_vllm_start_with_model "$model"
+        fi
+        ;;
+      3)
+        # HF cache tartalom
+        local hf_cache="${_REAL_HOME}/.cache/huggingface/hub"
+        local cache_list
+        cache_list=$(find "$hf_cache" -maxdepth 1 -type d -name "models--*" 2>/dev/null \
+          | sed 's|.*/models--||; s/--/\//g' | sort | head -30 \
+          || echo "(HF cache üres)")
+        [ -z "$cache_list" ] && cache_list="(HF cache üres)"
+        whiptail --title "HuggingFace lokális cache" \
+          --scrolltext --msgbox "Letöltött modellek:\n${cache_list}" 24 70
+        ;;
+      4)
+        # Service fájl MODEL_ID módosítása
+        if [ ! -f "$VLLM_SERVICE_FILE" ]; then
+          whiptail --msgbox "vLLM service fájl hiányzik!\nFuttasd install módban." 8 55
+          continue
+        fi
+        local current_svc_model
+        current_svc_model=$(grep "MODEL_ID=" "$VLLM_SERVICE_FILE" \
+          | grep -v "^#" | head -1 | grep -oP '(?<==).*')
+        local new_model
+        new_model=$(_vllm_model_browse)
+        [ "$new_model" = "CANCEL" ] && continue
+        [ -z "$new_model" ] && {
+          new_model=$(whiptail --title "Service modell" \
+            --inputbox "HuggingFace model ID:" 10 65 \
+            "${current_svc_model:-Qwen/Qwen2.5-Coder-7B-Instruct}" \
+            3>&1 1>&2 2>&3) || continue
+        }
+        [ -z "$new_model" ] && continue
+        # sed: MODEL_ID sorának cseréje
+        sed -i "s|Environment=\"MODEL_ID=.*\"|Environment=\"MODEL_ID=${new_model}\"|g" \
+          "$VLLM_SERVICE_FILE"
+        local uid; uid=$(id -u "$_REAL_USER" 2>/dev/null)
+        XDG_RUNTIME_DIR="/run/user/${uid}" \
+          sudo -u "$_REAL_USER" systemctl --user daemon-reload 2>/dev/null || true
+        log "INFO" "Service modell frissítve: $new_model"
+        whiptail --msgbox "✓ Service modell frissítve:\n${new_model}\n\nSzolgálat újraindításkor ez a modell töltődik be." 12 65
+        ;;
+      0) return ;;
+    esac
+  done
+}
+
+# _menu_vllm_start_with_model: modell megadásával vLLM indítás + progress
+# Kiszervezett segédfüggvény — _menu_vllm_model és _menu_vllm_control is hívja
+_menu_vllm_start_with_model() {
+  local model="$1"
+  [ -z "$model" ] && return 1
+  if _vllm_start "$model"; then
+    local vllm_pid
+    vllm_pid=$(cat "$VLLM_PID_FILE" 2>/dev/null)
+    if _vllm_wait_progress "$model" "$vllm_pid" 720; then
+      whiptail --msgbox "✓ vLLM API kész!\n\nModell: $model\nEndpoint: http://localhost:${VLLM_PORT}/v1\n\nBackend váltó menüben állítsd be a CLINE/Continue-t." 14 68
+    else
+      whiptail --msgbox "vLLM process fut háttérben.\n\nEllenőrzés:\n  tail -f ${VLLM_LOG_FILE}\n\nvLLM állapot menüpontban látod ha kész." 12 68
+    fi
+  else
+    whiptail --msgbox "vLLM indítás SIKERTELEN!\n\nLog: ${VLLM_LOG_FILE}\n\n$(tail -8 "$VLLM_LOG_FILE" 2>/dev/null | sed 's/\x1B\[[0-9;]*[mK]//g')" 22 78
+  fi
+}
+
+# _menu_vllm_control: vLLM szerver irányítás almenü
+# Szerver indítás/leállítás, állapot, service, PyTorch fix
+# Modell kezelés: külön _menu_vllm_model almenüben
+_menu_vllm_control() {
+  while true; do
+    local vllm_running_label="⛔ Leállítva"
+    _is_vllm_running && vllm_running_label="✅ Fut (port: ${VLLM_PORT})"
+
+    # Betöltött modell a fejlécbe
+    local current_model=""
+    if _is_vllm_running; then
+      current_model=$(curl -s --connect-timeout 2 \
+        "http://localhost:${VLLM_PORT}/v1/models" 2>/dev/null | \
+        python3 -c "
+import json,sys
+try:
+  d=json.load(sys.stdin)
+  models=[m['id'] for m in d.get('data',[])]
+  print(models[0] if models else '')
+except: print('')
+" 2>/dev/null)
+      [ -n "$current_model" ] && vllm_running_label="✅ Fut — $current_model"
+    fi
+
+    local choice
+    choice=$(whiptail --title "vLLM szerver — RTX 5090 Blackwell" \
+      --menu "$(printf 'Állapot: %s\ndtype: %s  gpu-mem: %s  max-len: %s' \
+        "$vllm_running_label" "$VLLM_DTYPE" "$VLLM_GPU_MEM_UTIL" "$VLLM_MAX_MODEL_LEN")" \
+      22 80 8 \
+      "1" "Modell kiválasztás + szerver indítás" \
+      "2" "Szerver leállítás" \
+      "3" "Állapot + log megtekintése" \
+      "4" "Service konfiguráció (boot-on-start)" \
+      "5" "Konfigurált paraméterek" \
+      "6" "⚠ PyTorch + vLLM Blackwell fix (cu128)" \
+      "7" "Modell kezelés (HF cache, service modell)" \
+      "0" "← Vissza" \
+      3>&1 1>&2 2>&3) || return
+
+    case "$choice" in
+      1)
+        # Modell kiválasztás majd indítás
+        if _is_vllm_running; then
+          whiptail --msgbox "vLLM már fut!\nÁllítsd le előbb (2. menüpont)." 8 50
+          continue
+        fi
+        local model src_choice
+        src_choice=$(whiptail --title "vLLM modell kiválasztás" \
+          --menu "Honnan választasz modellt?" 12 70 3 \
+          "1" "vLLM modell katalógus (HuggingFace)" \
+          "2" "Kézi HuggingFace model ID" \
+          "0" "← Vissza" \
+          3>&1 1>&2 2>&3) || continue
+        case "$src_choice" in
+          1) model=$(_vllm_model_browse); [ "$model" = "CANCEL" ] && continue; [ -z "$model" ] && continue ;;
+          2) model=$(whiptail --title "vLLM modell" --inputbox "HF model ID:" 10 65 "" 3>&1 1>&2 2>&3) || continue ;;
+          0) continue ;;
+        esac
+        [ -z "$model" ] && continue
+        _menu_vllm_start_with_model "$model"
+        ;;
+      2)
         _vllm_stop
+        echo "$(date '+%Y-%m-%d %H:%M:%S') [STOP] vLLM leállítva" >> "$VLLM_LOG_FILE" 2>/dev/null
         whiptail --msgbox "vLLM leállítva." 8 40
         ;;
       3)
@@ -1722,19 +1910,17 @@ _menu_vllm_control() {
         status_txt=$(_vllm_status_text)
         local log_tail=""
         [ -f "$VLLM_LOG_FILE" ] && \
-          log_tail=$(echo -e "\n── Utolsó 10 log sor ──\n$(tail -10 "$VLLM_LOG_FILE")")
+          log_tail=$(printf '\n── Utolsó 15 log sor ──\n%s' \
+            "$(tail -15 "$VLLM_LOG_FILE" | sed 's/\x1B\[[0-9;]*[mK]//g')")
         whiptail --title "vLLM állapot" --scrolltext \
-          --msgbox "${status_txt}${log_tail}" 24 78
+          --msgbox "${status_txt}${log_tail}" 28 84
         ;;
       4)
-        # systemd user service engedélyezés/tiltás (boot-on-start)
-        # MEGJEGYZÉS: systemctl --user sudo-ból futtatva igényli a DBUS session bus-t
-        # → XDG_RUNTIME_DIR exportálása szükséges a user service kezeléséhez
+        # systemd user service engedélyezés/tiltás
         if [ ! -f "$VLLM_SERVICE_FILE" ]; then
           whiptail --msgbox "vLLM service fájl hiányzik!\nFuttasd install módban a 09-es modult!" 10 55
           continue
         fi
-        # Aktuális státusz lekérés — XDG_RUNTIME_DIR exportálásával
         local svc_status xdg_dir uid
         uid=$(id -u "$_REAL_USER" 2>/dev/null)
         xdg_dir="/run/user/${uid}"
@@ -1742,8 +1928,6 @@ _menu_vllm_control() {
           sudo -u "$_REAL_USER" \
           systemctl --user is-enabled vllm-rtx5090 2>/dev/null || echo "disabled")
         [ -z "$svc_status" ] && svc_status="disabled"
-
-        # Státusz megjelenítése yesno dialog-ban — egyértelmű választás
         local status_label active_label
         [ "$svc_status" = "enabled" ] && {
           status_label="BE (boot-on-start ON)"
@@ -1752,49 +1936,50 @@ _menu_vllm_control() {
           status_label="KI (boot-on-start OFF)"
           active_label="ENGEDÉLYEZÉS (boot-on-start ON)"
         }
-
         if whiptail --title "vLLM systemd service" --yesno \
           "Jelenlegi állapot: ${status_label}\n\nService fájl:\n  ${VLLM_SERVICE_FILE}\n\n${active_label}?" \
           14 65; then
           if [ "$svc_status" = "enabled" ]; then
             XDG_RUNTIME_DIR="$xdg_dir" \
               sudo -u "$_REAL_USER" systemctl --user disable vllm-rtx5090 2>/dev/null
-            whiptail --msgbox "✓ vLLM service LETILTVA\n(boot-on-start OFF)" 8 45
+            whiptail --msgbox "✓ vLLM service LETILTVA (boot-on-start OFF)" 8 50
           else
             XDG_RUNTIME_DIR="$xdg_dir" \
               sudo -u "$_REAL_USER" systemctl --user enable vllm-rtx5090 2>/dev/null
-            # Fájlban lévő MODEL_ID megjelenítése
             local model_in_svc
             model_in_svc=$(grep "MODEL_ID=" "$VLLM_SERVICE_FILE" 2>/dev/null \
               | grep -v "^#" | head -1 | grep -oP '(?<==).*')
-            whiptail --msgbox "✓ vLLM service ENGEDÉLYEZVE\n(boot-on-start ON)\n\nModell: ${model_in_svc:-?}\n\nSzerkesztés:\n  nano ${VLLM_SERVICE_FILE}" 14 65
+            whiptail --msgbox "✓ vLLM service ENGEDÉLYEZVE\n\nModell: ${model_in_svc:-?}\nSzerkesztés: nano ${VLLM_SERVICE_FILE}" 12 65
           fi
         fi
         ;;
       5)
         whiptail --title "vLLM paraméterek" --msgbox "
-  Host:              ${VLLM_HOST}
-  Port:              ${VLLM_PORT}
-  dtype:             ${VLLM_DTYPE}      (Blackwell SM_120 optimális)
-  GPU mem utiliz.:   ${VLLM_GPU_MEM_UTIL}   (RTX 5090: ~28.8 GB)
-  Max model len:     ${VLLM_MAX_MODEL_LEN} token
-  Prefix caching:    $([ "$VLLM_ENABLE_PREFIX_CACHE" = "1" ] && echo ON || echo OFF)
+  Host:            ${VLLM_HOST}
+  Port:            ${VLLM_PORT}
+  dtype:           ${VLLM_DTYPE}   (Blackwell SM_120)
+  GPU mem:         ${VLLM_GPU_MEM_UTIL}  (RTX 5090: ~28.8 GB)
+  Max model len:   ${VLLM_MAX_MODEL_LEN} token
+  Prefix caching:  $([ "$VLLM_ENABLE_PREFIX_CACHE" = "1" ] && echo ON || echo OFF)
 
-  PID fájl:   ${VLLM_PID_FILE}
-  Log fájl:   ${VLLM_LOG_FILE}
-  vLLM bin:   ${VENV_VLLM}
+  PID fájl:  ${VLLM_PID_FILE}
+  Log fájl:  ${VLLM_LOG_FILE}
+  vLLM bin:  ${VENV_VLLM}
 
-  PyTorch SM_120 compat: $(
-    _vllm_check_pytorch_blackwell 2>/dev/null && echo "✓ OK" || echo "✗ INKOMPATIBILIS — cu128 fix szükséges!")
+  PyTorch SM_120: $(
+    _vllm_check_pytorch_blackwell 2>/dev/null \
+      && echo '✓ OK' || echo '✗ INKOMPATIBILIS — fix szükséges (6. pont)!')
 
-  API: http://localhost:${VLLM_PORT}/v1/chat/completions
-       http://localhost:${VLLM_PORT}/v1/models
-" 28 72
+  API endpoints:
+    http://localhost:${VLLM_PORT}/v1/chat/completions
+    http://localhost:${VLLM_PORT}/v1/models
+" 30 72
         ;;
       6)
-        # PyTorch Blackwell fix — önálló menüponként is elérhető
-        # Ugyanaz mint amit _vllm_start() is felajánl inkompatibilitás esetén
         _vllm_fix_pytorch_blackwell
+        ;;
+      7)
+        _menu_vllm_model
         ;;
       0) return ;;
     esac
