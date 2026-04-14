@@ -698,7 +698,14 @@ _vllm_fix_pytorch_blackwell() {
   fi
   log "INFO" "uv elérési útja: $uv_bin"
 
-  whiptail --msgbox "PyTorch Blackwell (SM_120) fix indítása\n\nA jelenlegi PyTorch csak sm_90-ig (Ada Lovelace) támogatott.\nRTX 5090 SM_120-hoz cu128 wheel kell.\n\nEszköz: uv pip install (CORE konvenció)\nIndex:  ${torch_index}\nLetöltés: ~2-4 GB\nIdő:  5-15 perc\n\nLog: ${fix_log}\n\nOK = indítás" 20 72
+  # yesno dialog — ESC vagy "Nem" esetén KILÉP, nem indítja a fix-et
+  # Volt: msgbox "OK = indítás" → mindig elindult, nem lehetett kilépni
+  if ! whiptail --title "PyTorch Blackwell (SM_120) fix" --yesno \
+    "A jelenlegi PyTorch csak sm_90-ig (Ada Lovelace) támogatott.\nRTX 5090 SM_120-hoz cu128 wheel kell.\n\nEszköz: uv pip install (CORE konvenció)\nIndex:  ${torch_index}\nLetöltés: ~2-4 GB\nIdő:  5-15 perc\n\nLog: ${fix_log}\n\nIgen = INDÍTÁS   Nem/ESC = visszalép" \
+    18 72; then
+    log "INFO" "PyTorch fix visszalépés (felhasználó döntése)"
+    return 0
+  fi
 
   # ── KRITIKUS: venv tulajdonjog visszaállítás ───────────────────────────────
   # Gyökérok: korábbi 'sudo pip install' vagy 'sudo uv pip' root tulajdonba
@@ -714,14 +721,16 @@ _vllm_fix_pytorch_blackwell() {
   # Reinstall PyTorch cu128-cal — uv pip install (INFRA konvenció, nem pip!)
   # NOTA: uv flag: --reinstall (nem --force-reinstall — az pip-specifikus)
   # Forrás: https://docs.astral.sh/uv/ (official uv dokumentáció)
+  # FONTOS: a subshell stdout-ját /dev/null-ba irányítjuk → nem írja szét a
+  # terminált a whiptail gauge mögé. A kimenet csak a log fájlba kerül.
   sudo -u "$_REAL_USER" bash -c "
     export PATH='${_REAL_HOME}/.local/bin:${_REAL_HOME}/.cargo/bin:/usr/local/bin:/usr/bin:/bin'
     source '${AI_VENV_DIR}/bin/activate'
     '${uv_bin}' pip install torch torchvision torchaudio \
       --index-url '${torch_index}' \
       --reinstall \
-      2>&1 | tee '${fix_log}'
-  " &
+      > '${fix_log}' 2>&1
+  " > /dev/null 2>&1 &
   local fix_pid=$!
 
   # Progress gauge HÁTTÉRBEN fut — így az ESC NEM blokkolja a fix process-t!
@@ -1933,12 +1942,9 @@ _menu_vllm_control() {
         case "$src_choice" in
           1)
             model=$(_vllm_model_browse)
-            # Ha katalógusból cancel → kézi bevitelre felajánlás
-            if [ "$model" = "CANCEL" ] || [ -z "$model" ]; then
-              model=$(whiptail --title "vLLM modell — kézi bevitel" \
-                --inputbox "HuggingFace model ID:\n(pl. Qwen/Qwen2.5-Coder-7B-Instruct)" \
-                12 72 "" 3>&1 1>&2 2>&3) || continue
-            fi
+            # ESC / CANCEL → vissza a menübe, NEM kézi bevitel fallback
+            [ "$model" = "CANCEL" ] && continue
+            [ -z "$model" ] && continue
             ;;
           2)
             model=$(whiptail --title "vLLM modell — kézi bevitel" \
@@ -1980,18 +1986,47 @@ _menu_vllm_control() {
         ;;
       4)
         # systemd user service engedélyezés/tiltás (boot-on-start)
+        # MEGJEGYZÉS: systemctl --user sudo-ból futtatva igényli a DBUS session bus-t
+        # → XDG_RUNTIME_DIR exportálása szükséges a user service kezeléséhez
         if [ ! -f "$VLLM_SERVICE_FILE" ]; then
           whiptail --msgbox "vLLM service fájl hiányzik!\nFuttasd install módban a 09-es modult!" 10 55
           continue
         fi
-        local svc_status
-        svc_status=$(sudo -u "$_REAL_USER" systemctl --user is-enabled vllm-rtx5090 2>/dev/null)
-        if [ "$svc_status" = "enabled" ]; then
-          sudo -u "$_REAL_USER" systemctl --user disable vllm-rtx5090 2>/dev/null
-          whiptail --msgbox "vLLM service letiltva (boot-on-start OFF)" 8 50
-        else
-          sudo -u "$_REAL_USER" systemctl --user enable vllm-rtx5090 2>/dev/null
-          whiptail --msgbox "vLLM service engedélyezve (boot-on-start ON)\nModell: a service fájlban megadott model!" 10 55
+        # Aktuális státusz lekérés — XDG_RUNTIME_DIR exportálásával
+        local svc_status xdg_dir uid
+        uid=$(id -u "$_REAL_USER" 2>/dev/null)
+        xdg_dir="/run/user/${uid}"
+        svc_status=$(XDG_RUNTIME_DIR="$xdg_dir" \
+          sudo -u "$_REAL_USER" \
+          systemctl --user is-enabled vllm-rtx5090 2>/dev/null || echo "disabled")
+        [ -z "$svc_status" ] && svc_status="disabled"
+
+        # Státusz megjelenítése yesno dialog-ban — egyértelmű választás
+        local status_label active_label
+        [ "$svc_status" = "enabled" ] && {
+          status_label="BE (boot-on-start ON)"
+          active_label="LETILTÁS (boot-on-start OFF)"
+        } || {
+          status_label="KI (boot-on-start OFF)"
+          active_label="ENGEDÉLYEZÉS (boot-on-start ON)"
+        }
+
+        if whiptail --title "vLLM systemd service" --yesno \
+          "Jelenlegi állapot: ${status_label}\n\nService fájl:\n  ${VLLM_SERVICE_FILE}\n\n${active_label}?" \
+          14 65; then
+          if [ "$svc_status" = "enabled" ]; then
+            XDG_RUNTIME_DIR="$xdg_dir" \
+              sudo -u "$_REAL_USER" systemctl --user disable vllm-rtx5090 2>/dev/null
+            whiptail --msgbox "✓ vLLM service LETILTVA\n(boot-on-start OFF)" 8 45
+          else
+            XDG_RUNTIME_DIR="$xdg_dir" \
+              sudo -u "$_REAL_USER" systemctl --user enable vllm-rtx5090 2>/dev/null
+            # Fájlban lévő MODEL_ID megjelenítése
+            local model_in_svc
+            model_in_svc=$(grep "MODEL_ID=" "$VLLM_SERVICE_FILE" 2>/dev/null \
+              | grep -v "^#" | head -1 | grep -oP '(?<==).*')
+            whiptail --msgbox "✓ vLLM service ENGEDÉLYEZVE\n(boot-on-start ON)\n\nModell: ${model_in_svc:-?}\n\nSzerkesztés:\n  nano ${VLLM_SERVICE_FILE}" 14 65
+          fi
         fi
         ;;
       5)
