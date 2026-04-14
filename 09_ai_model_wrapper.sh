@@ -33,12 +33,23 @@
 #   infra_require "02" — Ollama + vLLM + TurboQuant telepítve (02_local_ai_stack)
 #   infra_require "06" — VS Code + CLINE + Continue.dev telepítve (06_editors)
 #
-# FUTTATÁS:
-#   sudo bash 09_ai_model_wrapper.sh          → önállóan (manage mód)
-#   RUN_MODE=install sudo bash 09_...         → INFRA telepítő mód
-#   RUN_MODE=check   sudo bash 09_...         → komponens ellenőrzés
-#   RUN_MODE=update  sudo bash 09_...         → frissítő mód
-#   ai-model-ctl                              → parancssori alias (telepítés után)
+# FUTTATÁS (valós parancsok — RUN_MODE exportálva maradhat a shellben!):
+#   sudo RUN_MODE=manage bash 09_ai_model_wrapper.sh   → interaktív menü (AJÁNLOTT)
+#   RUN_MODE=install sudo bash 09_ai_model_wrapper.sh  → INFRA telepítő mód
+#   RUN_MODE=check   sudo bash 09_ai_model_wrapper.sh  → komponens ellenőrzés
+#   RUN_MODE=update  sudo bash 09_ai_model_wrapper.sh  → frissítő mód
+#   RUN_MODE=fix     sudo bash 09_ai_model_wrapper.sh  → újratelepítés
+#
+# FONTOS: Ha az előző futásnál RUN_MODE=install volt, a shell örökli!
+#   Ellenőrzés: echo $RUN_MODE
+#   Megoldás:   unset RUN_MODE && sudo RUN_MODE=manage bash 09_ai_model_wrapper.sh
+#   Vagy mindig:  sudo RUN_MODE=manage bash 09_ai_model_wrapper.sh
+#
+# ai-model-ctl (ha install már lefutott):
+#   ai-model-ctl                    → interaktív menü (sudo-t kér automatikusan)
+#   ai-model-ctl status             → komponens check
+#   ai-model-ctl start-vllm MODEL   → vLLM indítás CLI-ből
+#   ai-model-ctl stop-vllm          → vLLM leállítás
 #
 # HIVATKOZOTT DOKUMENTÁCIÓK (DOCS.md alapján, hivatalos forrás):
 #   Ollama API: https://ollama.readthedocs.io/en/api/
@@ -59,7 +70,7 @@
 #   CLINE: https://github.com/cline/cline (extension settings.json kulcsok)
 #     - cline.apiProvider / cline.ollamaBaseUrl / cline.openAiBaseUrl stb.
 #
-# VERZIÓ: v1.0 (lib v6.4+ kompatibilis)
+# VERZIÓ: v2.0 (lib v6.4+ kompatibilis)
 # =============================================================================
 
 # =============================================================================
@@ -85,7 +96,7 @@ LIB="$SCRIPT_DIR/00_lib.sh"
 # ── Modul azonosítók ──────────────────────────────────────────────────────────
 readonly MOD_ID="09"
 readonly MOD_NAME="AI Model Manager"
-readonly MOD_VERSION="1.0"
+readonly MOD_VERSION="2.0"
 # Lib minimum verzió (00_lib.sh LIB_VERSION) — compat check
 readonly MOD_LIB_MIN="6.4"
 
@@ -702,28 +713,50 @@ _vllm_fix_pytorch_blackwell() {
   " &
   local fix_pid=$!
 
-  # Progress gauge — uv pip output figyelés
+  # Progress gauge HÁTTÉRBEN fut — így az ESC NEM blokkolja a fix process-t!
+  # ESC = gauge bezárul, uv pip install tovább fut a háttérben
+  # uv párhuzamos letöltés kimenete szétírhatja a terminált → csak 1 sor mutatva
   (
     local elapsed=0
     while kill -0 "$fix_pid" 2>/dev/null; do
       local pct last_line
-      last_line=$(tail -1 "$fix_log" 2>/dev/null | cut -c1-65)
-      # uv download progress: különböző formátumok (byte vagy %)
-      pct=$(tail -5 "$fix_log" 2>/dev/null | grep -oP '\d+(?=%)' | tail -1)
+      # Csak az utolsó sor, ANSI strip, max 60 karakter (terminál védelme)
+      last_line=$(tail -1 "$fix_log" 2>/dev/null \
+        | sed 's/\x1B\[[0-9;]*[mK]//g; s/\r//g' \
+        | tr -d '\n' | cut -c1-60)
+      pct=$(tail -10 "$fix_log" 2>/dev/null \
+        | sed 's/\x1B\[[0-9;]*[mK]//g' \
+        | grep -oP '\d+(?=%)' | tail -1)
       [ -z "$pct" ] && pct=$(( elapsed * 60 / 600 ))
       [ "$pct" -gt 95 ] && pct=95
       printf 'XXX\n%d\n%dm%02ds  |  %s\nXXX\n' \
         "$pct" "$(( elapsed/60 ))" "$(( elapsed%60 ))" \
-        "${last_line:-(várakozás...)}"
+        "${last_line:-(uv pip install fut...)}"
       sleep 5; elapsed=$(( elapsed + 5 ))
     done
-    echo 100
-  ) | whiptail --title "PyTorch Blackwell fix — cu128 reinstall (uv)" \
-      --gauge "$(printf 'torch + torchvision + torchaudio\nEszköz: uv pip install\nIndex:  %s\nLog:    %s\n\nESC = háttérbe' \
+    printf 'XXX\n100\n✓ uv pip install befejezve\nXXX\n'
+    sleep 1; echo 100
+  ) | whiptail --title "PyTorch Blackwell fix — cu128 (uv pip install)" \
+      --gauge "$(printf 'torch + torchvision + torchaudio\nIndex:  %s\nLog:    %s\n\nESC = bezárás (install fut tovább háttérben!)' \
         "$torch_index" "$fix_log")" \
       14 76 0
 
-  wait "$fix_pid"
+  # gauge bezárult (ESC vagy befejezés) — ha a fix még fut, felajánljuk a várakozást
+  if kill -0 "$fix_pid" 2>/dev/null; then
+    if whiptail --yesno \
+      "uv pip install még fut háttérben!\n\nLog: $fix_log\n\nVárod be? (Igen=várakozás, Nem=háttérben hagyja)" \
+      12 68; then
+      # Felhasználó vár — egyszerű szöveges progress a whiptail nélkül
+      log "INFO" "Várakozás az uv pip install befejezésére (PID: $fix_pid)..."
+      wait "$fix_pid"
+    else
+      log "INFO" "uv pip install fut háttérben (PID: $fix_pid). Log: $fix_log"
+      whiptail --msgbox "uv pip install háttérben fut.\n\nEllenőrzés:\n  tail -f $fix_log\n\nBefejezés után futtasd újra a PyTorch fix ellenőrzést!" 14 68
+      return 0
+    fi
+  else
+    wait "$fix_pid"
+  fi
   local exit_code=$?
   cat "$fix_log" >> "$LOGFILE" 2>/dev/null
 
@@ -1384,65 +1417,119 @@ except: pass
   echo "${clean_names[$((sel_idx-1))]}"
 }
 
-# _popular_model_browse: népszerű modellek katalógusa letöltéshez
-# Kategóriák: code (kódgenerálás), chat (általános), embed (RAG), reason (érvelés)
-# A lista tartalmazza a 2025-2026-ban legelterjedtebb Ollama-kompatibilis modelleket
-# Paraméter: $1=szűrő kategória (all|code|chat|embed|reason), alapért.: all
-# Kimenet: stdout-ra írja a kiválasztott modell nevét, vagy "" ha cancel/egyedi
-_popular_model_browse() {
-  local filter="${1:-all}"
+# =============================================================================
+# EGYSÉGES MODELL KATALÓGUS
+# =============================================================================
+# Közös adatbázis Ollama + vLLM modellekhez.
+# HuggingFace TASK csoportosítás: code|chat|reason|embed|vision
+# Minden browse menüből elérhető — egységes UX.
+#
+# Forrás: ollama.com/library (Ollama ID-k)
+#         huggingface.co (HF ID-k, TASK metaadat)
 
-  # Kuráló lista: "ollama_name" "leírás" "kategória"
-  # Forrás: ollama.com/library (official modell katalógus)
-  local -a _cat _name _desc
-  _name+=("qwen2.5-coder:1.5b");      _desc+=("[KÓD]   Qwen2.5 Coder 1.5B  — tab-autocomplete, gyors (1.0 GB)");  _cat+=("code")
-  _name+=("qwen2.5-coder:7b");        _desc+=("[KÓD]   Qwen2.5 Coder 7B    — ajánlott kódassistens (4.7 GB)");     _cat+=("code")
-  _name+=("qwen2.5-coder:14b");       _desc+=("[KÓD]   Qwen2.5 Coder 14B   — erős kódgenerálás (9.0 GB)");         _cat+=("code")
-  _name+=("qwen2.5-coder:32b");       _desc+=("[KÓD]   Qwen2.5 Coder 32B   — SOTA kód, RTX 5090 (19 GB)");         _cat+=("code")
-  _name+=("deepseek-coder-v2:16b");   _desc+=("[KÓD]   DeepSeek Coder V2 16B — MoE, gyors (8.9 GB)");              _cat+=("code")
-  _name+=("codestral:22b");           _desc+=("[KÓD]   Codestral 22B        — Mistral kódmodell (13 GB)");          _cat+=("code")
-  _name+=("qwen2.5:7b");              _desc+=("[CHAT]  Qwen2.5 7B            — általános chat (4.7 GB)");            _cat+=("chat")
-  _name+=("qwen2.5:14b");             _desc+=("[CHAT]  Qwen2.5 14B           — erős általános (9.0 GB)");            _cat+=("chat")
-  _name+=("qwen2.5:32b");             _desc+=("[CHAT]  Qwen2.5 32B           — nagy általános (19 GB)");             _cat+=("chat")
-  _name+=("llama3.3:70b");            _desc+=("[CHAT]  Llama 3.3 70B         — Meta flagship (42 GB)");              _cat+=("chat")
-  _name+=("mistral:7b");              _desc+=("[CHAT]  Mistral 7B             — gyors, megbízható (4.1 GB)");        _cat+=("chat")
-  _name+=("gemma3:12b");              _desc+=("[CHAT]  Gemma 3 12B            — Google, hatékony (8.1 GB)");         _cat+=("chat")
-  _name+=("deepseek-r1:7b");          _desc+=("[REASON] DeepSeek R1 7B       — chain-of-thought (4.7 GB)");          _cat+=("reason")
-  _name+=("deepseek-r1:14b");         _desc+=("[REASON] DeepSeek R1 14B      — erős érvelő (9.0 GB)");               _cat+=("reason")
-  _name+=("deepseek-r1:32b");         _desc+=("[REASON] DeepSeek R1 32B      — SOTA reasoning (19 GB)");             _cat+=("reason")
-  _name+=("nomic-embed-text");        _desc+=("[EMBED] Nomic Embed Text       — RAG, Continue.dev (0.3 GB)");        _cat+=("embed")
-  _name+=("mxbai-embed-large");       _desc+=("[EMBED] MxBAI Embed Large      — RAG, nagy dimenzió (0.7 GB)");      _cat+=("embed")
-  _name+=("bge-m3");                  _desc+=("[EMBED] BGE-M3                 — multilingual RAG (1.2 GB)");        _cat+=("embed")
+# _init_model_db: modell adatbázis betöltése globális tömbökbe
+# Hívás: egyszer a browse előtt (lazy-init: ha üres, automatikusan hívódik)
+_init_model_db() {
+  _MDB_OLLAMA=(); _MDB_HF=();    _MDB_TASK=()
+  _MDB_SIZE=();   _MDB_VRAM=();  _MDB_DESC=()
+  _MDB_OLLAMA_OK=(); _MDB_VLLM_OK=()
 
-  # BUGFIX: kategória szűrő menü CSAK akkor jelenik meg, ha filter="all"
-  # Korábban: mindig megjelent → rekurzív hívás esetén kétszer mutatta a szűrőt
-  # Most: _popular_model_browse "code" hívás esetén AZONNAL a code listát mutatja
+  # Formátum: "ollama_name|hf_id|task|size_gb|vram_gb|ollama_ok|vllm_ok|leírás"
+  # ollama_ok: Ollama pull-lal letölthető
+  # vllm_ok:   vLLM serve-vel futtatható (HF API)
+  # embed + vision modellek: vllm_ok=false (legtöbb nem OpenAI-chat-compatible)
+  local -a _entries=(
+    # ── CODE: kódgenerálás, text-generation/code ──────────────────────────
+    "qwen2.5-coder:1.5b|Qwen/Qwen2.5-Coder-1.5B-Instruct|code|1.0|2|true|true|Tab autocomplete, gyors, CLINE inline"
+    "qwen2.5-coder:7b|Qwen/Qwen2.5-Coder-7B-Instruct|code|4.7|8|true|true|Ajánlott CLINE kód asszisztens"
+    "qwen2.5-coder:14b|Qwen/Qwen2.5-Coder-14B-Instruct|code|9.0|14|true|true|Erős kódgenerálás + context"
+    "qwen2.5-coder:32b|Qwen/Qwen2.5-Coder-32B-Instruct|code|19.0|25|true|true|SOTA kód, RTX 5090 kihasználja"
+    "deepseek-coder-v2:16b|deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct|code|8.9|12|true|true|MoE architektúra, gyors"
+    "codestral:22b|mistralai/Codestral-22B-v0.1|code|13.0|18|true|true|Mistral kódmodell, fill-in-middle"
+    "starcoder2:15b|bigcode/starcoder2-15b-instruct-v0.1|code|9.1|13|true|true|BigCode StarCoder2 15B"
+    "granite-code:20b|ibm-granite/granite-20b-code-instruct-8k|code|12.0|16|true|true|IBM Granite kód 20B"
+    # ── CHAT: általános szöveggenerálás ───────────────────────────────────
+    "qwen2.5:7b|Qwen/Qwen2.5-7B-Instruct|chat|4.7|8|true|true|Általános chat, gyors"
+    "qwen2.5:14b|Qwen/Qwen2.5-14B-Instruct|chat|9.0|14|true|true|Erős általános asszisztens"
+    "qwen2.5:32b|Qwen/Qwen2.5-32B-Instruct|chat|19.0|25|true|true|Nagy általános modell"
+    "llama3.3:70b|meta-llama/Llama-3.3-70B-Instruct|chat|42.0|48|true|true|Meta flagship, RTX 5090 teli"
+    "mistral:7b|mistralai/Mistral-7B-Instruct-v0.3|chat|4.1|6|true|true|Gyors, megbízható baseline"
+    "gemma3:12b|google/gemma-3-12b-it|chat|8.1|12|true|true|Google Gemma 3, hatékony"
+    "phi4:14b|microsoft/phi-4|chat|9.1|14|true|true|Microsoft Phi-4, kis VRAM"
+    "command-r:35b|CohereForAI/c4ai-command-r-08-2024|chat|20.0|26|true|true|Cohere RAG-optimalizált"
+    "aya-expanse:32b|CohereForAI/aya-expanse-32b|chat|20.0|26|true|true|Cohere multilingual 32B"
+    # ── REASON: érvelés, lánc-gondolkodás ────────────────────────────────
+    "deepseek-r1:7b|deepseek-ai/DeepSeek-R1-Distill-Qwen-7B|reason|4.7|8|true|true|Chain-of-thought, gyors"
+    "deepseek-r1:14b|deepseek-ai/DeepSeek-R1-Distill-Qwen-14B|reason|9.0|14|true|true|Erős érvelő modell"
+    "deepseek-r1:32b|deepseek-ai/DeepSeek-R1-Distill-Qwen-32B|reason|19.0|25|true|true|SOTA reasoning RTX 5090"
+    "qwq:32b|Qwen/QwQ-32B|reason|20.0|26|true|true|Qwen QwQ — hosszú gondolkodás"
+    "marco-o1:7b|AIDC-AI/Marco-o1|reason|4.7|8|true|true|Marco-o1 reasoning 7B"
+    # ── EMBED: beágyazás, RAG, feature-extraction ─────────────────────────
+    "nomic-embed-text|nomic-ai/nomic-embed-text-v1|embed|0.3|1|true|false|RAG + Continue.dev embed"
+    "mxbai-embed-large|mixedbread-ai/mxbai-embed-large-v1|embed|0.7|2|true|false|RAG nagy dimenzió"
+    "bge-m3|BAAI/bge-m3|embed|1.2|2|true|false|Multilingual RAG, 8192 ctx"
+    "snowflake-arctic-embed2|Snowflake/snowflake-arctic-embed-v2.0|embed|0.6|1|true|false|Arctic Embed v2"
+    "all-minilm|sentence-transformers/all-MiniLM-L6-v2|embed|0.1|1|true|false|Gyors, kis méretű embed"
+    # ── VISION: kép + szöveg, multimodális ───────────────────────────────
+    "llava:13b|llava-hf/llava-1.5-13b-hf|vision|8.0|12|true|true|LLaVA 1.5 13B vision"
+    "qwen2.5-vl:7b|Qwen/Qwen2.5-VL-7B-Instruct|vision|5.0|9|true|true|Qwen2.5 Vision 7B"
+    "minicpm-v|openbmb/MiniCPM-o-2_6|vision|5.5|9|true|true|MiniCPM-o 2.6 Vision"
+    "moondream2|vikhyatk/moondream2|vision|1.8|3|true|false|Kis vision modell, gyors"
+  )
+
+  for _entry in "${_entries[@]}"; do
+    IFS='|' read -r _ol _hf _task _sz _vr _ook _vok _desc <<< "$_entry"
+    _MDB_OLLAMA+=("$_ol");  _MDB_HF+=("$_hf")
+    _MDB_TASK+=("$_task");  _MDB_SIZE+=("$_sz");  _MDB_VRAM+=("$_vr")
+    _MDB_OLLAMA_OK+=("$_ook"); _MDB_VLLM_OK+=("$_vok")
+    _MDB_DESC+=("$_desc")
+  done
+}
+
+# _model_catalog_browse: egységes modell katalógus böngésző
+# Minden browse menüből elérhető — HF TASK szűrővel, ✓ jelöléssel.
+#
+# Paraméterek:
+#   $1 = backend: "ollama" | "vllm"
+#        - ollama: Ollama neve (pl. "qwen2.5-coder:7b") kerül visszaadásra
+#        - vllm:   HuggingFace ID (pl. "Qwen/Qwen2.5-Coder-7B") kerül vissza
+#   $2 = task filter: "all"|"code"|"chat"|"reason"|"embed"|"vision"
+#        Ha "all" → TASK szűrő menü jelenik meg először
+#
+# Kimenet: stdout → választott modell neve/ID, vagy "CANCEL"
+_model_catalog_browse() {
+  local backend="${1:-ollama}"
+  local filter="${2:-all}"
+
+  # Lazy init: ha az adatbázis még nincs betöltve
+  [ ${#_MDB_OLLAMA[@]} -eq 0 ] && _init_model_db
+
+  # TASK szűrő menü — csak "all" esetén jelenik meg (nem rekurzív!)
   if [ "$filter" = "all" ]; then
     local cat_choice
-    cat_choice=$(whiptail --title "Modell katalógus" \
-      --menu "Modell kategória szűrő:" 14 65 5 \
-      "1" "Összes modell megjelenítése" \
-      "2" "Csak kódgenerálás [KÓD]" \
-      "3" "Csak chat modellek [CHAT]" \
-      "4" "Csak érvelő modellek [REASON]" \
-      "5" "Csak embedding modellek [EMBED]" \
+    cat_choice=$(whiptail --title "Modell katalógus — HuggingFace TASK szűrő" \
+      --menu "Melyik kategóriából választasz?" 18 72 7 \
+      "1" "Összes modell (minden TASK)" \
+      "2" "[CODE]   Kódgenerálás — CLINE/Continue kód asszisztens" \
+      "3" "[CHAT]   Általános chat — text-generation" \
+      "4" "[REASON] Érvelő modellek — chain-of-thought" \
+      "5" "[EMBED]  Embedding / RAG — feature-extraction" \
+      "6" "[VISION] Vision + Language — kép + szöveg" \
       3>&1 1>&2 2>&3) || { echo "CANCEL"; return 1; }
-
-    # Szűrő paraméter beállítása a választás alapján (nem rekurzív hívás!)
     case "$cat_choice" in
-      2) filter="code" ;;
-      3) filter="chat" ;;
+      2) filter="code"   ;;
+      3) filter="chat"   ;;
       4) filter="reason" ;;
-      5) filter="embed" ;;
-      # 1 = összes → filter marad "all"
+      5) filter="embed"  ;;
+      6) filter="vision" ;;
+      # 1 = összes, filter marad "all"
     esac
   fi
 
-  # Telepített Ollama modellek lekérése ✓ jelöléshez
-  # GET /api/tags → name mező → set-be rakjuk a gyors lookup-hoz
+  # Telepített Ollama modellek lekérése (✓ jelöléshez)
   local installed_set=""
   if _is_ollama_running; then
-    installed_set=$(_ollama_api GET "/api/tags" | python3 -c "
+    installed_set=$(_ollama_api GET "/api/tags" 2>/dev/null | python3 -c "
 import json,sys
 try:
   data=json.load(sys.stdin)
@@ -1450,103 +1537,77 @@ try:
 except: pass
 " 2>/dev/null | tr '\n' '|')
   fi
+  # HuggingFace lokális cache (✓ jelöléshez vLLM esetén)
+  local hf_cache="${_REAL_HOME}/.cache/huggingface/hub"
 
-  # Szűrés kategória szerint — a fentebb beállított filter alapján
-  # ✓ jelölés: ha a modell neve szerepel a telepítettlista-ban
-  local menu_items=() filtered_names=()
+  # Lista összeállítás — backend + task szűrés
+  local menu_items=() result_ids=()
   local idx=1
-  for ((i=0; i<${#_name[@]}; i++)); do
-    [ "$filter" != "all" ] && [ "${_cat[$i]}" != "$filter" ] && continue
-    # ✓ marker ha már le van töltve
+  for ((i=0; i<${#_MDB_OLLAMA[@]}; i++)); do
+    # TASK szűrés
+    [ "$filter" != "all" ] && [ "${_MDB_TASK[$i]}" != "$filter" ] && continue
+    # Backend kompatibilitás szűrés
+    [ "$backend" = "ollama" ] && [ "${_MDB_OLLAMA_OK[$i]}" != "true" ] && continue
+    [ "$backend" = "vllm"   ] && [ "${_MDB_VLLM_OK[$i]}"  != "true" ] && continue
+
+    # Visszaadott ID: Ollama neve vagy HF ID
+    local result_id
+    [ "$backend" = "ollama" ] && result_id="${_MDB_OLLAMA[$i]}" \
+                               || result_id="${_MDB_HF[$i]}"
+
+    # ✓ jelölés — már letöltve?
     local marker=""
-    if [[ "$installed_set" == *"|${_name[$i]}|"* ]] || \
-       [[ "$installed_set" == "${_name[$i]}|"* ]]; then
-      marker=" ✓"
+    if [ "$backend" = "ollama" ]; then
+      local oname="${_MDB_OLLAMA[$i]}"
+      if [[ "$installed_set" == *"|${oname}|"* ]] || \
+         [[ "$installed_set" == "${oname}|"* ]]; then
+        marker=" ✓"
+      fi
+    else
+      local cache_name="models--${_MDB_HF[$i]//\//-}"
+      [ -d "${hf_cache}/${cache_name}" ] && marker=" ✓"
     fi
-    menu_items+=("$idx" "${_desc[$i]}${marker}" "OFF")
-    filtered_names+=("${_name[$i]}")
+
+    # TASK TAG: CODE, CHAT, REASON, EMBED, VISION
+    local task_tag="${_MDB_TASK[$i]^^}"
+    # Label: [TASK] modell (XGB, VRAM~YGB) — leírás  ✓
+    local label
+    label=$(printf '[%-6s] %-38s (%sGB, VRAM~%sGB) %s%s' \
+      "$task_tag" "$result_id" \
+      "${_MDB_SIZE[$i]}" "${_MDB_VRAM[$i]}" \
+      "${_MDB_DESC[$i]}" "$marker")
+    menu_items+=("$idx" "$label" "OFF")
+    result_ids+=("$result_id")
     ((idx++))
   done
 
-  if [ ${#filtered_names[@]} -eq 0 ]; then
-    whiptail --msgbox "Nincs modell ebben a kategóriában: ${filter}" 8 55
+  if [ ${#result_ids[@]} -eq 0 ]; then
+    whiptail --msgbox "Nincs modell ebben a kategóriában: [${filter^^}] / ${backend}" 8 60
     echo "CANCEL"; return 1
   fi
 
-  # Tényleges modell választó lista
+  # Szélesebb ablak a hosszú label-ekhez
   local sel_idx
-  sel_idx=$(whiptail --title "Modell katalógus — ${filter}" \
-    --radiolist "Válassz modellt (SPACE=jelöl, ENTER=OK):" \
-    24 80 "${#filtered_names[@]}" \
+  sel_idx=$(whiptail --title "Modell katalógus — [${filter^^}] | ${backend}" \
+    --radiolist "SPACE=jelöl, ENTER=OK  |  ✓ = már letöltve" \
+    28 92 "${#result_ids[@]}" \
     "${menu_items[@]}" \
     3>&1 1>&2 2>&3) || { echo "CANCEL"; return 1; }
 
-  echo "${filtered_names[$((sel_idx-1))]}"
+  echo "${result_ids[$((sel_idx-1))]}"
 }
 
-# _vllm_model_browse: vLLM-hez ajánlott HuggingFace modellek katalógusa
-# vLLM HuggingFace formátumot vár — ezek az Ollama nevektől eltérhetnek
-# A lista a HF Hub model ID-kat tartalmazza (vllm serve MODEL_ID)
+# _popular_model_browse: Ollama modell katalógus böngésző
+# Visszafelé-kompatibilis wrapper → _model_catalog_browse "ollama" "$filter"
+# Paraméter: $1=task filter (all|code|chat|reason|embed|vision)
+_popular_model_browse() {
+  _model_catalog_browse "ollama" "${1:-all}"
+}
+
+# _vllm_model_browse: vLLM HuggingFace modell katalógus böngésző
+# Visszafelé-kompatibilis wrapper → _model_catalog_browse "vllm" "$filter"
 _vllm_model_browse() {
-  # HuggingFace lokális cache ellenőrzés — letöltött modellek ✓ jelölése
-  # HF cache: ~/.cache/huggingface/hub/models--<owner>--<repo>/
-  local hf_cache_dir="${_REAL_HOME}/.cache/huggingface/hub"
-  _hf_is_cached() {
-    local hf_id="$1"
-    # Konverzió: "Qwen/Qwen2.5-7B" → "models--Qwen--Qwen2.5-7B"
-    local cache_name="models--${hf_id//\//-}"
-    [ -d "${hf_cache_dir}/${cache_name}" ]
-  }
-
-  # HuggingFace model ID-k és leírások
-  local hf_ids=(
-    "Qwen/Qwen2.5-Coder-7B-Instruct"
-    "Qwen/Qwen2.5-Coder-14B-Instruct"
-    "Qwen/Qwen2.5-Coder-32B-Instruct"
-    "Qwen/Qwen2.5-7B-Instruct"
-    "Qwen/Qwen2.5-14B-Instruct"
-    "Qwen/Qwen2.5-32B-Instruct"
-    "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B"
-    "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B"
-    "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct"
-    "mistralai/Mistral-7B-Instruct-v0.3"
-    "google/gemma-3-12b-it"
-    "meta-llama/Llama-3.3-70B-Instruct"
-  )
-  local hf_descs=(
-    "[KÓD-7B]   Qwen/Qwen2.5-Coder-7B-Instruct     (4.7 GB, VRAM~8GB)"
-    "[KÓD-14B]  Qwen/Qwen2.5-Coder-14B-Instruct     (9 GB, VRAM~14GB)"
-    "[KÓD-32B]  Qwen/Qwen2.5-Coder-32B-Instruct     (19 GB, VRAM~25GB)"
-    "[CHAT-7B]  Qwen/Qwen2.5-7B-Instruct            (4.7 GB, VRAM~8GB)"
-    "[CHAT-14B] Qwen/Qwen2.5-14B-Instruct           (9 GB, VRAM~14GB)"
-    "[CHAT-32B] Qwen/Qwen2.5-32B-Instruct           (19 GB, VRAM~25GB)"
-    "[REASON]   deepseek-ai/DeepSeek-R1-Distill-Qwen-7B  (4.7 GB)"
-    "[REASON]   deepseek-ai/DeepSeek-R1-Distill-Qwen-14B (9 GB)"
-    "[CODE]     deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct (8.9 GB)"
-    "[CHAT]     mistralai/Mistral-7B-Instruct-v0.3  (4.1 GB, VRAM~6GB)"
-    "[CHAT]     google/gemma-3-12b-it                (8.1 GB, VRAM~12GB)"
-    "[CHAT-70B] meta-llama/Llama-3.3-70B-Instruct   (42 GB — RTX 5090!)"
-  )
-
-  # Dinamikus menu_items: HF cache-ben lévő modellek ✓ jelölése
-  # HF cache útvonal: ~/.cache/huggingface/hub/models--<owner>--<repo>/
-  local menu_items=()
-  for ((i=0; i<${#hf_ids[@]}; i++)); do
-    local hf_id="${hf_ids[$i]}"
-    local cache_name="models--${hf_id//\//-}"
-    local marker=""
-    [ -d "${hf_cache_dir}/${cache_name}" ] && marker=" ✓"
-    menu_items+=("$((i+1))" "${hf_descs[$i]}${marker}" "OFF")
-  done
-
-  local sel_idx
-  sel_idx=$(whiptail --title "vLLM modell katalógus (HuggingFace)" \
-    --radiolist "vLLM HuggingFace modellek — RTX 5090 optimalizált:" \
-    24 82 "${#hf_ids[@]}" \
-    "${menu_items[@]}" \
-    3>&1 1>&2 2>&3) || { echo "CANCEL"; return 1; }
-
-  echo "${hf_ids[$((sel_idx-1))]}"
+  _model_catalog_browse "vllm" "${1:-all}"
 }
 
 # =============================================================================
@@ -1559,6 +1620,7 @@ _menu_model_manager() {
     # Telepített modellek lista
     local installed_list
     installed_list=$(_ollama_list_installed 2>/dev/null)
+
     local running_list
     running_list=$(_ollama_list_running 2>/dev/null)
 
