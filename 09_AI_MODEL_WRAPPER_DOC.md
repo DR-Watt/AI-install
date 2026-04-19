@@ -1,7 +1,7 @@
 # AI Model Manager — Fejlesztői Dokumentáció
 
 **Fájl:** `09_ai_model_wrapper.sh`  
-**Verzió:** v2.5  
+**Verzió:** v2.6  
 **Lib verzió minimum:** 6.4  
 **Projekt:** DR-Watt/AI-install · `main` branch  
 **Fejlesztési környezet:** Ubuntu 24.04 LTS · RTX 5090 Blackwell SM_120
@@ -90,7 +90,7 @@ A program Ubuntu 24.04 LTS-re van optimalizálva. Más Debian-alapú disztribúc
 
 ```
 <SCRIPT_DIR>/
-├── 09_ai_model_wrapper.sh       # Főscript (v2.5, ~2500 sor)
+├── 09_ai_model_wrapper.sh       # Főscript (v2.6, ~2550 sor)
 ├── 00_lib.sh                    # INFRA master lib loader
 ├── 00_registry.sh               # Modul registry (HW_REQ, DEFAULT, stb.)
 ├── lib/
@@ -917,7 +917,7 @@ Minden paraméter a script tetején `readonly` változókban van deklarálva. Ve
 ```bash
 # Modul
 MOD_ID="09"
-MOD_VERSION="2.5"
+MOD_VERSION="2.6"
 MOD_LIB_MIN="6.4"
 
 # Ollama
@@ -1094,6 +1094,7 @@ XDG_RUNTIME_DIR="/run/user/$(id -u $REAL_USER)" \
 | v2.3 | Lib split: `lib/09_lib_models.sh` + `lib/09_lib_browse.sh`; HF TASK bővítés 7 kategóriára (47 modell); ESC szabály egységesítés |
 | v2.4 | vLLM log timestamp; PyTorch fix után automatikus vLLM ABI reinstall; vLLM menü split (`_menu_vllm_control` + `_menu_vllm_model` + `_menu_vllm_start_with_model`) |
 | v2.5 | **SÚLYOS hibajavítás kör (H1–H6):** H1 ESC regresszió javítás (explicit `if/continue`), H2 JSON/Python injection védelem (env var), H3 `_do_update` ténylegesen újragenerálja az `ai-model-ctl`-t (`_generate_ai_model_ctl()` közös függvény), H4 vLLM systemd `StartLimitIntervalSec`+`StartLimitBurst`, **H5 TurboQuant valós funkció = KV cache compression** (menü + `_tq_quantize_model` átírva), H6 `set -o pipefail` a subshell-ben |
+| v2.6 | **KÖZEPES funkcionális kör (K1, K3, K4, K5, K6, K8):** K1 `_log_system_info` olvassa a state változókat `~/.infra-state`-ből (manage mód self-contained), K3 `_ollama_pull_model` detektálja a `"error"` JSON-t és whiptail-ben megjeleníti (korábban végtelen ciklus hibánál), K4 `_ide_update_settings` JSON parse hiba explicit log (nem néma elnyelés), **K5 `ollama_svc` 3-állapotú** (ok/old/missing — `list-unit-files` check, leállított ≠ hiányzó), **K6 `_vllm_start` `printf %q` escape** model name + args számára (space/aposztróf védelem), **K8 vLLM service enable után yesno start felajánlás** (+ `systemctl --user start` + 2s state check) |
 
 ---
 
@@ -1115,4 +1116,4 @@ XDG_RUNTIME_DIR="/run/user/$(id -u $REAL_USER)" \
 
 ---
 
-*Dokumentáció verziója: 2026-04-19 · DR-Watt/AI-install · `09_ai_model_wrapper.sh` v2.5*
+*Dokumentáció verziója: 2026-04-19 · DR-Watt/AI-install · `09_ai_model_wrapper.sh` v2.6*
