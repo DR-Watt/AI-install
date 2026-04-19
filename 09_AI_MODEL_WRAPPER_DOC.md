@@ -1,7 +1,7 @@
 # AI Model Manager — Fejlesztői Dokumentáció
 
 **Fájl:** `09_ai_model_wrapper.sh`  
-**Verzió:** v2.4  
+**Verzió:** v2.5  
 **Lib verzió minimum:** 6.4  
 **Projekt:** DR-Watt/AI-install · `main` branch  
 **Fejlesztési környezet:** Ubuntu 24.04 LTS · RTX 5090 Blackwell SM_120
@@ -30,7 +30,7 @@
 
 ## 1. A program célja
 
-Az `09_ai_model_wrapper.sh` az INFRA rendszer 9-es modulja. Feladata az **Vibe Coding Workspace** AI modell infrastruktúrájának interaktív kezelése: Ollama modellek letöltése és VRAM-kezelése, vLLM OpenAI-compatible szerver indítása, TurboQuant kvantálás, valamint a CLINE és Continue.dev IDE bővítmények backend konfigurációjának automatikus frissítése.
+Az `09_ai_model_wrapper.sh` az INFRA rendszer 9-es modulja. Feladata az **Vibe Coding Workspace** AI modell infrastruktúrájának interaktív kezelése: Ollama modellek letöltése és VRAM-kezelése, vLLM OpenAI-compatible szerver indítása, TurboQuant KV cache compression informatív kezelése (v2.6-ban aktív vLLM integráció), valamint a CLINE és Continue.dev IDE bővítmények backend konfigurációjának automatikus frissítése.
 
 A program kettős üzemmódban működik:
 
@@ -90,7 +90,7 @@ A program Ubuntu 24.04 LTS-re van optimalizálva. Más Debian-alapú disztribúc
 
 ```
 <SCRIPT_DIR>/
-├── 09_ai_model_wrapper.sh       # Főscript (v2.4, ~2400 sor)
+├── 09_ai_model_wrapper.sh       # Főscript (v2.5, ~2500 sor)
 ├── 00_lib.sh                    # INFRA master lib loader
 ├── 00_registry.sh               # Modul registry (HW_REQ, DEFAULT, stb.)
 ├── lib/
@@ -166,7 +166,7 @@ Browse UI függvények:
 | **Ollama** | `02_local_ai_stack.sh` | `/usr/local/bin/ollama` | REST API: `localhost:11434` |
 | **vLLM** | `02_local_ai_stack.sh` | `~/venvs/ai/bin/vllm` | OpenAI-compatible: `localhost:8000/v1` |
 | **PyTorch** | `02_local_ai_stack.sh` + fix | `~/venvs/ai/lib/.../torch` | cu128 szükséges RTX 5090-hez |
-| **TurboQuant** | `02_local_ai_stack.sh` | `~/src/turboquant` | GGUF kvantálás, Python CLI |
+| **TurboQuant** | `02_local_ai_stack.sh` | `~/src/turboquant` | KV cache compression (vLLM runtime, v2.6 target) |
 
 #### Python venv
 
@@ -336,14 +336,31 @@ uv pip install vllm --reinstall
 
 ### 6.4 TurboQuant integráció
 
-GGUF kvantálás az RTX 5090 optimalizált KV cache tömörítéssel.
+**⚠ v2.5 H5 FIX**: a TurboQuant **NEM modell kvantáló**, hanem **KV cache compression runtime** vLLM-hez. A korábbi `_tq_quantize_model` téves CLI feltevéssel készült és soha nem működött a valóságban.
 
-- **Algoritmus:** PolarQuant + QJL (ICLR 2026, Google Research)
-- **Hatás:** +35% decode sebesség, 6× kisebb KV cache (3-bit)
-- **Python CLI:** `python -m turboquant.quantize --model X --bits N --output Y.gguf`
-- **Ollama integráció:** automatikus `Modelfile` generálás + `ollama create` regisztráció
+**Valós funkció** (forrás: [github.com/0xSero/turboquant](https://github.com/0xSero/turboquant) README):
 
-Forrás: [https://github.com/0xSero/turboquant](https://github.com/0xSero/turboquant)
+- **Algoritmus:** random orthogonal rotation + Lloyd-Max scalar quantization + QJL projection + group quantization + bit-packing
+- **Integráció:** vLLM attention backend monkey-patch (Triton fused kernelekkel)
+- **Hatás inference közben:** KV cache 3-bit key + 2-bit value → ~4.4× tömörítés full-attention rétegeken
+
+**Benchmark (RTX 5090 32GB, Qwen3.5-27B-AWQ, vLLM 0.18.0, 30k context):**
+
+| Metrika | Baseline (bf16 KV) | TurboQuant (3b key / 2b val) |
+|---|---|---|
+| Prefill tok/s | 1,804 | 1,907 (+5.7%) |
+| Decode tok/s | 1.264 | 1.303 (+3.1%) |
+| KV cache freed | — | 30.0 GB |
+| Max token capacity | 457,072 | 914,144 (**2.0×**) |
+
+**v2.5 státusz:** a `_tq_quantize_model` `return 1` early exit-tel disabled, a `_menu_turboquant` informatív menü (Mi ez? / Benchmark / v2.6 terv). A tényleges vLLM monkey-patch integráció v2.6 target.
+
+**v2.6 tervezett workflow:**
+```bash
+pip install -e ~/src/turboquant       # TurboQuant telepítés (vLLM-et monkey-patch-eli)
+export VLLM_ATTENTION_BACKEND=TURBOQUANT  # runtime KV compression aktiválás
+vllm serve MODEL ...                   # ugyanaz a parancs, TQ runtime alatt
+```
 
 ### 6.5 IDE backend konfiguráció
 
@@ -366,7 +383,7 @@ A backend váltó egyszerre frissíti mindkettőt (`_ide_switch_backend()`).
 ## 7. Menütérkép
 
 ```
-AI Model Manager v2.4 — RTX 5090 Blackwell
+AI Model Manager v2.5 — RTX 5090 Blackwell
 │
 ├── 1. Ollama model kezelés
 │   ├── 1. Modell betöltés VRAM-ba (radiolist méretekkel)
@@ -401,10 +418,10 @@ AI Model Manager v2.4 — RTX 5090 Blackwell
 │   │   └── 4. Service fájl MODEL_ID módosítása
 │   └── 0. ← Vissza
 │
-├── 4. TurboQuant kvantálás
-│   ├── 1. Modell kvantálása (bit mélység: 3|4|8)
-│   ├── 2. Kvantált modellek listája
-│   └── 3. TurboQuant info + hivatkozások
+├── 4. TurboQuant KV cache compression (v2.5: informatív, v2.6: aktív)
+│   ├── 1. Mi a TurboQuant? (részletes info)
+│   ├── 2. Benchmark eredmények (RTX 5090)
+│   └── 3. Tervezett v2.6 integráció (vLLM env változó)
 │
 ├── 5. GPU memória állapot
 │
@@ -538,13 +555,19 @@ Külön `_menu_vllm_model()` almenü:
 
 ---
 
-### 8.4 TurboQuant kvantálás
+### 8.4 TurboQuant KV cache compression (v2.5 informatív menü)
 
-`_tq_quantize_model(src_model, bits)`:
-1. Python CLI futtatás venv-ből: `python -m turboquant.quantize`
-2. Kimenet: `~/turboquant/<model>-tq<bits>.gguf`
-3. Automatikus Ollama Modelfile generálás
-4. `ollama create <model>-tq<bits> -f Modelfile` regisztráció
+**v2.5 státusz (H5 FIX):** a menü 3 almenüpontból áll, mindegyik csak információt jelenít meg. A `_tq_quantize_model` `return 1` early exit-tel disabled (a régi hamis CLI workflow kommentezve megőrizve a v2.6 átdolgozáshoz).
+
+- **1. Mi a TurboQuant?** — részletes algoritmus ismertetés, workflow, mit csinál és mit NEM (nem modell kvantáló!)
+- **2. Benchmark eredmények** — RTX 5090-en Qwen3.5-27B-AWQ mérések: +5.7% prefill, 30 GB KV freed, 2× token kapacitás
+- **3. v2.6 integráció terv** — pip install + VLLM_ATTENTION_BACKEND env változó
+
+**v2.6 tervezett `_tq_integrate_vllm()` függvény:**
+1. `pip install -e $TQ_DIR` (monkey-patch vLLM attention backend)
+2. vLLM szerver indítás `VLLM_ATTENTION_BACKEND=TURBOQUANT` env változóval
+3. Triton fused kernel runtime KV compresszió (nincs külön kvantálási lépés)
+4. Ollama integráció NINCS (TurboQuant csak vLLM-mel működik)
 
 ---
 
@@ -894,7 +917,7 @@ Minden paraméter a script tetején `readonly` változókban van deklarálva. Ve
 ```bash
 # Modul
 MOD_ID="09"
-MOD_VERSION="2.4"
+MOD_VERSION="2.5"
 MOD_LIB_MIN="6.4"
 
 # Ollama
@@ -1057,14 +1080,6 @@ XDG_RUNTIME_DIR="/run/user/$(id -u $REAL_USER)" \
 
 ---
 
-### 14.7 Browse ESC → kézi fallback (visszatérő bug)
-
-**Tünet:** Katalógusból ESC nyomásra kézi inputbox nyílik meg.  
-**Ok:** A vLLM indítás menüpont 1-es ágában maradt a régi `CANCEL → inputbox` fallback kód.  
-**Megoldás:** Minden `CANCEL` visszatérési érték után `continue` (nem inputbox), nincs fallback.
-
----
-
 ## 15. Fejlesztési előzmények
 
 | Verzió | Főbb változások |
@@ -1078,6 +1093,7 @@ XDG_RUNTIME_DIR="/run/user/$(id -u $REAL_USER)" \
 | v2.2 | 4 regressed bug fix: PyTorch fix yesno, uv stdout elnyomás, service státusz display + XDG fix, CANCEL → continue |
 | v2.3 | Lib split: `lib/09_lib_models.sh` + `lib/09_lib_browse.sh`; HF TASK bővítés 7 kategóriára (47 modell); ESC szabály egységesítés |
 | v2.4 | vLLM log timestamp; PyTorch fix után automatikus vLLM ABI reinstall; vLLM menü split (`_menu_vllm_control` + `_menu_vllm_model` + `_menu_vllm_start_with_model`) |
+| v2.5 | **SÚLYOS hibajavítás kör (H1–H6):** H1 ESC regresszió javítás (explicit `if/continue`), H2 JSON/Python injection védelem (env var), H3 `_do_update` ténylegesen újragenerálja az `ai-model-ctl`-t (`_generate_ai_model_ctl()` közös függvény), H4 vLLM systemd `StartLimitIntervalSec`+`StartLimitBurst`, **H5 TurboQuant valós funkció = KV cache compression** (menü + `_tq_quantize_model` átírva), H6 `set -o pipefail` a subshell-ben |
 
 ---
 
@@ -1099,4 +1115,4 @@ XDG_RUNTIME_DIR="/run/user/$(id -u $REAL_USER)" \
 
 ---
 
-*Dokumentáció verziója: 2026-04-15 · DR-Watt/AI-install · `09_ai_model_wrapper.sh` v2.4*
+*Dokumentáció verziója: 2026-04-19 · DR-Watt/AI-install · `09_ai_model_wrapper.sh` v2.5*
