@@ -117,7 +117,7 @@ unset _09lib _09lib_file
 # ── Modul azonosítók ──────────────────────────────────────────────────────────
 readonly MOD_ID="09"
 readonly MOD_NAME="AI Model Manager"
-readonly MOD_VERSION="2.6"
+readonly MOD_VERSION="2.7"
 # Lib minimum verzió (00_lib.sh LIB_VERSION) — compat check
 readonly MOD_LIB_MIN="6.4"
 
@@ -263,6 +263,12 @@ _json_field() {
 # _check_all_components: minden komponens állapotának felmérése
 # Kimenet: COMP_STATUS / COMP_VER tömb feltöltése (lib/00_lib_comp.sh sémája)
 _check_all_components() {
+  # K2 FIX (v2.7): asszociatív tömbök explicit deklarálása (-gA = globális).
+  # Korábban: COMP_STATUS[ollama]=... implicit létrehozás működött bash 4.2+
+  # alatt, de szigorúan véve ez nincs deklarálva. Ha a lib/00_lib_comp.sh
+  # nem source-olódott (pl. standalone futás), a kulcsnak kezelt stringek
+  # felsorolódó indexű tömbként próbálnák kezelni → csendes adatvesztés.
+  declare -gA COMP_STATUS COMP_VER 2>/dev/null || true
   # ── Ollama ───────────────────────────────────────────────────────────────
   # Forrás: https://ollama.readthedocs.io/en/api/ — 'ollama version' a CLI
   local ollama_ver
@@ -1424,8 +1430,15 @@ _ide_config_continue() {
   fi
 
   # Continue.dev config.json generálás
+  # K10 FIX (v2.7): mktemp a fix /tmp path helyett — symlink attack védelem.
+  # Korábbi hibás kód: cat > /tmp/continue_config_new.json
+  #   → ha /tmp-ben van egy ilyen nevű symlink (pl. → /etc/passwd vagy
+  #   → ~/.ssh/authorized_keys), a cat követi és felülírja a célfájlt.
+  # mktemp: random 6-karakteres suffix + 0600 mode (user-only read/write).
   # Struktúra: models[] + tabAutocompleteModel + embeddingsProvider
-  cat > /tmp/continue_config_new.json << CONTINUE_EOF
+  local tmp_cfg
+  tmp_cfg=$(mktemp /tmp/continue_cfg_XXXXXX.json)
+  cat > "$tmp_cfg" << CONTINUE_EOF
 {
   "models": [
     {
@@ -1465,11 +1478,19 @@ CONTINUE_EOF
   # Biztonsági mentés a meglévő konfigból
   if [ -f "$CONTINUE_CONFIG_FILE" ]; then
     cp "$CONTINUE_CONFIG_FILE" "${CONTINUE_CONFIG_FILE}.bak.$(date +%Y%m%d_%H%M%S)"
+    # K11 FIX (v2.7): régi .bak fájlok tisztítása — csak az 5 legfrissebb marad.
+    # Korábbi viselkedés: minden backend váltáskor + minden install/fix módban
+    # új .bak jött létre, sosem törlődött → hónapok alatt tucatnyi 1-2 KB-os
+    # fájl felhalmozódott a ~/.continue/-ban.
+    # Forrás: ls -1t (modification time DESC) + tail -n +6 (6. sortól, azaz
+    # az első 5 megmarad). xargs -r: üres input esetén ne fusson le.
+    ls -1t "${CONTINUE_CONFIG_FILE}".bak.* 2>/dev/null | tail -n +6 \
+      | xargs -r rm -f
   fi
 
-  sudo -u "$_REAL_USER" cp /tmp/continue_config_new.json "$CONTINUE_CONFIG_FILE"
+  sudo -u "$_REAL_USER" cp "$tmp_cfg" "$CONTINUE_CONFIG_FILE"
   chown "$_REAL_USER:$_REAL_USER" "$CONTINUE_CONFIG_FILE"
-  rm -f /tmp/continue_config_new.json
+  rm -f "$tmp_cfg"
   log "INFO" "Continue.dev konfig írva: $CONTINUE_CONFIG_FILE"
 }
 
@@ -2254,7 +2275,18 @@ except: print('?')
         status_txt=$(_show_component_status)
         whiptail --title "Komponens állapot" --msgbox "$status_txt" 18 65
         ;;
-      0) break ;;
+      0)
+        # K12 FIX (v2.7): kilépés yesno confirm — véletlen 0/ESC védelem.
+        # Korábban: azonnali break → ha a user véletlenül a 0-t nyomta meg
+        # (pl. egy vLLM betöltés közepén), kilépett és újranavigálhatott.
+        # A futó szolgáltatások (Ollama, vLLM) tovább futnak a wrapper
+        # kilépése után, tehát a confirm csak a navigációt védi.
+        if whiptail --title "Kilépés megerősítés" --yesno \
+          "Kilépsz az AI Model Manager-ből?\n\nOllama: ${ollama_st}   vLLM: ${vllm_st}\n\nA futó szolgáltatások TOVÁBB futnak — csak a menü zárul be." \
+          12 65; then
+          break
+        fi
+        ;;
     esac
   done
 }
@@ -2400,8 +2432,15 @@ SERVICE_EOF
   fi
 
   # ── logkönyvtár ───────────────────────────────────────────────────────────
+  # K9 FIX (v2.7): explicit chown -R a sudo -u mkdir MELLETT.
+  # Gyökérok: ha egy korábbi sudo-s futás (régebbi wrapper vagy manuális
+  # sudo mkdir) már létrehozta ezeket a könyvtárakat ROOT tulajdonban, akkor
+  # az új 'sudo -u user mkdir -p' nem változtat a tulajdonoson (a directory
+  # már létezik). Az explicit chown -R visszaállítja a user-tulajdonjogot.
   sudo -u "$_REAL_USER" mkdir -p "${_REAL_HOME}/.infra-logs"
+  chown -R "$_REAL_USER:$_REAL_USER" "${_REAL_HOME}/.infra-logs" 2>/dev/null || true
   sudo -u "$_REAL_USER" mkdir -p "$TQ_QUANTIZED_DIR"
+  chown -R "$_REAL_USER:$_REAL_USER" "$TQ_QUANTIZED_DIR" 2>/dev/null || true
 
   # ── MOD_09_DONE state ─────────────────────────────────────────────────────
   infra_state_set "MOD_09_DONE" "true"
