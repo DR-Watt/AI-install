@@ -117,7 +117,7 @@ unset _09lib _09lib_file
 # ── Modul azonosítók ──────────────────────────────────────────────────────────
 readonly MOD_ID="09"
 readonly MOD_NAME="AI Model Manager"
-readonly MOD_VERSION="2.5"
+readonly MOD_VERSION="2.6"
 # Lib minimum verzió (00_lib.sh LIB_VERSION) — compat check
 readonly MOD_LIB_MIN="6.4"
 
@@ -277,10 +277,17 @@ _check_all_components() {
   fi
 
   # ── Ollama service állapot ────────────────────────────────────────────────
+  # K5 FIX (v2.6): 3-állapotú detektálás — ok (fut) / old (leállított de létezik) /
+  # missing (service fájl nincs). Korábban a csak leállított service is "missing"
+  # volt, ami félrevezető a 'Komponens állapot' menüben: úgy tűnt, az Ollama
+  # nincs telepítve, pedig csak le van állítva.
+  # Forrás: systemd.unit(5) — list-unit-files + is-active kombináció
   if _is_ollama_running; then
     COMP_STATUS[ollama_svc]="ok"; COMP_VER[ollama_svc]="running"
+  elif systemctl list-unit-files ollama.service 2>/dev/null | grep -q '^ollama\.service'; then
+    COMP_STATUS[ollama_svc]="old"; COMP_VER[ollama_svc]="stopped"
   else
-    COMP_STATUS[ollama_svc]="missing"; COMP_VER[ollama_svc]="stopped"
+    COMP_STATUS[ollama_svc]="missing"; COMP_VER[ollama_svc]="not installed"
   fi
 
   # ── vLLM ─────────────────────────────────────────────────────────────────
@@ -488,6 +495,19 @@ _ollama_pull_model() {
         sleep 1; echo 100; break
       fi
 
+      # K3 FIX (v2.6): hibadetektálás a streaming JSON-ban
+      # Ollama REST API hibakimenet: {"error": "model 'xxx' not found"}
+      # vagy: {"error": "pull model manifest: file does not exist"}
+      # Korábbi kód: csak a "success" sort figyelte → hibáknál a while végtelen
+      # ciklusba került, amíg a curl process el nem halt (timeout vagy API 404).
+      if grep -q '"error"' "$pull_log" 2>/dev/null; then
+        local err_msg
+        err_msg=$(grep '"error"' "$pull_log" | tail -1 | \
+          python3 -c "import json,sys; print(json.loads(sys.stdin.readline()).get('error','ismeretlen hiba'))" 2>/dev/null)
+        printf 'XXX\n100\n✗ Ollama pull hiba: %s\nXXX\n' "${err_msg:-API error}"
+        sleep 2; echo 100; break
+      fi
+
       # JSON sorok parse: completed/total → %
       local parsed
       parsed=$(python3 - "$pull_log" 2>/dev/null << 'PYEOF'
@@ -619,9 +639,21 @@ _vllm_start() {
   echo "  Modell:  $model" >> "$VLLM_LOG_FILE" 2>/dev/null
   echo "  Port:    $VLLM_PORT  dtype: $VLLM_DTYPE  gpu-mem: $VLLM_GPU_MEM_UTIL" >> "$VLLM_LOG_FILE" 2>/dev/null
   echo "═══════════════════════════════════════════════════" >> "$VLLM_LOG_FILE" 2>/dev/null
+
+  # K6 FIX (v2.6): model name + args biztonságos escape-elése
+  # Korábbi hibás kód: $(IFS=' '; echo "$(_vllm_build_args "$model")")
+  #   → a bash command substitution + word splitting tönkreteszi azokat a
+  #     modell neveket, amelyek aposztrófot vagy escape karaktert tartalmaznak.
+  #     HF ID-kben tipikusan nincs space, de védelem kell.
+  # Megoldás: printf %q — a bash saját shell-quoting mechanizmusa, ami escape-el
+  # minden speciális karaktert. A bash -c aztán tisztán értelmezi.
+  # Forrás: Bash Manual § 3.5.8.1 (printf built-in %q) — shell-quoted output.
+  local vllm_args_str
+  vllm_args_str=$(printf '%q ' "$VENV_VLLM" $(_vllm_build_args "$model"))
+
   sudo -u "$_REAL_USER" bash -c "
     source '${AI_VENV_DIR}/bin/activate'
-    nohup ${VENV_VLLM} $(IFS=' '; echo "$(_vllm_build_args "$model")") \
+    nohup ${vllm_args_str} \
       >> '${VLLM_LOG_FILE}' 2>&1 &
     echo \$! > '${VLLM_PID_FILE}'
     echo \"vLLM PID: \$!\" >&2
@@ -1029,12 +1061,21 @@ _log_system_info() {
   log "INFO" "  AI Model Manager v${MOD_VERSION} — Rendszer info"
   log "INFO" "══════════════════════════════════════════════════════"
 
+  # K1 FIX (v2.6): manage módban önállóan futva a state változók (INST_DRIVER_VER,
+  # INST_CUDA_VER, HW_VLLM_OK, TURBOQUANT_BUILD_MODE) nincsenek a process env-jében,
+  # csak a master installer shell kontextusában. Olvassuk őket a ~/.infra-state-ből
+  # infra_state_get-tel, ha nincsenek beállítva.
+  local _drv="${INST_DRIVER_VER:-$(infra_state_get INST_DRIVER_VER 2>/dev/null)}"
+  local _cuda="${INST_CUDA_VER:-$(infra_state_get INST_CUDA_VER 2>/dev/null)}"
+  local _vllm_ok="${HW_VLLM_OK:-$(infra_state_get HW_VLLM_OK 2>/dev/null)}"
+  local _tq_mode="${TURBOQUANT_BUILD_MODE:-$(infra_state_get TURBOQUANT_BUILD_MODE 2>/dev/null)}"
+
   # ── Hardver ────────────────────────────────────────────────────────────────
   log "HW" "GPU:    ${HW_GPU_NAME:-ismeretlen}"
   log "HW" "Profil: ${HW_PROFILE:-?}  |  CUDA arch: ${HW_CUDA_ARCH:-?}"
-  log "HW" "Driver: ${INST_DRIVER_VER:-?}  |  CUDA ver: ${INST_CUDA_VER:-?}"
-  log "HW" "vLLM kompatibilis: ${HW_VLLM_OK:-false}"
-  log "HW" "TurboQuant mód: ${TURBOQUANT_BUILD_MODE:-?}"
+  log "HW" "Driver: ${_drv:-?}  |  CUDA ver: ${_cuda:-?}"
+  log "HW" "vLLM kompatibilis: ${_vllm_ok:-false}"
+  log "HW" "TurboQuant mód: ${_tq_mode:-?}"
 
   # ── nvidia-smi GPU állapot ─────────────────────────────────────────────────
   local nvsmi
@@ -1298,13 +1339,18 @@ print(json.dumps(d))
 
   # Merge: update_json beleolvad a meglévő settings-be
   local merged
+  # K4 FIX (v2.6): JSON parse error explicit hibajelzés, nem néma elnyelés.
+  # Korábbi kód: 2>/dev/null → ha az existing settings.json hibás szintaxisú
+  # (pl. vesszőhiányos), a merged üres lett → "settings.json merge sikertelen"
+  # log, de a gyökérok (JSON syntax) elrejtve maradt.
+  local merge_err
   merged=$(python3 -c "
 import json
 existing = json.loads('''$existing''')
 update   = json.loads('''$update_json''')
 existing.update(update)
 print(json.dumps(existing, indent=2, ensure_ascii=False))
-" 2>/dev/null)
+" 2> >(merge_err=$(cat); [ -n "$merge_err" ] && log "ERR" "settings.json JSON parse hiba: $merge_err"))
 
   if [ -z "$merged" ]; then
     log "ERR" "settings.json merge sikertelen"
@@ -1996,7 +2042,25 @@ except: print('')
             local model_in_svc
             model_in_svc=$(grep "MODEL_ID=" "$VLLM_SERVICE_FILE" 2>/dev/null \
               | grep -v "^#" | head -1 | grep -oP '(?<==).*')
-            whiptail --msgbox "✓ vLLM service ENGEDÉLYEZVE\n\nModell: ${model_in_svc:-?}\nSzerkesztés: nano ${VLLM_SERVICE_FILE}" 12 65
+            # K8 FIX (v2.6): enable után felajánljuk az AZONNALI start-ot is.
+            # Korábbi viselkedés: csak enable (a service a következő boot-kor indult),
+            # a user-nek külön kellett volna 'systemctl --user start vllm-rtx5090'.
+            # Most yesno: indítsuk-e most?
+            if whiptail --title "vLLM service engedélyezve" --yesno \
+              "✓ vLLM service ENGEDÉLYEZVE (boot-on-start)\n\nModell: ${model_in_svc:-?}\nService fájl: ${VLLM_SERVICE_FILE}\n\nElindítsuk MOST is? (Igen = systemctl --user start)" \
+              14 68; then
+              XDG_RUNTIME_DIR="$xdg_dir" \
+                sudo -u "$_REAL_USER" systemctl --user start vllm-rtx5090 2>/dev/null
+              # 2 mp várakozás + állapot check — a user azonnal lássa az eredményt
+              sleep 2
+              if _is_vllm_running; then
+                whiptail --msgbox "✓ vLLM szolgáltatás elindult!\n\nPort: ${VLLM_PORT}  Modell: ${model_in_svc:-?}\nLog: ${VLLM_LOG_FILE}" 12 68
+              else
+                whiptail --msgbox "⚠ systemctl start lefutott, de a vLLM még nem válaszol.\nEz normális 1-10 perc modell betöltésnél.\n\nÁllapot: systemctl --user status vllm-rtx5090\nLog:     tail -f ${VLLM_LOG_FILE}" 14 70
+              fi
+            else
+              whiptail --msgbox "Service engedélyezve (boot-on-start).\nA következő bejelentkezésnél elindul.\n\nKézi indítás:\n  systemctl --user start vllm-rtx5090" 12 65
+            fi
           fi
         fi
         ;;
