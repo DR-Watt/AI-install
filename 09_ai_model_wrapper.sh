@@ -72,7 +72,7 @@
 #   CLINE: https://github.com/cline/cline (extension settings.json kulcsok)
 #     - cline.apiProvider / cline.ollamaBaseUrl / cline.openAiBaseUrl stb.
 #
-# VERZIÓ: v2.0 (lib v6.4+ kompatibilis)
+# VERZIÓ: v2.5 (lib v6.4+ kompatibilis) — H1–H6 SÚLYOS hiba javítás
 # =============================================================================
 
 # =============================================================================
@@ -117,7 +117,7 @@ unset _09lib _09lib_file
 # ── Modul azonosítók ──────────────────────────────────────────────────────────
 readonly MOD_ID="09"
 readonly MOD_NAME="AI Model Manager"
-readonly MOD_VERSION="2.3"
+readonly MOD_VERSION="2.5"
 # Lib minimum verzió (00_lib.sh LIB_VERSION) — compat check
 readonly MOD_LIB_MIN="6.4"
 
@@ -150,13 +150,18 @@ readonly VLLM_PID_FILE="/tmp/vllm-rtx5090.pid"
 VLLM_LOG_FILE="${SCRIPT_DIR}/wrapper_vllm.log"
 
 # ── TurboQuant konfiguráció ───────────────────────────────────────────────────
-# Forrás: https://github.com/0xSero/turboquant (official reference impl)
-# https://research.google/blog/turboquant-redefining-ai-efficiency-with-extreme-compression/
-# Kvanálás: PolarQuant + QJL algoritmus, 3-bit KV cache tömörítés
+# !! FONTOS (H5 FIX v2.5) — TurboQuant VALÓS funkció eltér a feltételezéstől !!
+# Forrás: https://github.com/0xSero/turboquant README (ICLR 2026, arXiv:2504.19874)
+# A TurboQuant NEM modell kvantáló eszköz. NINCS 'python -m turboquant.quantize' CLI.
+# Valós funkció: KV cache compression vLLM runtime-ban, inference közben.
+# Telepítés: pip install -e . → vLLM-et monkey-patch-eli.
+# Benchmark: RTX 5090 32GB, Qwen3.5-27B-AWQ, +5.7% prefill tok/s, 30GB KV freed.
+# A 09-es wrapper jelenleg NEM integrálja (v2.6 target). A TurboQuant menüpont
+# csak informatív — a _tq_quantize_model függvény disabled (return 1 early exit).
 readonly TQ_DIR="${_REAL_HOME}/src/turboquant"
-readonly TQ_QUANTIZED_DIR="${_REAL_HOME}/.ollama/turboquant"  # GGUF kimenetek
-readonly TQ_DEFAULT_BITS=4             # 4-bit súly kvantálás (3 is OK de lassabb)
-readonly TQ_DEFAULT_GROUP_SIZE=128     # group size súly kvantáláshoz
+readonly TQ_QUANTIZED_DIR="${_REAL_HOME}/.ollama/turboquant"  # (unused v2.5-től)
+readonly TQ_DEFAULT_BITS=4             # (unused v2.5-től — hamis CLI param)
+readonly TQ_DEFAULT_GROUP_SIZE=128     # (unused v2.5-től — hamis CLI param)
 
 # ── IDE elérési utak ──────────────────────────────────────────────────────────
 # VS Code settings.json — sudo alatt _REAL_HOME kell (nem $HOME!)
@@ -1124,14 +1129,26 @@ except: pass
 # =============================================================================
 # TURBOQUANT INTEGRÁCIÓ
 # =============================================================================
-# Forrás: https://github.com/0xSero/turboquant (official reference implementation)
-# https://research.google/blog/turboquant-redefining-ai-efficiency-with-extreme-compression/
+# !! H5 FIX v2.5 — TurboQuant valós funkciója eltér a korábbi feltételezéstől !!
 #
-# TurboQuant flow Ollama integrációhoz:
-#   1. Python CLI: python -m turboquant.quantize --model X --bits N → .gguf fájl
-#   2. Ollama Modelfile: FROM /path/to/output.gguf
-#   3. ollama create <model-name>-tq4 -f Modelfile
-#   4. ollama run <model-name>-tq4 → RTX 5090-en közvetlen GPU inference
+# Forrás: https://github.com/0xSero/turboquant README (hivatalos)
+# Papír:  https://arxiv.org/pdf/2504.19874 (ICLR 2026, Google Research)
+#
+# KORÁBBI HIBÁS FELTÉTELEZÉS (v2.4-ig):
+#   "python -m turboquant.quantize --model X --bits N --output Y.gguf"
+#   → NEM LÉTEZIK! A TurboQuant nem modell kvantáló.
+#
+# VALÓS FUNKCIÓ:
+#   KV cache compression vLLM runtime-ban — Triton kernelekkel, inference közben.
+#   Random orthogonal rotation + Lloyd-Max quantization + QJL projection.
+#   Bemérve: RTX 5090 32GB, Qwen3.5-27B-AWQ → 30 GB KV freed, +5.7% prefill.
+#
+# HELYES WORKFLOW (v2.6-ban implementálva):
+#   1. pip install -e ~/src/turboquant         (monkey-patch vLLM-et)
+#   2. export VLLM_ATTENTION_BACKEND=TURBOQUANT (env változó)
+#   3. vllm serve MODEL ... (TurboQuant aktív KV compression-nel)
+#
+# Jelenleg (v2.5): a _tq_quantize_model disabled, _menu_turboquant informatív.
 
 # _tq_list_quantized: korábban kvantált modellek listája
 _tq_list_quantized() {
@@ -1143,10 +1160,26 @@ _tq_list_quantized() {
     | sort || echo "(üres könyvtár)"
 }
 
-# _tq_quantize_model: modell kvantálása TurboQuant-tal
-# Paraméterek: $1=forrás modell (Ollama neve v. HF path), $2=bit mélység
-# Kimenet: $TQ_QUANTIZED_DIR/<model>-tq${bits}.gguf
+# _tq_quantize_model: !! DEPRECATED v2.5 — H5 FIX !!
+# A korábbi implementáció hamis TurboQuant CLI-t feltételezett.
+# A valós TurboQuant KV cache compression (runtime), nem modell kvantáló.
+# Forrás: https://github.com/0xSero/turboquant README
+#
+# Ezt a függvényt a _menu_turboquant v2.5-től NEM HÍVJA (informatív menü helyett).
+# Early return 1 minden hívásra — régi kód megőrizve referencia céljából.
+# Teljes átdolgozás v2.6-ban: vLLM monkey-patch integráció.
+#
+# Paraméterek: $1=forrás modell, $2=bit mélység (érvénytelen v2.5-től)
 _tq_quantize_model() {
+  # H5 FIX (v2.5): early exit — a TurboQuant CLI feltételezés téves volt
+  log "ERR" "[TurboQuant v2.5] DEPRECATED — valós funkció: KV cache compression (runtime)"
+  log "ERR" "  Nem modell kvantáló! Forrás: https://github.com/0xSero/turboquant"
+  log "ERR" "  v2.6 target: vLLM monkey-patch integráció (nem GGUF workflow)"
+  return 1
+
+  # ── Régi kód (v2.4-ig) — MÁR NEM FUT le az early return miatt ──────────
+  # Megőrizve referenciaként a v2.6 átdolgozáshoz.
+  # H6 FIX (v2.5): set -o pipefail hozzáadva a `| tee` pipe exit-code védelmére.
   local src_model="$1"
   local bits="${2:-$TQ_DEFAULT_BITS}"
   local safe_name
@@ -1164,6 +1197,7 @@ _tq_quantize_model() {
   # TurboQuant Python CLI hívás — venv Python-nal, user kontextusban
   # Forrás: github.com/0xSero/turboquant README (official usage)
   if ! sudo -u "$_REAL_USER" bash -c "
+    set -o pipefail
     source '${AI_VENV_DIR}/bin/activate'
     python3 -m turboquant.quantize \
       --model '${src_model}' \
@@ -1243,13 +1277,21 @@ _ide_update_settings() {
 
   # Python merge: meglévő beállítások + új kulcsok
   # A többi kulcs (nem CLINE) érintetlen marad
+  #
+  # H2 FIX (v2.5): JSON/Python injection védelem environment változókon át
+  # Korábbi hibás kód: d['$key'] = '$val'
+  #   → bash $-expanzió a Python forráskódba → ha a modell név aposztrófot,
+  #     \n-t, vagy escape karaktert tartalmaz, a Python kód szétesik
+  #     (legrosszabb esetben: tetszőleges Python kód futtatható).
+  # Biztonságos megoldás: env változó → os.environ olvasás (nincs string-interpoláció).
   local update_json="{}"
   for key in "${!_settings_ref[@]}"; do
     local val="${_settings_ref[$key]}"
-    update_json=$(echo "$update_json" | python3 -c "
-import json, sys
+    update_json=$(echo "$update_json" | \
+      CFG_KEY="$key" CFG_VAL="$val" python3 -c "
+import json, os, sys
 d = json.load(sys.stdin)
-d['$key'] = '$val'
+d[os.environ['CFG_KEY']] = os.environ['CFG_VAL']
 print(json.dumps(d))
 " 2>/dev/null)
   done
@@ -1657,10 +1699,15 @@ except: pass
           whiptail --msgbox "vLLM futó modell automatikusan detektálva:\n${model}" 10 65
         else
           # Nincs futó modell → browse
+          # H1 FIX (v2.5): ESC → continue (NINCS fallback inputbox — REGRESSZIÓ javítás!)
+          # Korábbi hibás láncolat: "[] || [] && ... || continue" — bash operator
+          # precedencia miatt az `&&` erősebben kötött, így CANCEL-re a fallback
+          # inputbox lefutott, aminek a Cancel-je vitte csak `continue`-ra.
+          # Az explicit if/continue egyértelmű és biztonságos (11.1 UI szabály).
           model=$(_vllm_model_browse)
-          [ "$model" = "CANCEL" ] || [ -z "$model" ] && \
-            model=$(whiptail --title "vLLM modell ID" \
-              --inputbox "HuggingFace model ID:" 10 65 "" 3>&1 1>&2 2>&3) || continue
+          if [ "$model" = "CANCEL" ] || [ -z "$model" ]; then
+            continue
+          fi
         fi
         [ -z "$model" ] && continue
         _ide_switch_backend "vllm" "$model"
@@ -1987,76 +2034,104 @@ except: print('')
 }
 
 # _menu_turboquant: TurboQuant kvantálás almenü
+# !! H5 FIX v2.5 !! A TurboQuant valós funkciója = KV cache compression,
+# nem modell kvantáló. A menüpontok ennek megfelelően informatívak v2.5-től,
+# a tényleges kvantálási művelet disabled. v2.6-ban új vLLM integráció jön.
 _menu_turboquant() {
   while true; do
-    local tq_available="⛔ Nem telepített"
-    [ -d "$TQ_DIR" ] && tq_available="✅ Elérhető (${TQ_DIR})"
+    local tq_src="⛔ Nem telepített"
+    [ -d "$TQ_DIR" ] && tq_src="✅ Forráskönyvtár: ${TQ_DIR}"
+    local tq_pkg="⛔ Nem importálható"
+    _python3_user -c "import turboquant" 2>/dev/null && tq_pkg="✅ Python csomag: import OK"
 
     local choice
-    choice=$(whiptail --title "TurboQuant — RTX 5090 KV cache kvantálás" \
-      --menu "TurboQuant: ${tq_available}\nKimenet: ${TQ_QUANTIZED_DIR}" \
-      18 76 5 \
-      "1" "Modell kvantálása (TurboQuant)" \
-      "2" "Kvantált modellek listája" \
-      "3" "TurboQuant info + papír link" \
+    choice=$(whiptail --title "TurboQuant — KV cache compression (v2.5 info)" \
+      --menu "${tq_src}\n${tq_pkg}\n\n⚠ v2.5: modell kvantálás DISABLED (H5 fix)\n   v2.6: vLLM monkey-patch integráció" \
+      20 78 4 \
+      "1" "Mi a TurboQuant? (részletes info)" \
+      "2" "Benchmark eredmények (RTX 5090)" \
+      "3" "Tervezett v2.6 integráció (vLLM env változó)" \
       "0" "← Vissza" \
       3>&1 1>&2 2>&3) || return
 
     case "$choice" in
       1)
-        if [ ! -d "$TQ_DIR" ]; then
-          whiptail --msgbox "TurboQuant nem telepített!\nFuttasd előbb a 02-es modult (Lokális AI stack)." 10 60
-          continue
-        fi
-        local src_model
-        src_model=$(whiptail --title "TurboQuant forrás modell" \
-          --inputbox "Ollama modell neve vagy HF ID:\n(pl. qwen2.5-coder:7b)" \
-          12 65 "" 3>&1 1>&2 2>&3) || continue
-        [ -z "$src_model" ] && continue
+        whiptail --title "Mi a TurboQuant?" --scrolltext --msgbox "
+  TurboQuant — ICLR 2026 (Google Research, 0xSero reference impl)
+  Forrás: https://github.com/0xSero/turboquant
+  Papír:  https://arxiv.org/pdf/2504.19874
 
-        local bits
-        bits=$(whiptail --title "Bit mélység" \
-          --radiolist "Kvantálási bit mélység:" 14 55 4 \
-          "3" "3-bit (legkisebb, lassabb)" "OFF" \
-          "4" "4-bit (ajánlott, egyensúly)" "ON" \
-          "8" "8-bit (legnagyobb, leggyorsabb)" "OFF" \
-          3>&1 1>&2 2>&3) || continue
+  MI EZ PONTOSAN:
+  A TurboQuant egy KV CACHE COMPRESSION RUNTIME — NEM modell kvantáló!
+  Inference közben (nem előre!) tömöríti a Key-Value cache-t.
 
-        if whiptail --yesno "Kvantálás indítása?\n\nForrás:    $src_model\nBit:       ${bits}-bit\nKimenet:   ${TQ_QUANTIZED_DIR}/${src_model}-tq${bits}.gguf\n\nEz több percig tarthat!" 16 65; then
-          local result
-          result=$(_tq_quantize_model "$src_model" "$bits")
-          if [ -n "$result" ]; then
-            whiptail --msgbox "TurboQuant kvantálás kész!\n\nOllama modell neve: ${result}\n\nHasználat:\n  ollama run ${result}" 14 65
-          else
-            whiptail --msgbox "Kvantálás SIKERTELEN\nEllenőrizd a log fájlt!" 10 50
-          fi
-        fi
+  ALGORITMUS (README szerint):
+    1. Random orthogonal rotation — információ szétterítése dimenziók között
+    2. Lloyd-Max optimal scalar quantization (b-1 bit) — Beta-eloszlású értékek
+    3. QJL projection — 1-bit residual sign bits
+    4. Group quantization — value-k (2-bit vagy 4-bit)
+    5. Bit-packing — 4 value/byte (2-bit) vagy 2 value/byte (4-bit)
+
+  HOGYAN MŰKÖDIK:
+    vLLM-et monkey-patch-eli — az attention backend-et cseréli le
+    Triton fused kerneles dekódolással gyorsítja az inferenciát
+    KV cache-t compresszált formában tárolja (3-bit key / 2-bit val)
+
+  MIRE JÓ NEKED (RTX 5090 32GB):
+    Hosszabb kontextus ugyanannyi VRAM-on (2x!)
+    Több párhuzamos request (KV freed → több concurrent user)
+    +5.7% prefill tok/s a benchmark szerint (Qwen3.5-27B-AWQ)
+
+  MI AZ, AMI NEM:
+    Nem csökkenti a modell méretét (weight-ek változatlan)
+    Nem generál GGUF fájlt (ezt a korábbi wrapper hibásan feltételezte)
+    Nem használható Ollama-val (csak vLLM-mel)
+" 32 80
         ;;
       2)
-        local tq_list
-        tq_list=$(_tq_list_quantized)
-        whiptail --title "Kvantált modellek" --scrolltext \
-          --msgbox "$tq_list" 20 72
+        whiptail --title "Benchmark (RTX 5090 32GB)" --scrolltext --msgbox "
+  Qwen3.5-27B-AWQ (dense, 4-bit weights, TP=1)
+  vLLM 0.18.0, gpu_memory_utilization=0.90, 30k context
+
+  Metrika              Baseline (bf16 KV)  TurboQuant (3b key/2b val)
+  ─────────────────────────────────────────────────────────────────
+  Prefill tok/s        1,804               1,907 (+5.7%)
+  Decode tok/s         1.264               1.303 (+3.1%)
+  KV cache freed       —                   30.0 GB (across 4 GPUs)
+  Max token capacity   457,072             914,144 (2.0x)
+  Peak activation mem  644.6 MB            599.2 MB (-7.0%)
+
+  QUANTIZATION QUALITY (head_dim=256):
+  3-bit key compression   cos_sim = 1.000000  (near-lossless)
+  4-bit key compression   cos_sim = 1.000000  (near-lossless)
+  2-bit value quantize    cos_sim = 0.940    (bottleneck)
+  4-bit value quantize    cos_sim = 0.997    (recommended)
+
+  Forrás: 0xSero/turboquant README.md — 'Benchmark Results' szekció
+" 26 80
         ;;
       3)
-        whiptail --title "TurboQuant info" --msgbox "
-  TurboQuant — ICLR 2026 (Google Research)
-  Algoritmus: PolarQuant + QJL
+        whiptail --title "v2.6 TurboQuant integráció terve" --scrolltext --msgbox "
+  A v2.6 wrapper a TurboQuant-ot vLLM attention backend-ként fogja
+  integrálni — runtime KV compression aktív attention layer-eken.
 
-  RTX 5090-en:
-    +35% decode sebesség
-    6x kisebb KV cache (3-bitre tömörít)
-    Tréning nélkül, veszteségmentes pontosság
+  TERVEZETT WORKFLOW:
+    1. pip install -e ~/src/turboquant   (monkey-patch)
+    2. export VLLM_ATTENTION_BACKEND=TURBOQUANT  vagy a wrapper flag
+    3. vllm serve MODEL ... (ugyanaz a parancs, TQ runtime aktív)
+    4. Inference közben Triton kernel KV compression
 
-  Papír: https://arxiv.org/pdf/2504.19874
-  Blog:  https://research.google/blog/turboquant-redefining-ai-efficiency-with-extreme-compression/
-  Kód:   https://github.com/0xSero/turboquant
+  NINCS MODELL KVANTÁLÁSI LÉPÉS — a weightek változatlanok maradnak,
+  csak a KV cache kerül tömörítésre futásidőben.
 
-  Folyamat:
-    1. python -m turboquant.quantize --model X --bits N → .gguf
-    2. ollama create model-tq4 -f Modelfile
-    3. ollama run model-tq4  (automatikus)
-" 26 72
+  Elsődleges előny RTX 5090-en:
+    • 30k context → 2x több token kapacitás ugyanannyi VRAM-on
+    • Hosszabb context ablakok (100k+) kényelmesen
+    • Több párhuzamos CLINE/Continue session
+
+  Forrás: https://github.com/0xSero/turboquant
+          ↑ integration/vllm.py — monkey-patch kód
+" 26 78
         ;;
       0) return ;;
     esac
@@ -2182,38 +2257,12 @@ _do_install() {
   fi
   log "INFO" "Előfeltételek OK: MOD_02_DONE=true, MOD_06_DONE=true"
 
-  # ── ai-model-ctl wrapper script ───────────────────────────────────────────
-  # ~/bin/ könyvtár létrehozása (01b_post_reboot.sh PATH-ba teszi)
-  sudo -u "$_REAL_USER" mkdir -p "$TOOL_INSTALL_DIR"
-
-  # ai-model-ctl: egyszerű wrapper, ami a 09_ai_model_wrapper.sh-t hívja manage módban
-  cat > "$TOOL_TARGET" << WRAPPER_EOF
-#!/bin/bash
-# ai-model-ctl — AI Model Manager wrapper
-# Automatikusan generálva: 09_ai_model_wrapper.sh install módban
-# Futtatás: ai-model-ctl [manage|status|start-vllm MODEL|stop-vllm|...]
-INFRA_DIR="${SCRIPT_DIR}"
-WRAPPER="${SCRIPT_DIR}/09_ai_model_wrapper.sh"
-
-if [ "\$1" = "status" ]; then
-  RUN_MODE=check sudo bash "\$WRAPPER"
-elif [ "\$1" = "start-vllm" ] && [ -n "\$2" ]; then
-  RUN_MODE=start_vllm MODEL="\$2" sudo bash "\$WRAPPER"
-elif [ "\$1" = "stop-vllm" ]; then
-  RUN_MODE=stop_vllm sudo bash "\$WRAPPER"
-else
-  # Alap: interaktív manage menü (sudo szükséges)
-  if [ "\$EUID" -ne 0 ]; then
-    exec sudo bash "\$WRAPPER"
-  else
-    RUN_MODE=manage bash "\$WRAPPER"
-  fi
-fi
-WRAPPER_EOF
-
-  chown "$_REAL_USER:$_REAL_USER" "$TOOL_TARGET"
-  chmod 755 "$TOOL_TARGET"
-  log "INFO" "Tool telepítve: $TOOL_TARGET"
+  # ── ai-model-ctl wrapper script ────────────────────────────────────────────
+  # H3 FIX (v2.5): tool generálás kiszervezve _generate_ai_model_ctl() függvénybe
+  # hogy _do_install ÉS _do_update ugyanazt a logikát használja.
+  # Korábbi hiba: _do_update csak 'mkdir -p'-t csinált, nem írta felül a tool-t,
+  # így új wrapper CLI parancsok (pl. 'restart-vllm') nem kerültek bele update-kor.
+  _generate_ai_model_ctl
 
   # ── vLLM systemd user service fájl ───────────────────────────────────────
   # A service-t a felhasználó engedélyezi ha boot-on-start kell
@@ -2246,8 +2295,15 @@ ExecStart=${AI_VENV_DIR}/bin/vllm serve \${MODEL_ID} \
     --max-model-len ${VLLM_MAX_MODEL_LEN} \
     --trust-remote-code \
     --enable-prefix-caching
+# H4 FIX (v2.5): Restart limit, hogy ne kerüljön végtelen ciklusba
+# ha a PyTorch fix nem futott le (cu126 + Blackwell → ImportError)
+# Forrás: systemd.unit(5) — StartLimitIntervalSec/StartLimitBurst
+# Jelentés: 300 másodpercen belül max 3 újraindítási próbálkozás.
+# Ha túllépi → systemd "start-limit-hit" állapotba rakja a service-t.
 Restart=on-failure
 RestartSec=10
+StartLimitIntervalSec=300
+StartLimitBurst=3
 StandardOutput=append:${VLLM_LOG_FILE}
 StandardError=append:${VLLM_LOG_FILE}
 
@@ -2291,17 +2347,57 @@ SERVICE_EOF
   _do_check
 }
 
+# _generate_ai_model_ctl: ~/bin/ai-model-ctl wrapper script generálás
+# H3 FIX (v2.5): kiszervezve _do_install és _do_update közös használatra.
+# Korábbi hiba: _do_update csak 'mkdir -p' volt, nem írta felül a tool-t,
+# így új wrapper CLI parancsok (pl. 'restart-vllm', 'list-models') nem
+# kerültek bele frissítéskor. Most update mód IS újragenerálja.
+#
+# A tool futásidőben hívja a 09_ai_model_wrapper.sh-t RUN_MODE dispatch-csel.
+_generate_ai_model_ctl() {
+  log "INFO" "ai-model-ctl wrapper generálás: $TOOL_TARGET"
+
+  # ~/bin/ könyvtár létrehozása (01b_post_reboot.sh PATH-ba teszi)
+  sudo -u "$_REAL_USER" mkdir -p "$TOOL_INSTALL_DIR"
+
+  # ai-model-ctl: egyszerű wrapper, ami a 09_ai_model_wrapper.sh-t hívja manage módban
+  cat > "$TOOL_TARGET" << WRAPPER_EOF
+#!/bin/bash
+# ai-model-ctl — AI Model Manager wrapper
+# Automatikusan generálva: 09_ai_model_wrapper.sh (install/update módban)
+# Futtatás: ai-model-ctl [manage|status|start-vllm MODEL|stop-vllm|...]
+INFRA_DIR="${SCRIPT_DIR}"
+WRAPPER="${SCRIPT_DIR}/09_ai_model_wrapper.sh"
+
+if [ "\$1" = "status" ]; then
+  RUN_MODE=check sudo bash "\$WRAPPER"
+elif [ "\$1" = "start-vllm" ] && [ -n "\$2" ]; then
+  RUN_MODE=start_vllm MODEL="\$2" sudo bash "\$WRAPPER"
+elif [ "\$1" = "stop-vllm" ]; then
+  RUN_MODE=stop_vllm sudo bash "\$WRAPPER"
+else
+  # Alap: interaktív manage menü (sudo szükséges)
+  if [ "\$EUID" -ne 0 ]; then
+    exec sudo bash "\$WRAPPER"
+  else
+    RUN_MODE=manage bash "\$WRAPPER"
+  fi
+fi
+WRAPPER_EOF
+
+  chown "$_REAL_USER:$_REAL_USER" "$TOOL_TARGET"
+  chmod 755 "$TOOL_TARGET"
+  log "INFO" "ai-model-ctl telepítve/frissítve: $TOOL_TARGET"
+}
+
 # _do_update: konfig frissítés, tool újragenerálás
 _do_update() {
   log "INFO" "[$MOD_ID] Update mód..."
 
-  # ai-model-ctl tool újragenerálása (ha a script frissült)
-  if [ -f "$TOOL_TARGET" ]; then
-    log "INFO" "ai-model-ctl újragenerálás"
-    # Meghívjuk saját _do_install logikánk tool-generáló részét
-    # (nem írjuk felül a meglévő konfigokat — csak a tool binárist)
-    sudo -u "$_REAL_USER" mkdir -p "$TOOL_INSTALL_DIR"
-  fi
+  # H3 FIX (v2.5): ai-model-ctl TÉNYLEGES újragenerálás
+  # Korábban csak 'mkdir -p' volt → új CLI parancsok nem kerültek be update-kor.
+  # Most a közös _generate_ai_model_ctl() függvényt hívjuk (ugyanaz mint install).
+  _generate_ai_model_ctl
 
   # systemd daemon reload (ha a service fájl frissült)
   sudo -u "$_REAL_USER" systemctl --user daemon-reload 2>/dev/null || true
