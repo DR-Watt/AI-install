@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# lib/09_lib_browse.sh — AI Model Manager böngésző UI v1.0
+# lib/09_lib_browse.sh — AI Model Manager böngésző UI v1.1
 #
 # TARTALOM:
 #   _ollama_model_radiolist()  — telepített Ollama modellek radiolist-je
@@ -23,7 +23,7 @@
 #   Nincs fallback inputbox ha valaki kilép a katalógusból!
 #   Minden CANCEL visszatér: echo "CANCEL"; return 1
 #
-# VERZIÓ: v1.0
+# VERZIÓ: v1.1
 # =============================================================================
 
 # _ollama_model_radiolist: telepített Ollama modellek radiolist-je MÉRETEKKEL
@@ -144,15 +144,21 @@ _model_catalog_browse() {
   fi
 
   # ── ✓ jelölés: Ollama telepített modellek ─────────────────────────────────
-  local installed_set=""
+  # L4 FIX (v1.1): asszociatív tömb a fragilis pipe-szeparált string match helyett.
+  # Korábban: installed_set="model1|model2|" + bash glob match → résznév false positive
+  # (pl. "llama3:7b" illeszkedhetett "llama3:7b-instruct"-ra is).
+  # Most: declare -A _installed_map + pontos kulcs-lookup.
+  declare -A _installed_map
   if _is_ollama_running; then
-    installed_set=$(_ollama_api GET "/api/tags" 2>/dev/null | python3 -c "
+    while IFS= read -r _iname; do
+      [ -n "$_iname" ] && _installed_map["$_iname"]=1
+    done < <(_ollama_api GET "/api/tags" 2>/dev/null | python3 -c "
 import json,sys
 try:
   data=json.load(sys.stdin)
   for m in data.get('models',[]): print(m['name'])
 except: pass
-" 2>/dev/null | tr '\n' '|')
+" 2>/dev/null)
   fi
 
   # ── ✓ jelölés: HuggingFace lokális cache ──────────────────────────────────
@@ -178,17 +184,24 @@ except: pass
                              || result_id="${_MDB_OLLAMA[$i]}"
 
     # ✓ jelölés — már letöltve?
+    # L4 FIX (v1.1): _installed_map asszociatív tömb lookup (pontos match)
+    # L5 FIX (v1.1): all módban ✓O (Ollama) / ✓V (vLLM) / ✓OV (mindkettő)
     local marker=""
     if [ "$backend" = "ollama" ] || [ "$backend" = "all" ]; then
       local oname="${_MDB_OLLAMA[$i]}"
-      if [[ "$installed_set" == *"|${oname}|"* ]] || \
-         [[ "$installed_set" == "${oname}|"* ]]; then
-        marker=" ✓"
+      if [ "${_installed_map[$oname]+_}" ]; then
+        [ "$backend" = "all" ] && marker=" ✓O" || marker=" ✓"
       fi
     fi
     if [ "$backend" = "vllm" ] || [ "$backend" = "all" ]; then
       local cache_name="models--${_MDB_HF[$i]//\//-}"
-      [ -d "${hf_cache}/${cache_name}" ] && marker=" ✓"
+      if [ -d "${hf_cache}/${cache_name}" ]; then
+        if [ "$backend" = "all" ]; then
+          [ -n "$marker" ] && marker=" ✓OV" || marker=" ✓V"
+        else
+          marker=" ✓"
+        fi
+      fi
     fi
 
     # Kompatibilitás jelölés (all módban)
@@ -240,7 +253,7 @@ except: pass
   local filter_tag="${filter^^}"
   local sel_idx
   sel_idx=$(whiptail --title "Modell katalógus — [${filter_tag}] | ${backend}" \
-    --radiolist "SPACE=jelöl, ENTER=OK  |  ✓=letöltve  |  ↑↓=görgetés  |  ESC=vissza" \
+    --radiolist "SPACE=jelöl, ENTER=OK  |  ✓=letöltve (✓O=Ollama ✓V=vLLM)  |  ESC=vissza" \
     "$win_h" "$win_w" "$list_h" \
     "${menu_items_sized[@]}" \
     3>&1 1>&2 2>&3) || { echo "CANCEL"; return 1; }

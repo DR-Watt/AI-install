@@ -1,6 +1,6 @@
 #!/bin/bash
 # =============================================================================
-# lib/09_lib_models.sh — AI Model Manager modell adatbázis v1.0
+# lib/09_lib_models.sh — AI Model Manager modell adatbázis v1.1
 #
 # TARTALOM:
 #   _init_model_db() — modell adatbázis betöltése globális tömbökbe
@@ -18,7 +18,9 @@
 #   (a 09_ai_model_wrapper.sh hívja a 00_lib.sh után)
 #
 # GLOBÁLIS TÖMBÖK (lazy-init: _init_model_db() tölti be):
-#   _MDB_OLLAMA[]   — Ollama pull neve (pl. "qwen2.5-coder:7b")
+#   _MDB_OLLAMA[]   — Display ID (Ollama pull neve ha elérhető, egyedi azonosító
+#                     ha nem — pl. ASR modellek: whisper-large-v3 NEM Ollama pull)
+#                     L1 FIX (v1.1): korábban megtévesztő "Ollama pull neve" leírás
 #   _MDB_HF[]       — HuggingFace ID (pl. "Qwen/Qwen2.5-Coder-7B-Instruct")
 #   _MDB_TASK[]     — TASK kategória (code|chat|reason|embed|vision|agent|asr)
 #   _MDB_SIZE[]     — modell mérete GB-ban (letöltési méret)
@@ -39,7 +41,7 @@
 # FORRÁS: ollama.com/library (Ollama ID-k)
 #         huggingface.co (HF ID-k, TASK metaadat)
 #
-# VERZIÓ: v1.0
+# VERZIÓ: v1.1
 # =============================================================================
 
 # Globális tömbök deklarálása (source-olásnál egyszer fut le)
@@ -48,7 +50,8 @@ declare -ga _MDB_OLLAMA_OK _MDB_VLLM_OK
 
 # _init_model_db: modell adatbázis betöltése
 # Hívás: automatikus (lazy-init) a browse függvényekből, ha a tömb üres
-# Formátum: "ollama_neve|hf_id|task|meret_gb|vram_gb|ollama_ok|vllm_ok|leiras"
+# Formátum: "display_id|hf_id|task|meret_gb|vram_gb|ollama_ok|vllm_ok|leiras"
+#   display_id: Ollama pull neve ha ollama_ok=true, egyébként egyedi azonosító
 #   ollama_ok: "true" ha ollama pull-lal letölthető és futtatható
 #   vllm_ok:   "true" ha vllm serve HF ID-val futtatható
 _init_model_db() {
