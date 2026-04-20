@@ -1,7 +1,7 @@
 # AI Model Manager — Fejlesztői Dokumentáció
 
 **Fájl:** `09_ai_model_wrapper.sh`  
-**Verzió:** v2.7  
+**Verzió:** v2.7.1  
 **Lib verzió minimum:** 6.4  
 **Projekt:** DR-Watt/AI-install · `main` branch  
 **Fejlesztési környezet:** Ubuntu 24.04 LTS · RTX 5090 Blackwell SM_120
@@ -90,7 +90,7 @@ A program Ubuntu 24.04 LTS-re van optimalizálva. Más Debian-alapú disztribúc
 
 ```
 <SCRIPT_DIR>/
-├── 09_ai_model_wrapper.sh       # Főscript (v2.7, ~2605 sor)
+├── 09_ai_model_wrapper.sh       # Főscript (v2.7.1, ~2630 sor)
 ├── 00_lib.sh                    # INFRA master lib loader
 ├── 00_registry.sh               # Modul registry (HW_REQ, DEFAULT, stb.)
 ├── lib/
@@ -186,7 +186,7 @@ Browse UI függvények:
 |---|---|---|
 | **VS Code** | `~/.config/Code/User/settings.json` | `cline.apiProvider`, `cline.ollamaBaseUrl`, stb. |
 | **CLINE** | VS Code `settings.json` | `cline.apiProvider`, `cline.apiModelId` |
-| **Continue.dev** | `~/.continue/config.json` | `models[]`, `tabAutocompleteModel`, `embeddingsProvider` |
+| **Continue.dev** | `~/.continue/config.yaml` | `models[].roles[]`, `context[]` (v1 YAML séma, v2.7.1+) |
 
 #### Rendszereszközök
 
@@ -371,19 +371,33 @@ vllm serve MODEL ...                   # ugyanaz a parancs, TQ runtime alatt
 | Ollama | `cline.apiProvider=ollama`, `cline.ollamaBaseUrl`, `cline.apiModelId` |
 | vLLM | `cline.apiProvider=openai`, `cline.openAiBaseUrl=http://localhost:8000/v1`, `cline.openAiModelId` |
 
-**Continue.dev beállítás** (`~/.continue/config.json`):
-- `models[]` — chat modell
-- `tabAutocompleteModel` — kódkiegészítés
-- `embeddingsProvider` — RAG embedding (mindig Ollama: `nomic-embed-text`)
+**Continue.dev beállítás** (`~/.continue/config.yaml`, v1 YAML séma):
 
-A backend váltó egyszerre frissíti mindkettőt (`_ide_switch_backend()`).
+A Continue.dev 2025 Q1-től `config.yaml`-t használ (v1 séma, roles-alapú modell definíciók). A wrapper v2.7.1-től YAML-t generál. Legacy JSON (`config.json`) detektálás: `_check_all_components` → `old` státusz.
+
+Forrás: `github.com/continuedev/continue` — `packages/config-yaml/src/schemas/`
+
+| Mező | Leírás |
+|---|---|
+| `name` | Workspace név (top-level, kötelező) |
+| `version` | Konfig verzió (pl. `0.0.1`) |
+| `models[]` | Modell definíciók: `name`, `provider`, `model`, `apiBase`, `roles[]` |
+| `models[].roles[]` | `[chat, edit, apply]`, `[autocomplete]`, `[embed]` stb. |
+| `context[]` | Kontextus provider-ek (régi `contextProviders[]`) |
+
+**Viselkedés-változás (v2.7.1):**
+- autocomplete **mindig Ollama** (1.5B coder, gyorsabb mint vLLM-en)
+- embed **mindig Ollama** (`nomic-embed-text`)
+- A régi `tabAutocompleteModel` és `embeddingsProvider` top-level mezők nem használtak a v1 sémában
+
+A backend váltó egyszerre frissíti a CLINE + Continue.dev konfigot (`_ide_switch_backend()`).
 
 ---
 
 ## 7. Menütérkép
 
 ```
-AI Model Manager v2.5 — RTX 5090 Blackwell
+AI Model Manager v2.7.1 — RTX 5090 Blackwell
 │
 ├── 1. Ollama model kezelés
 │   ├── 1. Modell betöltés VRAM-ba (radiolist méretekkel)
@@ -917,7 +931,7 @@ Minden paraméter a script tetején `readonly` változókban van deklarálva. Ve
 ```bash
 # Modul
 MOD_ID="09"
-MOD_VERSION="2.7"
+MOD_VERSION="2.7.1"
 MOD_LIB_MIN="6.4"
 
 # Ollama
@@ -947,7 +961,8 @@ TQ_DEFAULT_GROUP_SIZE=128
 
 # IDE
 VSCODE_SETTINGS_FILE="${HOME}/.config/Code/User/settings.json"
-CONTINUE_CONFIG_FILE="${HOME}/.continue/config.json"
+CONTINUE_CONFIG_FILE="${HOME}/.continue/config.yaml"
+CONTINUE_CONFIG_FILE_LEGACY="${HOME}/.continue/config.json"
 
 # Telepítési célok
 TOOL_INSTALL_DIR="${HOME}/bin"
@@ -977,7 +992,7 @@ COMP_09_V_VLLM=0.19.0
 COMP_09_S_TURBOQUANT=ok|old|missing
 COMP_09_S_CLINE_CFG=ok|missing
 COMP_09_V_CLINE_CFG=ollama|openai
-COMP_09_S_CONTINUE_CFG=ok|missing
+COMP_09_S_CONTINUE_CFG=ok|old|missing
 COMP_09_S_TOOL=ok|missing
 PYTORCH_INDEX=cu128             # Fix sikeres esetén
 ```
@@ -1080,6 +1095,14 @@ XDG_RUNTIME_DIR="/run/user/$(id -u $REAL_USER)" \
 
 ---
 
+### 14.7 Browse ESC → kézi fallback (visszatérő bug)
+
+**Tünet:** Katalógusból ESC nyomásra kézi inputbox nyílik meg.  
+**Ok:** A vLLM indítás menüpont 1-es ágában maradt a régi `CANCEL → inputbox` fallback kód.  
+**Megoldás:** Minden `CANCEL` visszatérési érték után `continue` (nem inputbox), nincs fallback.
+
+---
+
 ## 15. Fejlesztési előzmények
 
 | Verzió | Főbb változások |
@@ -1096,6 +1119,7 @@ XDG_RUNTIME_DIR="/run/user/$(id -u $REAL_USER)" \
 | v2.5 | **SÚLYOS hibajavítás kör (H1–H6):** H1 ESC regresszió javítás (explicit `if/continue`), H2 JSON/Python injection védelem (env var), H3 `_do_update` ténylegesen újragenerálja az `ai-model-ctl`-t (`_generate_ai_model_ctl()` közös függvény), H4 vLLM systemd `StartLimitIntervalSec`+`StartLimitBurst`, **H5 TurboQuant valós funkció = KV cache compression** (menü + `_tq_quantize_model` átírva), H6 `set -o pipefail` a subshell-ben |
 | v2.6 | **KÖZEPES funkcionális kör (K1, K3, K4, K5, K6, K8):** K1 `_log_system_info` olvassa a state változókat `~/.infra-state`-ből (manage mód self-contained), K3 `_ollama_pull_model` detektálja a `"error"` JSON-t és whiptail-ben megjeleníti (korábban végtelen ciklus hibánál), K4 `_ide_update_settings` JSON parse hiba explicit log (nem néma elnyelés), **K5 `ollama_svc` 3-állapotú** (ok/old/missing — `list-unit-files` check, leállított ≠ hiányzó), **K6 `_vllm_start` `printf %q` escape** model name + args számára (space/aposztróf védelem), **K8 vLLM service enable után yesno start felajánlás** (+ `systemctl --user start` + 2s state check) |
 | v2.7 | **KÖZEPES polish/biztonság kör (K2, K9, K10, K11, K12):** K2 `COMP_STATUS`/`COMP_VER` explicit `declare -gA` (standalone futás robusztusság), K9 `_do_install` `chown -R` a `mkdir -p` mellé (régi root-tulajdonú directory fallback), **K10 `/tmp/continue_config_new.json` → `mktemp`** (symlink attack védelem — fix path /tmp-ben kihasználható volt), K11 Continue.dev `.bak` fájlok cleanup (max 5 legfrissebb marad, korábbi: soha nem törlődött), **K12 `_manage_main_menu` kilépés yesno confirm** (véletlen `0`/ESC védelem) |
+| v2.7.1 | **K7 Continue.dev JSON → YAML v1 séma:** `config.json` → `config.yaml` (roles-alapú modell definíciók), legacy JSON fallback detektálás (`old` státusz), `tabAutocompleteModel`/`embeddingsProvider` → `models[].roles[]`, autocomplete mindig Ollama (1.5B coder), `contextProviders[]` → `context[]`, `yaml.safe_load` a check függvényben. Forrás: `continuedev/continue` repo `packages/config-yaml/src/schemas/` |
 
 ---
 
@@ -1117,4 +1141,4 @@ XDG_RUNTIME_DIR="/run/user/$(id -u $REAL_USER)" \
 
 ---
 
-*Dokumentáció verziója: 2026-04-19 · DR-Watt/AI-install · `09_ai_model_wrapper.sh` v2.7*
+*Dokumentáció verziója: 2026-04-20 · DR-Watt/AI-install · `09_ai_model_wrapper.sh` v2.7.1*
