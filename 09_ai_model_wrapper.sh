@@ -68,7 +68,7 @@
 #   VS Code API: https://code.visualstudio.com/docs/configure/settings
 #     - settings.json: ~/.config/Code/User/settings.json
 #   Continue.dev: https://docs.continue.dev (DOCS.md nem listázza, de szükséges)
-#     - ~/.continue/config.json (provider, model, apiBase)
+#     - ~/.continue/config.yaml (v1 YAML séma, 2025 Q1-től alapértelmezett)
 #   CLINE: https://github.com/cline/cline (extension settings.json kulcsok)
 #     - cline.apiProvider / cline.ollamaBaseUrl / cline.openAiBaseUrl stb.
 #
@@ -117,7 +117,7 @@ unset _09lib _09lib_file
 # ── Modul azonosítók ──────────────────────────────────────────────────────────
 readonly MOD_ID="09"
 readonly MOD_NAME="AI Model Manager"
-readonly MOD_VERSION="2.7"
+readonly MOD_VERSION="2.7.1"
 # Lib minimum verzió (00_lib.sh LIB_VERSION) — compat check
 readonly MOD_LIB_MIN="6.4"
 
@@ -170,7 +170,9 @@ readonly VSCODE_SETTINGS_FILE="${_REAL_HOME}/.config/Code/User/settings.json"
 # Continue.dev konfiguráció
 # Forrás: Continue.dev docs (DOCS.md-ben nincs listing, de ez a standard útvonal)
 readonly CONTINUE_CONFIG_DIR="${_REAL_HOME}/.continue"
-readonly CONTINUE_CONFIG_FILE="${CONTINUE_CONFIG_DIR}/config.json"
+readonly CONTINUE_CONFIG_FILE="${CONTINUE_CONFIG_DIR}/config.yaml"
+# Legacy JSON konfig — fallback detektálásra (régi Continue.dev verziók, v0.x séma)
+readonly CONTINUE_CONFIG_FILE_LEGACY="${CONTINUE_CONFIG_DIR}/config.json"
 # CLINE API provider kulcs neve a settings.json-ban
 # Forrás: CLINE extension README / settings schema (github.com/cline/cline)
 readonly CLINE_PROVIDER_KEY="cline.apiProvider"
@@ -354,20 +356,36 @@ except:
   fi
 
   # ── Continue.dev konfig ───────────────────────────────────────────────────
+  # K7 FIX (v2.7.1): YAML elsőbbség, JSON legacy fallback.
+  # Continue.dev 2025 Q1-től config.yaml-t használ (v1 séma, roles-alapú modellek).
+  # Ha config.yaml nincs DE config.json van → legacy (old) státusz.
+  # Forrás: github.com/continuedev/continue — packages/config-yaml/src/schemas/
   if [ -f "$CONTINUE_CONFIG_FILE" ]; then
     COMP_STATUS[continue_cfg]="ok"
-    # Aktív provider kinyerése a konfig első modelljéből
     local cont_provider
     cont_provider=$(python3 -c "
-import json, sys
+import yaml, sys
 try:
-  d = json.load(open('$CONTINUE_CONFIG_FILE'))
+  d = yaml.safe_load(open('$CONTINUE_CONFIG_FILE'))
   models = d.get('models', [])
   print(models[0].get('provider','?') if models else '?')
 except:
   print('?')
 " 2>/dev/null)
     COMP_VER[continue_cfg]="${cont_provider:-?}"
+  elif [ -f "$CONTINUE_CONFIG_FILE_LEGACY" ]; then
+    COMP_STATUS[continue_cfg]="old"
+    local cont_provider
+    cont_provider=$(python3 -c "
+import json, sys
+try:
+  d = json.load(open('$CONTINUE_CONFIG_FILE_LEGACY'))
+  models = d.get('models', [])
+  print(models[0].get('provider','?') if models else '?')
+except:
+  print('?')
+" 2>/dev/null)
+    COMP_VER[continue_cfg]="(legacy JSON) ${cont_provider:-?}"
   else
     COMP_STATUS[continue_cfg]="missing"; COMP_VER[continue_cfg]=""
   fi
@@ -1400,8 +1418,16 @@ _ide_config_cline_vllm() {
   _ide_update_settings settings
 }
 
-# _ide_config_continue: Continue.dev config.json frissítése
-# Forrás: Continue.dev docs — ~/.continue/config.json schema
+# _ide_config_continue: Continue.dev config.yaml generálás (v1 YAML séma)
+# K7 FIX (v2.7.1): JSON → YAML átírás. Continue.dev 2025 Q1-től YAML-t használ.
+# Forrás: github.com/continuedev/continue — packages/config-yaml/src/schemas/
+#   - Top-level: name, version, schema ("v1")
+#   - Modellek: name (nem title!), provider, model, apiBase, roles[]
+#   - roles: [chat, autocomplete, embed, edit, apply, rerank, summarize, subagent]
+#   - contextProviders[] → context[]
+# Viselkedés-változás v2.7-hez képest:
+#   - autocomplete MINDIG ollama (1.5B coder, gyorsabb mint vLLM-en)
+#   - embed MINDIG ollama (nomic-embed-text, mint a régi JSON-ban)
 # Paraméterek: $1=backend ("ollama"|"vllm"), $2=chat model, $3=autocomplete model
 _ide_config_continue() {
   local backend="${1:-ollama}"
@@ -1409,89 +1435,89 @@ _ide_config_continue() {
   local autocomplete_model="${3:-$OLLAMA_DEFAULT_AUTOCOMPLETE}"
   local embed_model="$OLLAMA_DEFAULT_EMBED_MODEL"
 
-  log "INFO" "Continue.dev konfig → $backend: chat=$chat_model, ac=$autocomplete_model"
+  log "INFO" "Continue.dev konfig (YAML) → $backend: chat=$chat_model, ac=$autocomplete_model"
 
   sudo -u "$_REAL_USER" mkdir -p "$CONTINUE_CONFIG_DIR"
 
-  local provider api_base chat_provider
+  local chat_provider chat_api_base
 
   if [ "$backend" = "vllm" ]; then
-    # vLLM: OpenAI-compatible endpoint
+    # vLLM: OpenAI-compatible endpoint a chat/edit modellhez
     # Forrás: Continue.dev provider="openai" + apiBase (official docs)
-    provider="openai"
-    api_base="http://localhost:${VLLM_PORT}/v1"
     chat_provider="openai"
+    chat_api_base="http://localhost:${VLLM_PORT}/v1"
   else
-    # Ollama: natív Ollama provider
+    # Ollama: natív Ollama provider a chat/edit modellhez
     # Forrás: Continue.dev provider="ollama" (official docs)
-    provider="ollama"
-    api_base="$OLLAMA_HOST"
     chat_provider="ollama"
+    chat_api_base="$OLLAMA_HOST"
   fi
 
-  # Continue.dev config.json generálás
+  # Continue.dev config.yaml generálás (v1 YAML séma)
   # K10 FIX (v2.7): mktemp a fix /tmp path helyett — symlink attack védelem.
-  # Korábbi hibás kód: cat > /tmp/continue_config_new.json
-  #   → ha /tmp-ben van egy ilyen nevű symlink (pl. → /etc/passwd vagy
-  #   → ~/.ssh/authorized_keys), a cat követi és felülírja a célfájlt.
   # mktemp: random 6-karakteres suffix + 0600 mode (user-only read/write).
-  # Struktúra: models[] + tabAutocompleteModel + embeddingsProvider
   local tmp_cfg
-  tmp_cfg=$(mktemp /tmp/continue_cfg_XXXXXX.json)
-  cat > "$tmp_cfg" << CONTINUE_EOF
-{
-  "models": [
-    {
-      "title": "Kód (${backend}) — ${chat_model}",
-      "provider": "${provider}",
-      "model": "${chat_model}",
-      "apiBase": "${api_base}",
-      "apiKey": "dummy"
-    }
-  ],
-  "tabAutocompleteModel": {
-    "title": "Tab autocomplete — ${autocomplete_model}",
-    "provider": "${chat_provider}",
-    "model": "${autocomplete_model}",
-    "apiBase": "${api_base}",
-    "apiKey": "dummy"
-  },
-  "embeddingsProvider": {
-    "provider": "ollama",
-    "model": "${embed_model}",
-    "apiBase": "${OLLAMA_HOST}"
-  },
-  "contextProviders": [
-    { "name": "code" },
-    { "name": "docs" },
-    { "name": "diff" },
-    { "name": "terminal" },
-    { "name": "open" }
-  ],
-  "slashCommands": [
-    { "name": "share", "description": "Export current chat session" },
-    { "name": "cmd",   "description": "Generate shell command" }
-  ]
-}
-CONTINUE_EOF
+  tmp_cfg=$(mktemp /tmp/continue_cfg_XXXXXX.yaml)
+  cat > "$tmp_cfg" << 'CONTINUE_YAML_HEAD'
+# Continue.dev config.yaml — INFRA Vibe Coding Workspace
+# Generálva: 09_ai_model_wrapper.sh v2.7.1
+# Séma: v1 (2025 Q1+, roles-alapú modell definíciók)
+# Forrás: github.com/continuedev/continue packages/config-yaml/src/schemas/
+#
+# NE SZERKESZD KÉZZEL ha a wrapper kezeli a backend váltást!
+# A wrapper felülírja ezt a fájlt minden backend váltáskor.
+CONTINUE_YAML_HEAD
 
-  # Biztonsági mentés a meglévő konfigból
+  # A YAML body-t bash változó-expanzióval írjuk (nem 'quoted' heredoc)
+  cat >> "$tmp_cfg" << CONTINUE_YAML_BODY
+name: INFRA Vibe Coding Workspace
+version: 0.0.1
+
+models:
+  - name: "Kód (${backend}) — ${chat_model}"
+    provider: ${chat_provider}
+    model: ${chat_model}
+    apiBase: ${chat_api_base}
+    apiKey: dummy
+    roles: [chat, edit, apply]
+
+  - name: "Tab autocomplete — ${autocomplete_model}"
+    provider: ollama
+    model: ${autocomplete_model}
+    apiBase: ${OLLAMA_HOST}
+    roles: [autocomplete]
+
+  - name: "Embedding — ${embed_model}"
+    provider: ollama
+    model: ${embed_model}
+    apiBase: ${OLLAMA_HOST}
+    roles: [embed]
+
+context:
+  - provider: code
+  - provider: docs
+  - provider: diff
+  - provider: terminal
+  - provider: open
+CONTINUE_YAML_BODY
+
+  # Biztonsági mentés: YAML és legacy JSON is
   if [ -f "$CONTINUE_CONFIG_FILE" ]; then
     cp "$CONTINUE_CONFIG_FILE" "${CONTINUE_CONFIG_FILE}.bak.$(date +%Y%m%d_%H%M%S)"
-    # K11 FIX (v2.7): régi .bak fájlok tisztítása — csak az 5 legfrissebb marad.
-    # Korábbi viselkedés: minden backend váltáskor + minden install/fix módban
-    # új .bak jött létre, sosem törlődött → hónapok alatt tucatnyi 1-2 KB-os
-    # fájl felhalmozódott a ~/.continue/-ban.
-    # Forrás: ls -1t (modification time DESC) + tail -n +6 (6. sortól, azaz
-    # az első 5 megmarad). xargs -r: üres input esetén ne fusson le.
-    ls -1t "${CONTINUE_CONFIG_FILE}".bak.* 2>/dev/null | tail -n +6 \
-      | xargs -r rm -f
   fi
+  # Legacy JSON mentés is (ha létezik, a user később dönthet a törlésről)
+  if [ -f "$CONTINUE_CONFIG_FILE_LEGACY" ]; then
+    cp "$CONTINUE_CONFIG_FILE_LEGACY" "${CONTINUE_CONFIG_FILE_LEGACY}.bak.$(date +%Y%m%d_%H%M%S)"
+  fi
+  # K11 FIX (v2.7): régi .bak fájlok tisztítása — csak az 5 legfrissebb marad.
+  # Forrás: ls -1t (modification time DESC) + tail -n +6 (6. sortól).
+  ls -1t "${CONTINUE_CONFIG_DIR}"/config.*.bak.* 2>/dev/null | tail -n +6 \
+    | xargs -r rm -f
 
   sudo -u "$_REAL_USER" cp "$tmp_cfg" "$CONTINUE_CONFIG_FILE"
   chown "$_REAL_USER:$_REAL_USER" "$CONTINUE_CONFIG_FILE"
   rm -f "$tmp_cfg"
-  log "INFO" "Continue.dev konfig írva: $CONTINUE_CONFIG_FILE"
+  log "INFO" "Continue.dev YAML konfig írva: $CONTINUE_CONFIG_FILE"
 }
 
 # _ide_switch_backend: egyszerre váltja a CLINE + Continue.dev backend-et
