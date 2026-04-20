@@ -1,7 +1,7 @@
 # AI Model Manager — Fejlesztői Dokumentáció
 
 **Fájl:** `09_ai_model_wrapper.sh`  
-**Verzió:** v2.7.1  
+**Verzió:** v2.8  
 **Lib verzió minimum:** 6.4  
 **Projekt:** DR-Watt/AI-install · `main` branch  
 **Fejlesztési környezet:** Ubuntu 24.04 LTS · RTX 5090 Blackwell SM_120
@@ -90,7 +90,7 @@ A program Ubuntu 24.04 LTS-re van optimalizálva. Más Debian-alapú disztribúc
 
 ```
 <SCRIPT_DIR>/
-├── 09_ai_model_wrapper.sh       # Főscript (v2.7.1, ~2630 sor)
+├── 09_ai_model_wrapper.sh       # Főscript (v2.8, ~2663 sor)
 ├── 00_lib.sh                    # INFRA master lib loader
 ├── 00_registry.sh               # Modul registry (HW_REQ, DEFAULT, stb.)
 ├── lib/
@@ -931,7 +931,7 @@ Minden paraméter a script tetején `readonly` változókban van deklarálva. Ve
 ```bash
 # Modul
 MOD_ID="09"
-MOD_VERSION="2.7.1"
+MOD_VERSION="2.8"
 MOD_LIB_MIN="6.4"
 
 # Ollama
@@ -1120,6 +1120,7 @@ XDG_RUNTIME_DIR="/run/user/$(id -u $REAL_USER)" \
 | v2.6 | **KÖZEPES funkcionális kör (K1, K3, K4, K5, K6, K8):** K1 `_log_system_info` olvassa a state változókat `~/.infra-state`-ből (manage mód self-contained), K3 `_ollama_pull_model` detektálja a `"error"` JSON-t és whiptail-ben megjeleníti (korábban végtelen ciklus hibánál), K4 `_ide_update_settings` JSON parse hiba explicit log (nem néma elnyelés), **K5 `ollama_svc` 3-állapotú** (ok/old/missing — `list-unit-files` check, leállított ≠ hiányzó), **K6 `_vllm_start` `printf %q` escape** model name + args számára (space/aposztróf védelem), **K8 vLLM service enable után yesno start felajánlás** (+ `systemctl --user start` + 2s state check) |
 | v2.7 | **KÖZEPES polish/biztonság kör (K2, K9, K10, K11, K12):** K2 `COMP_STATUS`/`COMP_VER` explicit `declare -gA` (standalone futás robusztusság), K9 `_do_install` `chown -R` a `mkdir -p` mellé (régi root-tulajdonú directory fallback), **K10 `/tmp/continue_config_new.json` → `mktemp`** (symlink attack védelem — fix path /tmp-ben kihasználható volt), K11 Continue.dev `.bak` fájlok cleanup (max 5 legfrissebb marad, korábbi: soha nem törlődött), **K12 `_manage_main_menu` kilépés yesno confirm** (véletlen `0`/ESC védelem) |
 | v2.7.1 | **K7 Continue.dev JSON → YAML v1 séma:** `config.json` → `config.yaml` (roles-alapú modell definíciók), legacy JSON fallback detektálás (`old` státusz), `tabAutocompleteModel`/`embeddingsProvider` → `models[].roles[]`, autocomplete mindig Ollama (1.5B coder), `contextProviders[]` → `context[]`, `yaml.safe_load` a check függvényben. Forrás: `continuedev/continue` repo `packages/config-yaml/src/schemas/` |
+| v2.8 | **ALACSONY prioritás javítások (A1–A10):** A1 log fájlnév dátum-stamp egységesítés (`%H%M%S` → `%Y%m%d_%H%M%S`), A2 `_is_ollama_running` curl REST API fallback (manuálisan indított Ollama detektálás), A3 GPU `bar_pct` clamp `max(0, min(30, ...))`, A5 `VLLM_MAX_MODEL_LEN` komment bővítés (modell-függő), A8 vLLM service fájl komment (menü hivatkozás + sed példa), **A9 `_cleanup_old_logs()`** (max 20 wrapper + 10 pull log, K11 mintájára), **A10 `_menu_gpu_status` while+yesno frissítés** (korábban egyetlen statikus snapshot). A4 arxiv link validálva (OK). A6/A7 skip. |
 
 ---
 
@@ -1141,4 +1142,4 @@ XDG_RUNTIME_DIR="/run/user/$(id -u $REAL_USER)" \
 
 ---
 
-*Dokumentáció verziója: 2026-04-20 · DR-Watt/AI-install · `09_ai_model_wrapper.sh` v2.7.1*
+*Dokumentáció verziója: 2026-04-20 · DR-Watt/AI-install · `09_ai_model_wrapper.sh` v2.8*
